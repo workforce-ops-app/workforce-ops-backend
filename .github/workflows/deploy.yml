@@ -1,0 +1,20 @@
+# Deployment placeholder: dry run until a hosting target exists.
+name: deploy
+
+on:
+  push:
+    branches: [production]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    uses: workforce-ops-app/.github/.github/workflows/reusable-deploy.yml@main
+    with:
+      image-name: workforce-ops-backend

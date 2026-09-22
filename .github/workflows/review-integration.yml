@@ -1,0 +1,23 @@
+# Keeps review/integration equal to main + every open, ready-for-review PR.
+name: review-integration
+
+on:
+  push:
+    branches: [main]
+  pull_request_target:
+    types: [opened, reopened, synchronize, closed, ready_for_review, converted_to_draft]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: review-integration
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  rebuild:
+    uses: workforce-ops-app/.github/.github/workflows/reusable-review-integration.yml@main

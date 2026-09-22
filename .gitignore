@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tool caches and coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# CI runner output
+ci-results/
+ci-report/
+
+# Environment and secrets (document variables in .env.example)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

@@ -1,0 +1,57 @@
+# Weekly dependency update PRs. Minor/patch updates are grouped per ecosystem;
+# major updates arrive one per PR. See the dependencies guide and decision 0011.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    labels: ["type:chore", "area:deps"]
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      python-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    labels: ["type:chore", "area:deps"]
+    commit-message:
+      prefix: chore
+      include: scope
+    ignore:
+      # Python stays on 3.13 until a decision record changes it.
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  - package-ecosystem: docker-compose
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    labels: ["type:chore", "area:deps"]
+    commit-message:
+      prefix: chore
+      include: scope
+    ignore:
+      # MySQL stays on 8.4 LTS; patch releases only.
+      - dependency-name: mysql
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    labels: ["type:chore", "area:deps"]
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      actions:
+        patterns: ["*"]

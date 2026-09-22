@@ -1,0 +1,15 @@
+# Posts the CI report as one PR comment that updates on every run.
+name: ci-comment
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+
+permissions:
+  actions: read
+  pull-requests: write
+
+jobs:
+  comment:
+    uses: workforce-ops-app/.github/.github/workflows/reusable-ci-comment.yml@main

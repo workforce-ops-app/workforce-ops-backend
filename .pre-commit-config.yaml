@@ -1,0 +1,39 @@
+# Local checks. Install once per clone:
+#   python -m pip install pre-commit
+#   pre-commit install
+# Hook versions are refreshed with `pre-commit autoupdate` (see the dependencies guide).
+default_install_hook_types: [pre-commit, commit-msg, pre-push]
+default_stages: [pre-commit]
+
+repos:
+  - repo: https://github.com/workforce-ops-app/.github
+    rev: v0.1.0
+    hooks:
+      - id: commit-message
+      - id: branch-name
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: detect-private-key
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.8
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format

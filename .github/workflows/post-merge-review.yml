@@ -1,0 +1,17 @@
+# Opens a follow-up issue when a PR merged with a bypass or without approval.
+name: post-merge-review
+
+on:
+  pull_request_target:
+    types: [closed]
+    branches: [main, production]
+
+permissions:
+  issues: write
+  pull-requests: read
+
+jobs:
+  follow-up:
+    uses: workforce-ops-app/.github/.github/workflows/reusable-post-merge-review.yml@main
+    with:
+      review-team: workforce-ops-app/maintainers
