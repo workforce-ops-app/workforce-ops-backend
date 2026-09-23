@@ -30,7 +30,7 @@ sequenceDiagram
 
 | Field | Notes |
 |---|---|
-| `seq` | 1, 2, 3… per chain, no gaps |
+| `seq` | 1, 2, 3… per chain, no gaps; `(chain_id, seq)` is a unique key |
 | `company_id` | null for the platform chain |
 | `actor` | user ID, or `system` |
 | `action` | dotted name, e.g. `time_off.approved`, `role.permission_added` |

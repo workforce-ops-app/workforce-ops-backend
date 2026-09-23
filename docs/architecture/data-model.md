@@ -22,8 +22,9 @@ erDiagram
     users ||--o{ role_assignments : holds
     roles ||--o{ role_assignments : "assigned as"
     users ||--o{ sessions : "signs in with"
-    companies ||--|| audit_chain_heads : "chain head"
-    companies ||--o{ audit_events : records
+    companies |o--|| audit_chain_heads : "has one chain head"
+    audit_chain_heads ||--o{ audit_events : "orders and seals"
+    companies |o--o{ audit_events : records
     companies ||--o{ company_settings : configures
     departments ||--o{ shifts : "scheduled in"
     users ||--o{ shifts : works
@@ -119,9 +120,9 @@ erDiagram
     }
     audit_events {
         uuid id PK
-        string chain_id FK
+        string chain_id FK "which log; company id or platform"
         uuid company_id FK "null for platform chain"
-        bigint seq "per chain"
+        bigint seq "unique with chain_id; no gaps"
         string actor "user id or system"
         string action
         string target_type
@@ -155,6 +156,7 @@ erDiagram
 - Each **user** has exactly one home department and can be on several teams in the company.
 - A user belongs to exactly **one company**. Platform personnel are stored in separate platform tables.
 - `role_assignments` has a `CHECK` that exactly the column matching `scope_type` is set, and none for `company`.
+- **Audit log:** there is one chain head per company plus one for the platform (its head and entries have no company). Every audit entry belongs to one chain through `chain_id`, and `(chain_id, seq)` is a unique key, so an entry number can never repeat within a log. See [audit log](audit-log.md).
 
 ## Time zones
 
