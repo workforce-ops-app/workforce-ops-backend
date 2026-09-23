@@ -64,6 +64,26 @@ A verification failure names the first bad `seq` and raises a security event.
 - Has an ID; rotating the key starts using a new ID while old entries keep theirs. Old keys are kept (read-only) for verification.
 - Losing a key means entries signed with it can no longer be verified; leaking it reduces the protection to a plain hash chain. Its handling will be covered by an operations runbook.
 
+## Relation to blockchains
+
+**In short:** the audit log borrows the core idea of a blockchain, where each entry is linked to the one before it so that changing history breaks the chain, but it is not a blockchain. The accurate name is an **HMAC-signed hash chain**, or a tamper-evident log.
+
+**What it borrows:** every entry stores the previous entry's signature, and its own signature covers that value. Editing, removing, or inserting an entry therefore invalidates every entry after it, just as altering a block invalidates the blocks that follow it.
+
+**Where it differs:**
+
+| | Blockchain (e.g. Bitcoin) | This audit log |
+|---|---|---|
+| Storage | Copied across many independent computers | One database the application controls |
+| Who adds entries | Many parties agree (consensus, mining) | The application alone |
+| What seals an entry | A public hash anyone can recompute | HMAC-SHA256 with a secret key kept outside the database |
+| Who can verify | Anyone | Whoever holds the key (the verification job, and owners through it) |
+| Protects against | Distrust between many independent parties | Someone quietly editing or deleting the organization's own records |
+
+**Why a secret key instead of a plain hash:** with a plain hash chain, anyone with database access could change an entry and recompute every hash after it, leaving a chain that still looks valid. Without the key they cannot produce valid signatures. A blockchain solves the same problem differently, by keeping many independent copies. That is unnecessary here, and would add infrastructure the project does not need.
+
+**Wording for reports:** describe it as a "tamper-evident, HMAC-signed hash chain". Calling it a blockchain overstates it, because there is no network of independent copies and no consensus.
+
 ## What to log
 
 Log actions that change access, data belonging to others, or configuration: authentication events, role and permission changes, scope changes, approvals and denials, schedule changes, policy changes, support access, and automatic actions. Feature pages list their audit events.
