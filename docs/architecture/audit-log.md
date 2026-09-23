@@ -31,8 +31,9 @@ sequenceDiagram
 | Field | Notes |
 |---|---|
 | `seq` | 1, 2, 3… per chain, no gaps; `(chain_id, seq)` is a unique key |
+| `chain_id` | which log: the company's ID, or the all-zero UUID for the platform chain |
 | `company_id` | null for the platform chain |
-| `actor` | user ID, or `system` |
+| `actor_type`, `actor_id` | `user`, `platform_user`, or `system` (no ID for `system`) |
 | `action` | dotted name, e.g. `time_off.approved`, `role.permission_added` |
 | `target_type`, `target_id` | what was acted on |
 | `occurred_at` | UTC |
