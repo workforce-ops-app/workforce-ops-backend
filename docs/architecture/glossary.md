@@ -12,6 +12,7 @@
 | **Candidate** | A coworker's accepted coverage or agreed swap, waiting for manager approval. |
 | **Audit log** | Append-only, tamper-evident record of security-relevant actions. |
 | **Role assignment** | Giving a user a role together with its scope: the whole company, one department, one team, or one employee. |
+| **Reporting line** | A record that one person reports to another. A person can report to several managers, and a manager can have many reports. |
 | **Current company** | The company of the signed-in user, taken from the server-side session. Every query is filtered to it. |
 | **Audit chain** | One company's audit entries, each signed together with the previous entry's signature, so tampering is detectable. |
 | **Workplace zone** | The time zone a shift is scheduled in: the department's zone if set, otherwise the company's. |

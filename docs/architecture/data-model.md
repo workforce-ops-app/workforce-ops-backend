@@ -1,6 +1,6 @@
 # Data model
 
-**In short:** the tables every feature builds on: companies and their structure, people, roles and where they apply, sessions, shifts, company settings, and the audit log. Every company-owned row carries its company, records are deactivated or archived rather than deleted, IDs are UUIDv7, and exact moments are stored in UTC.
+**In short:** the tables every feature builds on: companies and their structure, people, roles and where they apply, who reports to whom, sessions, shifts, company settings, and the audit log. Every company-owned row carries its company, records are deactivated or archived rather than deleted, IDs are UUIDv7, and exact moments are stored in UTC.
 
 Decisions behind this page: [0016 tenancy](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0016-tenant-isolation.md) · [0017 scoped roles](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0017-scoped-role-assignments.md) · [0018 audit](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0018-audit-log-chains.md) · [0019 IDs](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0019-uuidv7-ids.md) · [0020 deletion](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md) · [0021 time](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md) · [0022 SQLAlchemy](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0022-sqlalchemy-and-alembic.md)
 
@@ -23,6 +23,8 @@ erDiagram
     permissions ||--o{ role_permissions : "granted by"
     users ||--o{ role_assignments : holds
     roles ||--o{ role_assignments : "assigned as"
+    users ||--o{ reporting_lines : "is reported to (manager_id)"
+    users ||--o{ reporting_lines : "reports through (employee_id)"
     users ||--o{ sessions : "signs in with"
     departments ||--o{ shifts : "scheduled in"
     users ||--o{ shifts : works
@@ -90,6 +92,13 @@ erDiagram
         uuid department_id FK
         uuid team_id FK
         uuid employee_id FK
+    }
+    reporting_lines {
+        uuid id PK
+        uuid company_id FK
+        uuid manager_id FK
+        uuid employee_id FK
+        datetime ended_at
     }
     sessions {
         uuid id PK
@@ -256,6 +265,27 @@ Primary key: `(role_id, permission_code)`.
 
 A `CHECK` constraint ensures exactly the column matching `scope_type` is filled in, and none for `company`. The service rejects duplicate assignments.
 
+### reporting_lines
+
+**What it is:** who reports to whom. One row means "this employee reports to this manager". A person can report to several managers, and a manager can have many reports, so this is a separate table rather than a column on `users`.
+
+| Column | Type | Rules |
+|---|---|---|
+| `id` | `BINARY(16)` | primary key |
+| `company_id` | `BINARY(16)` | required |
+| `manager_id` | `BINARY(16)` | required; company-aware foreign key to `users` (the person reported to) |
+| `employee_id` | `BINARY(16)` | required; company-aware foreign key to `users` (the person reporting) |
+| `ended_at` | `DATETIME(6)` | null = current; ending a line keeps it as history |
+
+A `CHECK (manager_id <> employee_id)` constraint stops anyone reporting to themselves. The service also:
+
+- rejects a second current line for the same manager and employee;
+- rejects a line that would create a loop (A reports to B, who reports, directly or indirectly, to A);
+- rejects changes to a person's own reporting lines;
+- writes every added or ended line to the audit log.
+
+Loops and "not your own lines" cannot be checked by a single-row constraint, so they are enforced in the service and covered by security tests. What reporting lines allow a manager to do, and who may add or end them, is part of the authorization design.
+
 ### sessions
 
 **What it is:** a signed-in browser. Deleting the row signs that browser out.
@@ -350,6 +380,7 @@ The application's database user may only insert and read rows here.
 | users | role_assignments | one to many | company-aware foreign key | A person can hold several roles |
 | roles | role_assignments | one to many | company-aware foreign key | A role can be given to many people |
 | role_assignments | departments / teams / users (scope) | many to one, only one of them | company-aware foreign keys + `CHECK` | Where the role applies: a department, a team, one employee, or (none set) the whole company |
+| users ↔ users | via reporting_lines | many to many | company-aware foreign keys + `CHECK (manager_id <> employee_id)`; loops rejected by the service | A person can report to several managers; a manager can have many reports |
 | users | sessions | one to many | company-aware foreign key | A person can be signed in on several browsers |
 | departments | shifts | one to many | company-aware foreign key | A shift happens in one department |
 | users | shifts | one to many | company-aware foreign key | A shift is worked by one employee |
@@ -368,7 +399,7 @@ The application's database user may only insert and read rows here.
 | **Company ownership** | Company-owned tables have `company_id NOT NULL`, a unique key on `(company_id, id)`, and composite foreign keys `(company_id, <x>_id)` → `<x>(company_id, id)`. See [tenancy](tenancy.md) |
 | **Global tables** | Only `permissions` (maintained by code), `companies`, and platform tables are not company-owned |
 | **Timestamps** | `created_at` and `updated_at`, `DATETIME(6)` in UTC, on every table |
-| **Deletion** | No hard deletes of business records. Users get `deactivated_at`; structure (companies, departments, teams, roles) gets `archived_at`; workflow records get an explicit `status`. Default queries exclude inactive rows |
+| **Deletion** | No hard deletes of business records. Users get `deactivated_at`; structure (companies, departments, teams, roles) gets `archived_at`; reporting lines get `ended_at`; workflow records get an explicit `status`. Default queries exclude inactive rows |
 | **Moments vs dates** | Moments are UTC `DATETIME(6)`; calendar days (time off, holidays) are `DATE` in the workplace's zone |
 | **Enumerations** | Stored as short strings with a `CHECK` constraint, mirrored by Python enums |
 | **Names** | Tables plural `snake_case`; foreign keys `<singular>_id` |
