@@ -9,9 +9,11 @@ on:
     branches: [main, production, "review/**"]
   workflow_dispatch:
 
+# A newer push to a PR replaces its older run. Runs on main, production, and
+# review branches are never cancelled, so every commit there gets a full result.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
