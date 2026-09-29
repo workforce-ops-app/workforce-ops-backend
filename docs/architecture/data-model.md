@@ -26,6 +26,7 @@ erDiagram
     users ||--o{ reporting_lines : "is reported to (manager_id)"
     users ||--o{ reporting_lines : "reports through (employee_id)"
     users ||--o{ sessions : "signs in with"
+    users ||--o{ one_time_tokens : "set up or reset with"
     departments ||--o{ shifts : "scheduled in"
     users |o--o{ shifts : "works (none while open)"
     companies ||--o{ company_settings : configures
@@ -60,6 +61,9 @@ erDiagram
         string email
         string password_hash
         string display_name
+        datetime password_changed_at
+        int failed_sign_ins
+        datetime locked_until
         datetime deactivated_at
     }
     team_members {
@@ -106,6 +110,17 @@ erDiagram
         uuid user_id FK
         binary token_hash
         datetime expires_at
+        datetime last_seen_at
+        datetime reauth_at
+    }
+    one_time_tokens {
+        uuid id PK
+        uuid company_id FK
+        uuid user_id FK
+        string purpose
+        binary token_hash
+        datetime expires_at
+        datetime used_at
     }
     shifts {
         uuid id PK
@@ -198,10 +213,15 @@ Not itself company-owned. Only platform code creates or archives companies.
 | `id` | `BINARY(16)` | primary key |
 | `company_id` | `BINARY(16)` | required |
 | `department_id` | `BINARY(16)` | required; company-aware foreign key to `departments` (home department) |
-| `email` | `VARCHAR(254)` | required; unique within the company |
-| `password_hash` | `VARCHAR(255)` | required; Argon2id ([0027](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md)) |
+| `email` | `VARCHAR(254)` | required; stored in lowercase; **unique across the whole platform**, so sign-in needs only an email and a password |
+| `password_hash` | `VARCHAR(255)` | Argon2id ([0027](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md)); null until the person sets a password with their setup link |
 | `display_name` | `VARCHAR(120)` | required |
+| `password_changed_at` | `DATETIME(6)` | when the password was last set |
+| `failed_sign_ins` | `SMALLINT` | wrong passwords since the last success; reset after a success or 24 hours without failures |
+| `locked_until` | `DATETIME(6)` | null = not locked; set by the lockout schedule ([authentication](authentication.md#lockouts-and-rate-limits)) |
 | `deactivated_at` | `DATETIME(6)` | null = active; deactivated users cannot sign in |
+
+One email address belongs to at most one account on the platform. A person who works for two companies has two accounts with two different email addresses ([0016](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0016-tenant-isolation.md)). When an administrator adds an address that is already taken, the answer does not say where it is used.
 
 ### team_members
 
@@ -300,10 +320,28 @@ Loops and "not your own lines" cannot be checked by a single-row constraint, so 
 | `company_id` | `BINARY(16)` | required |
 | `user_id` | `BINARY(16)` | company-aware foreign key to `users` |
 | `token_hash` | `BINARY(32)` | hash of the session token; the token itself is never stored |
-| `expires_at` | `DATETIME(6)` | required |
-| `last_seen_at` | `DATETIME(6)` | for idle timeouts |
+| `expires_at` | `DATETIME(6)` | required; the maximum session length, counted from sign-in |
+| `last_seen_at` | `DATETIME(6)` | last activity, for the idle timeout; updated at most once a minute |
+| `reauth_at` | `DATETIME(6)` | when the password was last re-entered in this session, for sensitive actions |
 
-Sessions end after 1 hour without activity or 30 days after sign-in, whichever comes first; the cookie details are in [0027](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md). Expired rows are deleted. The columns needed for CSRF tokens and password re-entry are added with the authentication design.
+Sessions end after 1 hour without activity or 30 days after sign-in, whichever comes first (companies may shorten both). Expired rows are deleted. The cookie, the CSRF token (derived from the session, so it needs no column), and password re-entry are described on the [authentication](authentication.md) page.
+
+### one_time_tokens
+
+**What it is:** a one-time setup or reset link. An administrator creates one for a new employee or for someone who forgot their password, and passes it on in person or by text.
+
+| Column | Type | Rules |
+|---|---|---|
+| `id` | `BINARY(16)` | primary key |
+| `company_id` | `BINARY(16)` | required |
+| `user_id` | `BINARY(16)` | company-aware foreign key to `users` (whose password it sets) |
+| `purpose` | `VARCHAR(8)` | `setup` or `reset` |
+| `token_hash` | `BINARY(32)` | SHA-256 of the token in the link; the token itself is never stored |
+| `created_by` | `BINARY(16)` | company-aware foreign key to `users` (the administrator) |
+| `expires_at` | `DATETIME(6)` | required; 48 hours after creation by default |
+| `used_at` | `DATETIME(6)` | null = not used yet; a token works once |
+
+Creating a new link cancels the person's earlier unused links. Used and expired rows are deleted.
 
 ### shifts
 
@@ -392,6 +430,7 @@ The application's database user may only insert and read rows here.
 | role_assignments | departments / teams / users (scope) | many to one, only one of them | company-aware foreign keys + `CHECK` | Where the role applies: a department, a team, one employee, or (none set) the whole company |
 | users ↔ users | via reporting_lines | many to many | company-aware foreign keys + `CHECK (manager_id <> employee_id)`; loops rejected by the service | A person can report to several managers; a manager can have many reports |
 | users | sessions | one to many | company-aware foreign key | A person can be signed in on several browsers |
+| users | one_time_tokens | one to many | company-aware foreign key | A person may have a setup or reset link waiting; only the newest one works |
 | departments | shifts | one to many | company-aware foreign key | A shift happens in one department |
 | users | shifts | one to many (optional) | company-aware foreign key + `CHECK` on status | A shift is worked by one employee, or by nobody while it is open |
 | companies | company_settings | one to many | foreign key | A company's configured rules |
@@ -427,7 +466,7 @@ The application's database user may only insert and read rows here.
 | Audit log | indefinitely |
 | Security events | 1 year |
 | Sessions | until expiry, then removed |
-| One-time tokens (setup and reset links; table added with the authentication design) | until used or expired, then removed |
+| One-time tokens (setup and reset links) | until used or expired, then removed |
 
 ## Adding a table
 
