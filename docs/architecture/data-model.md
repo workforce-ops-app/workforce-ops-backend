@@ -71,6 +71,7 @@ erDiagram
         uuid id PK
         uuid company_id FK
         string name
+        string built_in
         datetime archived_at
     }
     permissions {
@@ -224,9 +225,10 @@ Primary key: `(team_id, user_id)`. Being on a team does not change a person's ho
 | `id` | `BINARY(16)` | primary key |
 | `company_id` | `BINARY(16)` | required |
 | `name` | `VARCHAR(80)` | required; unique within the company |
+| `built_in` | `VARCHAR(16)` | `owner`, `administrator`, `manager`, or `employee` for the starting roles; null for roles a company adds; unique per company when set |
 | `archived_at` | `DATETIME(6)` | null = active; archived roles grant nothing |
 
-A new company starts with the roles Owner, Administrator, Manager, and Employee ([0024](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md)). Roles have no rank; who may manage whom follows [reporting lines](#reporting_lines).
+A new company starts with the roles Owner, Administrator, Manager, and Employee ([0024](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md)). `built_in` lets the code find them even after a company renames them. The Owner role is locked: its permissions cannot be edited and it cannot be archived. Roles have no rank; who may manage whom follows [reporting lines](#reporting_lines). What each starting role grants is on the [authorization](authorization.md) page.
 
 ### permissions
 

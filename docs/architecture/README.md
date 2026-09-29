@@ -16,7 +16,7 @@ The backend is organized by feature module ([decision 0004](https://github.com/w
 | [Data model](data-model.md) (core tables, conventions, time zones, retention) | design |
 | [Tenancy](tenancy.md) (keeping companies separate) | design |
 | Authentication and sessions | to do |
-| Authorization (permissions and scopes) | to do |
+| [Authorization](authorization.md) (permissions, starting roles, scopes, reporting chain, escalation rules) | design |
 | [Audit log](audit-log.md) (signed per-company chains) | design |
 | Detection | to do |
 | Background jobs | to do |
