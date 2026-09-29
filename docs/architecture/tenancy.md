@@ -43,5 +43,5 @@ Tenancy decides **which company's data exists** for a request. Authorization (`a
 
 ## Known limits
 
-- MySQL has no row-level security, so layer 1 lives in the application. Layers 2–4 exist so that a single application bug is not enough to leak data.
+- MySQL has no row-level security, so layer 1 lives in the application. Layers 2 to 4 exist so that a single application bug is not enough to leak data.
 - Direct database access (for example with a stolen database password) bypasses layer 1. Database credentials are therefore limited per purpose (application vs migrations), and audit tables are append-only for the application user ([audit log](audit-log.md)).

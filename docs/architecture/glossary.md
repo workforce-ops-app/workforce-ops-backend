@@ -8,7 +8,6 @@
 | **Role** | A named set of permissions, defined per company. |
 | **Permission** | A single allowed action, for example `schedule.edit`. |
 | **Scope** | The employees, departments, or teams a permission applies to for a given user. |
-| **Stewardship** | An explicitly stored manager-to-employee/department/team relationship that defines a manager's scope. |
 | **Candidate** | A coworker's accepted coverage or agreed swap, waiting for manager approval. |
 | **Audit log** | Append-only, tamper-evident record of security-relevant actions. |
 | **Role assignment** | Giving a user a role together with its scope: the whole company, one department, one team, or one employee. |
