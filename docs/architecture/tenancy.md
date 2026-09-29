@@ -39,7 +39,7 @@ flowchart LR
 
 ## Relation to authorization
 
-Tenancy decides **which company's data exists** for a request. Authorization (`authorize()`, [0017](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0017-scoped-role-assignments.md)) then decides what the user may do **within** that company, based on their role assignments and scopes. Both always apply.
+Tenancy decides **which company's data exists** for a request. Authorization (`authorize()`, [0017](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0017-scoped-role-assignments.md)) then decides what the user may do **within** that company, based on their role assignments and scopes, and, for actions on a person, their place in the reporting chain ([0024](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md)). Both always apply.
 
 ## Known limits
 

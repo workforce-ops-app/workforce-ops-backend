@@ -2,7 +2,7 @@
 
 **In short:** how the backend is put together: its layers, modules, data model, and security design.
 
-> Pending: authorization details and API conventions are still being designed. Pages marked *design* describe agreed decisions whose code does not exist yet.
+> Pages marked *design* describe agreed decisions whose code does not exist yet. The pages marked *to do* are written before the code they describe; the decisions behind them are already made (0024 authorization, 0026 API conventions, 0027 authentication).
 
 ## Overview
 

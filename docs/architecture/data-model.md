@@ -27,7 +27,7 @@ erDiagram
     users ||--o{ reporting_lines : "reports through (employee_id)"
     users ||--o{ sessions : "signs in with"
     departments ||--o{ shifts : "scheduled in"
-    users ||--o{ shifts : works
+    users |o--o{ shifts : "works (none while open)"
     companies ||--o{ company_settings : configures
     companies |o--|| audit_chain_heads : "has one chain head"
     audit_chain_heads ||--o{ audit_events : "orders and seals"
@@ -116,6 +116,10 @@ erDiagram
         datetime ends_at
         string timezone
         string status
+        string details
+        text notes
+        string event_name
+        text event_description
     }
     company_settings {
         uuid company_id FK
@@ -195,7 +199,7 @@ Not itself company-owned. Only platform code creates or archives companies.
 | `company_id` | `BINARY(16)` | required |
 | `department_id` | `BINARY(16)` | required; company-aware foreign key to `departments` (home department) |
 | `email` | `VARCHAR(254)` | required; unique within the company |
-| `password_hash` | `VARCHAR(255)` | required; algorithm decided with authentication |
+| `password_hash` | `VARCHAR(255)` | required; Argon2id ([0027](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md)) |
 | `display_name` | `VARCHAR(120)` | required |
 | `deactivated_at` | `DATETIME(6)` | null = active; deactivated users cannot sign in |
 
@@ -222,7 +226,7 @@ Primary key: `(team_id, user_id)`. Being on a team does not change a person's ho
 | `name` | `VARCHAR(80)` | required; unique within the company |
 | `archived_at` | `DATETIME(6)` | null = active; archived roles grant nothing |
 
-Which roles a new company starts with is part of the authorization design.
+A new company starts with the roles Owner, Administrator, Manager, and Employee ([0024](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md)). Roles have no rank; who may manage whom follows [reporting lines](#reporting_lines).
 
 ### permissions
 
@@ -230,7 +234,7 @@ Which roles a new company starts with is part of the authorization design.
 
 | Column | Type | Rules |
 |---|---|---|
-| `code` | `VARCHAR(100)` | primary key; naming scheme decided with authorization |
+| `code` | `VARCHAR(100)` | primary key; `resource.action`, lowercase, `_self` suffix for self-service, e.g. `schedule.view_self` ([0024](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md)) |
 | `module` | `VARCHAR(50)` | the module that declares it |
 | `description` | `VARCHAR(255)` | plain-language meaning |
 
@@ -284,7 +288,7 @@ A `CHECK (manager_id <> employee_id)` constraint stops anyone reporting to thems
 - rejects changes to a person's own reporting lines;
 - writes every added or ended line to the audit log.
 
-Loops and "not your own lines" cannot be checked by a single-row constraint, so they are enforced in the service and covered by security tests. What reporting lines allow a manager to do, and who may add or end them, is part of the authorization design.
+Loops and "not your own lines" cannot be checked by a single-row constraint, so they are enforced in the service and covered by security tests. What reporting lines allow (being above someone decides *whom* you may act on; permissions decide *what*), and who may add or end them (someone above both people, with `reporting_line.manage`), are set out in [0024](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md).
 
 ### sessions
 
@@ -299,21 +303,27 @@ Loops and "not your own lines" cannot be checked by a single-row constraint, so 
 | `expires_at` | `DATETIME(6)` | required |
 | `last_seen_at` | `DATETIME(6)` | for idle timeouts |
 
-Lifetimes, idle timeouts, and cookie details are part of the API conventions. Expired rows are deleted.
+Sessions end after 1 hour without activity or 30 days after sign-in, whichever comes first; the cookie details are in [0027](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md). Expired rows are deleted. The columns needed for CSRF tokens and password re-entry are added with the authentication design.
 
 ### shifts
 
-**What it is:** one scheduled block of work for one employee. Listed here because roles, tenancy, and the audit log refer to it; its full rules are on the schedules feature page.
+**What it is:** one scheduled block of work in a department, worked by one employee, or by nobody yet (an *open shift*, for example after the employee's time off was approved). Listed here because roles, tenancy, and the audit log refer to it; its full rules are on the schedules feature page.
 
 | Column | Type | Rules |
 |---|---|---|
 | `id` | `BINARY(16)` | primary key |
 | `company_id` | `BINARY(16)` | required |
-| `department_id` | `BINARY(16)` | company-aware foreign key to `departments` |
-| `employee_id` | `BINARY(16)` | company-aware foreign key to `users` |
+| `department_id` | `BINARY(16)` | required; company-aware foreign key to `departments` |
+| `employee_id` | `BINARY(16)` | company-aware foreign key to `users`; null while the shift is open |
 | `starts_at`, `ends_at` | `DATETIME(6)` | UTC; `CHECK (ends_at > starts_at)` |
 | `timezone` | `VARCHAR(64)` | the workplace zone at creation, copied and never recalculated |
-| `status` | `VARCHAR(12)` | `scheduled` or `cancelled` |
+| `status` | `VARCHAR(12)` | `scheduled`, `open`, or `cancelled`; `CHECK`: `employee_id` is null exactly when the status is `open` |
+| `details` | `VARCHAR(200)` | optional; what the shift is, e.g. "Register 2" |
+| `notes` | `TEXT` | optional; instructions for whoever works it |
+| `event_name` | `VARCHAR(120)` | optional; a special event during the shift, e.g. "Inventory night" |
+| `event_description` | `TEXT` | optional |
+
+Details, notes, and event text are written by users, so they are shown as plain text, never as HTML. Draft-and-publish schedules (next tier) will add a publication state on the schedules feature page.
 
 ### company_settings
 
@@ -383,7 +393,7 @@ The application's database user may only insert and read rows here.
 | users ↔ users | via reporting_lines | many to many | company-aware foreign keys + `CHECK (manager_id <> employee_id)`; loops rejected by the service | A person can report to several managers; a manager can have many reports |
 | users | sessions | one to many | company-aware foreign key | A person can be signed in on several browsers |
 | departments | shifts | one to many | company-aware foreign key | A shift happens in one department |
-| users | shifts | one to many | company-aware foreign key | A shift is worked by one employee |
+| users | shifts | one to many (optional) | company-aware foreign key + `CHECK` on status | A shift is worked by one employee, or by nobody while it is open |
 | companies | company_settings | one to many | foreign key | A company's configured rules |
 | companies | audit_chain_heads | one to one | foreign key + unique `company_id` | Each company has exactly one audit log bookmark; the platform's bookmark has no company |
 | audit_chain_heads | audit_events | one to many | foreign key + unique `(chain_id, seq)` | Every entry belongs to one log, in numbered order |
@@ -408,7 +418,7 @@ The application's database user may only insert and read rows here.
 
 - The **workplace zone** for a shift is the department's `timezone` if set, otherwise the company's.
 - When a shift is created, that zone is copied into `shifts.timezone`, so later settings changes or daylight-saving rules never move existing shifts.
-- Deadlines ("no swaps within 24 hours of the shift") are computed in UTC.
+- Deadlines and cutoffs (for example "24 hours before the shift") are computed in UTC.
 
 ## Retention
 
@@ -417,7 +427,7 @@ The application's database user may only insert and read rows here.
 | Audit log | indefinitely |
 | Security events | 1 year |
 | Sessions | until expiry, then removed |
-| One-time tokens | until used or expired, then removed |
+| One-time tokens (setup and reset links; table added with the authentication design) | until used or expired, then removed |
 
 ## Adding a table
 
