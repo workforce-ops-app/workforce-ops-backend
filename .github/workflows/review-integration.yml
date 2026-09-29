@@ -1,9 +1,10 @@
 # Keeps review/integration equal to main + every open, ready-for-review PR.
 name: review-integration
 
+# No push trigger: main only changes through merged PRs, and a merge already
+# fires "closed". A second run started by the push would be cancelled by that
+# one, and a cancelled run marks the main commit as failed.
 on:
-  push:
-    branches: [main]
   pull_request_target:
     types: [opened, reopened, synchronize, closed, ready_for_review, converted_to_draft]
     branches: [main]
