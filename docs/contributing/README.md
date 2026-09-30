@@ -2,7 +2,23 @@
 
 **In short:** how to set up and work on the backend. The shared workflow (issues, branches, PRs, CI) is in the [contributor guide](https://github.com/workforce-ops-app/.github/tree/main/docs/contributing); this page covers what is specific to this repository.
 
-> Setup and run commands are added with the backend skeleton (Phase 1). Until then: install Python 3.13 and `pre-commit`, then run `pre-commit install` in this repository ([local setup](https://github.com/workforce-ops-app/.github/blob/main/docs/contributing/local-setup.md)).
+## First-time setup
+
+Needs Python 3.13 and pre-commit ([local setup](https://github.com/workforce-ops-app/.github/blob/main/docs/contributing/local-setup.md)). From this repository's folder:
+
+```
+py -3.13 -m venv .venv                 # macOS/Linux: python3.13 -m venv .venv
+.venv\Scriptsctivate                 # macOS/Linux: source .venv/bin/activate
+python -m pip install -e ".[dev]"      # the app plus the development tools
+copy .env.example .env                 # macOS/Linux: cp .env.example .env
+pre-commit install
+```
+
+- **The virtual environment** (`.venv`) keeps this project's packages separate from other projects and from the system Python. Activate it in each new terminal before working here; the prompt then starts with `(.venv)`.
+- **`-e` (editable)** means code changes take effect without reinstalling.
+- **Dependencies** are pinned to exact versions in `pyproject.toml`; Dependabot proposes updates. After pulling a change to `pyproject.toml`, run the install line again.
+- **Settings** come from environment variables; `.env` holds them for local use and is never committed. Every setting is listed in `.env.example`.
+
 
 ## Quick reference
 
@@ -11,6 +27,10 @@
 | Run all CI checks locally | `python ../.github/scripts/ci_runner.py` |
 | Run one check | `python ../.github/scripts/ci_runner.py --only lint` |
 | Install git hooks | `pre-commit install` |
+| Format the code | `ruff format .` |
+| Lint (including security rules) | `ruff check .` (add `--fix` for automatic fixes) |
+| Type check | `mypy app` |
+| Check dependencies for known vulnerabilities | `pip-audit --skip-editable` |
 
 ## Conventions specific to this repository
 
