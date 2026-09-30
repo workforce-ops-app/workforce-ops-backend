@@ -61,8 +61,8 @@ stateDiagram-v2
     Pending --> Cancelled: employee cancels
     Escalated --> Cancelled: employee cancels
     Approved --> Cancelled: employee cancels before the first day
-    Pending --> Expired: first day passes undecided
-    Escalated --> Expired: first day passes undecided
+    Pending --> Denied: not reviewed by the end of the first day
+    Escalated --> Denied: not reviewed by the end of the first day
 ```
 
 - **Whole days only**, from a first to a last day (at most 30 days per request), stored as `DATE` in the employee's workplace zone ([0021](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md)). The first day is today or later.
@@ -76,8 +76,12 @@ stateDiagram-v2
 - **Reviewers are checked at the moment they decide** (still above the employee, still holding `time_off.review`).
 - **On approval:** every shift of the employee that overlaps the approved days becomes **open** (`employee_id` cleared, status `open`), with an audit entry linking it to the request.
 - **Cancelling an approved request** does not give the shifts back automatically; the manager reassigns them.
-- **Expiry:** a request still undecided when its first day arrives expires. Time-off requests do not use the 7-day expiry that role grants and owner changes use ([0032](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md)), since people often ask weeks ahead.
-- **Next tier:** advance-notice and deadline policies, reminders, notifications. Attachments (for example a doctor's note) are stretch.
+- **Not reviewed in time:** a request still undecided (pending or escalated) when its **first day ends** (midnight in the employee's workplace zone) is **declined**. It counts as declined for everything, and the audit log records that nobody reviewed it; the employee sees "Declined: not reviewed in time". Waiting until the first day ends means a same-day request (for example a sick day) can still be approved during that day. Role grants, owner changes, and account changes use a 7-day deadline instead ([0032](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md)).
+- **Next tier:**
+  - **Advance notice**, company setting `time_off.min_notice_days` (default 0): how many days before the first day an employee must ask.
+  - **Decision deadline**, company setting `time_off.decision_deadline_hours` (default: none, which keeps the end-of-first-day rule): how long before the first day reviewers must decide. When it passes undecided, the request either is declined as not reviewed or moves up the chain to the next person above; which of the two is decided when the next tier is designed.
+  - Reminders to reviewers, and notifications.
+  - Attachments (for example a doctor's note) are stretch.
 
 ### Backend
 
@@ -102,9 +106,9 @@ stateDiagram-v2
 | `employee_id` | `BINARY(16)` | required; company-aware foreign key to `users` |
 | `first_day`, `last_day` | `DATE` | required; `CHECK (last_day >= first_day)`; in the employee's workplace zone |
 | `reason` | `VARCHAR(500)` | optional; shown as plain text |
-| `status` | `VARCHAR(12)` | `pending`, `escalated`, `approved`, `denied`, `cancelled`, or `expired` |
+| `status` | `VARCHAR(12)` | `pending`, `escalated`, `approved`, `denied`, or `cancelled`; a request declined because nobody reviewed it is `denied`, and its approval record has `not_reviewed` set |
 | `approval_request_id` | `BINARY(16)` | required; company-aware foreign key to `approval_requests` (kind `time_off`) |
-| `decided_at` | `DATETIME(6)` | null until approved, denied, cancelled, or expired |
+| `decided_at` | `DATETIME(6)` | null until approved, denied, or cancelled |
 
 | From | To | How many | Enforced by | Meaning |
 |---|---|---|---|---|
@@ -115,11 +119,11 @@ stateDiagram-v2
 
 **Scope resolver:** a request belongs to its employee, and through them to their home department and teams.
 
-**Background job:** once a day, requests still pending or escalated whose first day has arrived are marked expired (actor `system`).
+**Background job:** at least once an hour, requests still pending or escalated whose first day has ended in the employee's workplace zone are declined as not reviewed (actor `system`). The API also refuses decisions after that moment, so the outcome does not depend on when the job last ran.
 
 ### Audit and security
 
-**Audit events:** `time_off.requested`, `time_off.approved`, `time_off.denied`, `time_off.escalated` (details: who it went to), `time_off.cancelled`, `time_off.expired` (actor `system`), and `shift.opened` for each shift opened by an approval (details: the request).
+**Audit events:** `time_off.requested`, `time_off.approved`, `time_off.denied`, `time_off.escalated` (details: who it went to), `time_off.cancelled`, `time_off.not_reviewed` (actor `system`; the request is declined), and `shift.opened` for each shift opened by an approval (details: the request).
 
 **Threats** ([threat model](../security/threat-model.md)): E5 (approving your own request), E3 (reviewing someone you are not above), I1 and I2 (seeing others' requests), T2 (setting the status directly), T5 (reason text).
 

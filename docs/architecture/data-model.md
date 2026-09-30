@@ -117,7 +117,8 @@ erDiagram
         json payload
         string status
         int required_approvals
-        datetime expires_at
+        datetime review_by
+        boolean not_reviewed
     }
     approval_decisions {
         uuid company_id FK
@@ -345,9 +346,10 @@ Loops and "not your own lines" cannot be checked by a single-row constraint, so 
 | `requested_by` | `BINARY(16)` | company-aware foreign key to `users` |
 | `subject_user_id` | `BINARY(16)` | company-aware foreign key to `users`: the person the request is about |
 | `payload` | `JSON` | what will happen on approval, e.g. the role and scope; validated against the kind |
-| `status` | `VARCHAR(12)` | `pending`, `approved`, `denied`, `cancelled`, or `expired` |
+| `status` | `VARCHAR(12)` | `pending`, `approved`, `denied`, or `cancelled` |
 | `required_approvals` | `SMALLINT` | how many approvals it needs (1 for a same-level grant; the number of owners who must agree for owner changes) |
-| `expires_at` | `DATETIME(6)` | 7 days after creation by default |
+| `review_by` | `DATETIME(6)` | the review deadline: 7 days after creation for role grants, owner changes, and account changes; features set their own (time off: the end of the first day) |
+| `not_reviewed` | `BOOLEAN` | true when the request was declined because nobody decided by `review_by`; recorded as "not reviewed" in the audit log |
 | `decided_at` | `DATETIME(6)` | null while pending |
 
 A pending request grants nothing: a role assignment is created only when the request is approved. Who may decide is checked again at the moment of each decision.

@@ -167,7 +167,7 @@ The owner is the only person who holds every permission. Everyone else holds a p
 
 **Who approves a same-level grant:** the granter's direct managers who hold `role.assign`; if none of them can, the request moves up the chain one level at a time, ending at the Owner. This is the same routing as requests in [0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md). Nobody approves a request they made or one that gives them a role. Approvers are checked again at the moment they decide.
 
-**Approval requests** are stored in `approval_requests` and `approval_decisions` ([data model](data-model.md#approval_requests)), shared with time off. A request not decided within 7 days expires; the requester may send it again. In the core tier, reviewers see pending requests on their page; notifications arrive with the next tier.
+**Approval requests** are stored in `approval_requests` and `approval_decisions` ([data model](data-model.md#approval_requests)), shared with time off. A request nobody decides within 7 days is **declined as not reviewed**: it counts as declined, and the audit log records that nobody reviewed it. The requester may send it again. In the core tier, reviewers see pending requests on their page; notifications arrive with the next tier.
 
 ## Escalation rules
 
@@ -212,7 +212,7 @@ Schedule changes affecting 10 or more shifts show a confirmation with the count 
 | `role_assignment.added`, `role_assignment.removed` | someone gains or loses a role (details: scope) |
 | `reporting_line.added`, `reporting_line.ended` | a reporting line starts or ends |
 | `ownership.owner_added`, `ownership.owner_removed` | an owner change takes effect |
-| `approval.requested`, `approval.approved`, `approval.denied`, `approval.expired`, `approval.cancelled` | a same-level grant or owner change is requested, decided, or lapses (details: kind, who) |
+| `approval.requested`, `approval.approved`, `approval.denied`, `approval.not_reviewed`, `approval.cancelled` | a same-level grant or owner change is requested, decided, or lapses (details: kind, who) |
 
 Refused requests (403) are not audit entries: they are recorded as security events for detection (next tier), with the permission and the kind of target, never the record's contents.
 
