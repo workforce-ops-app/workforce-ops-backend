@@ -40,7 +40,8 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 | `time_off.view` | record | see time-off requests of people in scope |
 | `time_off.review` | person | approve or deny the requests of people you are above ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)) |
 | `user.view` | record | see people in scope (name, department, teams, roles) |
-| `user.manage` | person | create accounts, issue setup and reset links, deactivate, unlock, sign out |
+| `user.manage` | person | create accounts, issue setup and reset links, deactivate, unlock, sign out; approve other people's requests to change their own name or email |
+| `account.change_self` | self | ask to change your own display name or email; takes effect once approved from above ([0032](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md)) |
 | `org.manage` | company | create, rename, and archive departments and teams; move people between them |
 | `role.view` | company | see roles and what they grant |
 | `role.manage` | company | create roles; change, rename, or archive a role whose holders are all below you ([delegation limits](#delegation-limits)) |
@@ -65,6 +66,7 @@ Every new company gets four roles ([0024](https://github.com/workforce-ops-app/.
 | `time_off.request`, `time_off.cancel_self` | yes | yes | yes | yes |
 | `time_off.view`, `time_off.review` | yes | yes | yes | |
 | `user.view` | yes | yes | yes | |
+| `account.change_self` | yes | yes | yes | yes |
 | `user.manage` | yes | yes | | |
 | `org.manage` | yes | yes | | |
 | `role.view` | yes | yes | yes | |
