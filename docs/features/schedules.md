@@ -42,7 +42,7 @@ stateDiagram-v2
 ```
 
 - **Status and person match:** a shift is `open` exactly when it has no person; the database enforces this with a `CHECK` ([data model](../architecture/data-model.md#shifts)).
-- **Times:** entered in the **workplace zone** (the department's time zone, or the company's), stored in UTC, and the zone is copied onto the shift so later changes never move it ([0021](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md)). The end is after the start; a shift is at most 16 hours long.
+- **Times:** entered in the **workplace zone** (the department's time zone, or the company's), stored in UTC, and the zone is copied onto the shift so later changes never move it ([0021](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md)). The end is after the start; a shift is at most **12 hours** long, a common practical limit for a single shift (many countries set stricter working-time rules).
 - **Who can be assigned:** an active person whose home department is the shift's department, or who is on a team in it. Invited or deactivated people cannot be assigned.
 - **No double booking:** a person cannot have two shifts that overlap (409).
 - **Time off:** a person cannot be assigned during their approved time off (409).
