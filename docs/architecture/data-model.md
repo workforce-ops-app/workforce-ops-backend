@@ -123,6 +123,7 @@ erDiagram
     approval_decisions {
         uuid company_id FK
         uuid request_id FK
+        string approver_type
         uuid approver_id FK
         string decision
         datetime decided_at
@@ -336,13 +337,13 @@ Loops and "not your own lines" cannot be checked by a single-row constraint, so 
 
 ### approval_requests
 
-**What it is:** something waiting for approval from people above the requester: giving someone a role at the granter's own level, adding or removing an owner ([0032](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md)), and later time-off and coverage reviews ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)).
+**What it is:** something waiting for approval from people above the requester: giving someone a role at the granter's own level, adding or removing an owner, changing your own name or email ([0032](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md)), and later time-off and coverage reviews ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)).
 
 | Column | Type | Rules |
 |---|---|---|
 | `id` | `BINARY(16)` | primary key |
 | `company_id` | `BINARY(16)` | required |
-| `kind` | `VARCHAR(24)` | `role_assignment`, `owner_add`, `owner_remove`; later features add their own |
+| `kind` | `VARCHAR(24)` | `role_assignment`, `owner_add`, `owner_remove`, `account_change`; later features add their own |
 | `requested_by` | `BINARY(16)` | company-aware foreign key to `users` |
 | `subject_user_id` | `BINARY(16)` | company-aware foreign key to `users`: the person the request is about |
 | `payload` | `JSON` | what will happen on approval, e.g. the role and scope; validated against the kind |
@@ -362,7 +363,8 @@ A pending request grants nothing: a role assignment is created only when the req
 |---|---|---|
 | `company_id` | `BINARY(16)` | required |
 | `request_id` | `BINARY(16)` | company-aware foreign key to `approval_requests` |
-| `approver_id` | `BINARY(16)` | company-aware foreign key to `users` |
+| `approver_type` | `VARCHAR(16)` | `user`, or `platform_user` when platform staff decide (a sole owner's account change) |
+| `approver_id` | `BINARY(16)` | who decided; a company-aware foreign key to `users` when `approver_type = user` (platform staff are stored separately) |
 | `decision` | `VARCHAR(8)` | `approve` or `deny` |
 | `decided_at` | `DATETIME(6)` | required |
 
