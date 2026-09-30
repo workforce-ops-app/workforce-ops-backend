@@ -9,7 +9,7 @@ New pages start from the [feature template](https://github.com/workforce-ops-app
 | Schedules and shifts | [schedules](schedules.md) | design, core tier |
 | Companies, departments, teams, users; demo data | [organization](organization.md) | design, core tier |
 | Roles, role assignments, reporting lines, owners | [organization](organization.md), rules in [authorization](../architecture/authorization.md) | design, core tier |
-| Time-off requests | — | planned |
+| Time-off requests | [time off](time-off.md) | design, core tier |
 | Shift coverage and swaps | — | planned |
 | Shift tasks | — | planned |
 | Announcements | — | planned |
