@@ -348,7 +348,7 @@ Loops and "not your own lines" cannot be checked by a single-row constraint, so 
 | `payload` | `JSON` | what will happen on approval, e.g. the role and scope; validated against the kind |
 | `status` | `VARCHAR(12)` | `pending`, `approved`, `denied`, or `cancelled` |
 | `required_approvals` | `SMALLINT` | how many approvals it needs (1 for a same-level grant; the number of owners who must agree for owner changes) |
-| `review_by` | `DATETIME(6)` | the review deadline: 7 days after creation for role grants, owner changes, and account changes; features set their own (time off: the end of the first day) |
+| `review_by` | `DATETIME(6)` | the review deadline: 7 days after creation for role grants, owner changes, and account changes; features set their own (time off: the start of the first day) |
 | `not_reviewed` | `BOOLEAN` | true when the request was declined because nobody decided by `review_by`; recorded as "not reviewed" in the audit log |
 | `decided_at` | `DATETIME(6)` | null while pending |
 

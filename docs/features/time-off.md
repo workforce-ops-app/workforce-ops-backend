@@ -42,6 +42,7 @@ sequenceDiagram
 3. Reviewers see the request, its affected shifts, and the other reviewers' decisions. Anyone higher in the chain may also step in.
 4. When it is approved, the employee's shifts on those days become **open**. The manager can give them to someone else before or after the decision ([schedules](schedules.md)).
 5. The employee can cancel their request until its first day.
+6. **Same-day absences** (for example calling in sick that morning) are not time-off requests: the manager makes that day's shifts open on the schedule, which is audited ([schedules](schedules.md)).
 
 In the core tier, requests and their status are shown on the pages; notifications come with the next tier.
 
@@ -61,11 +62,11 @@ stateDiagram-v2
     Pending --> Cancelled: employee cancels
     Escalated --> Cancelled: employee cancels
     Approved --> Cancelled: employee cancels before the first day
-    Pending --> Denied: not reviewed by the end of the first day
-    Escalated --> Denied: not reviewed by the end of the first day
+    Pending --> Denied: not reviewed before the first day begins
+    Escalated --> Denied: not reviewed before the first day begins
 ```
 
-- **Whole days only**, from a first to a last day (at most 30 days per request), stored as `DATE` in the employee's workplace zone ([0021](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md)). The first day is today or later.
+- **Whole days only**, from a first to a last day (at most 30 days per request), stored as `DATE` in the employee's workplace zone ([0021](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md)). The first day is **tomorrow or later**, so every request can be reviewed before it starts.
 - **No overlap:** a new request may not overlap the employee's own pending, escalated, or approved requests (409).
 - **Required approvals:** a company setting, `time_off.required_approvals`, default **1**, counted among the direct managers ([company settings](../architecture/data-model.md#company_settings)). If fewer direct managers can review than required, administrators are told the setting is misconfigured and all available direct managers are required instead.
 - **Outcome among direct managers:**
@@ -76,10 +77,10 @@ stateDiagram-v2
 - **Reviewers are checked at the moment they decide** (still above the employee, still holding `time_off.review`).
 - **On approval:** every shift of the employee that overlaps the approved days becomes **open** (`employee_id` cleared, status `open`), with an audit entry linking it to the request.
 - **Cancelling an approved request** does not give the shifts back automatically; the manager reassigns them.
-- **Not reviewed in time:** a request still undecided (pending or escalated) when its **first day ends** (midnight in the employee's workplace zone) is **declined**. It counts as declined for everything, and the audit log records that nobody reviewed it; the employee sees "Declined: not reviewed in time". Waiting until the first day ends means a same-day request (for example a sick day) can still be approved during that day. Role grants, owner changes, and account changes use a 7-day deadline instead ([0032](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md)).
+- **Not reviewed in time:** a request still undecided (pending or escalated) when its **first day begins** (midnight in the employee's workplace zone) is **declined**. It counts as declined for everything, and the audit log records that nobody reviewed it; the employee sees "Declined: not reviewed in time". Role grants, owner changes, and account changes use a 7-day deadline instead ([0032](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md)).
 - **Next tier:**
   - **Advance notice**, company setting `time_off.min_notice_days` (default 0): how many days before the first day an employee must ask.
-  - **Decision deadline**, company setting `time_off.decision_deadline_hours` (default: none, which keeps the end-of-first-day rule): how long before the first day reviewers must decide. When it passes undecided, the request either is declined as not reviewed or moves up the chain to the next person above; which of the two is decided when the next tier is designed.
+  - **Decision deadline**, company setting `time_off.decision_deadline_hours` (default: none, which keeps the start-of-first-day rule): how long before the first day reviewers must decide. When it passes undecided, the request either is declined as not reviewed or moves up the chain to the next person above; which of the two is decided when the next tier is designed.
   - Reminders to reviewers, and notifications.
   - Attachments (for example a doctor's note) are stretch.
 
@@ -119,7 +120,7 @@ stateDiagram-v2
 
 **Scope resolver:** a request belongs to its employee, and through them to their home department and teams.
 
-**Background job:** at least once an hour, requests still pending or escalated whose first day has ended in the employee's workplace zone are declined as not reviewed (actor `system`). The API also refuses decisions after that moment, so the outcome does not depend on when the job last ran.
+**Background job:** at least once an hour, requests still pending or escalated whose first day has begun in the employee's workplace zone are declined as not reviewed (actor `system`). The API also refuses decisions after that moment, so the outcome does not depend on when the job last ran.
 
 ### Audit and security
 
