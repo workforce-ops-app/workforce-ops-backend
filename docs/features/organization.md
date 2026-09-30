@@ -18,6 +18,7 @@ Administrators set up their company in the application: its departments and team
 | Owner | propose adding or removing an owner | `company.transfer_ownership` | company |
 | Manager | see the people in their scope and their roles | `user.view`, `role.view` | their assignment's scope |
 | Everyone | see their own name, department, teams, roles, and managers | none | own account |
+| Everyone | ask to change their own display name (core) or email (next tier); it takes effect once approved from above | `account.change_self` | own account |
 
 These are the starting roles' defaults ([authorization](../architecture/authorization.md#starting-roles)); companies can change what their roles grant.
 
@@ -67,6 +68,14 @@ stateDiagram-v2
 - **Email addresses** are unique across the platform and stored in lowercase. When an address is taken, the answer is "this email can't be used" without saying where ([0016](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0016-tenant-isolation.md)).
 - Nobody deactivates, unlocks, or signs out themselves through these actions, and the last owner cannot be deactivated.
 
+**Changing your own name or email** ([0032](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md))
+- A person asks for the change; nothing changes until it is approved.
+- **Who approves:** the nearest person above them who holds `user.manage` (usually an administrator), walking up the chain and ending at the Owner.
+- **Owners:** with several owners, another owner approves. A sole owner's request goes to platform staff; until platform staff screens exist, the platform operators decide with a command-line tool, recorded in the platform audit chain.
+- **Email (next tier):** the password must be re-entered when asking; the address must not be taken (checked when asked and again when approved, with the generic answer if taken); when the change takes effect, the person's other sessions end. A confirmation link to the new address can be added once email delivery exists.
+- Requests not decided within 7 days expire.
+- Administrators with `user.manage` who are above the person can still change the name or email directly.
+
 **Roles, assignments, reporting lines, and owners** follow the [authorization](../architecture/authorization.md) page: rules AZ1 to AZ15, the delegation limits, and the approval requests for same-level grants and owner changes. Actions marked *sensitive* there need the password re-entered.
 
 ### Backend
@@ -91,6 +100,7 @@ stateDiagram-v2
 | `GET /reporting-lines?user_id=` | `user.view` | a person's managers and reports |
 | `POST /reporting-lines`, `POST /reporting-lines/{id}/end` | `reporting_line.manage`, above both people | add or end a line |
 | `POST /owners`, `POST /owners/{user_id}/remove` | Owner | propose an owner change (an approval request) |
+| `POST /me/account-changes` `{display_name}` or `{email}` | `account.change_self` (email: next tier, password re-entry) | ask to change your own name or email; answers 202 with an approval request |
 | `GET /approval-requests` | signed in | requests you made and requests waiting for you |
 | `POST /approval-requests/{id}/approve`, `.../deny`, `.../cancel` | the eligible approver, or the requester for cancel | decide or withdraw |
 
@@ -113,7 +123,7 @@ The seed script (`python -m scripts.seed_demo`) creates the same data on every r
 
 ### Audit and security
 
-**Audit events:** `department.created`, `department.updated`, `department.archived`, `team.created`, `team.updated`, `team.archived`, `team_member.added`, `team_member.removed`, `user.created`, `user.updated` (details: which fields), `user.deactivated`, `user.reactivated`; plus the role, reporting-line, ownership, and approval events on the [authorization](../architecture/authorization.md#audit-events) page.
+**Audit events:** `department.created`, `department.updated`, `department.archived`, `team.created`, `team.updated`, `team.archived`, `team_member.added`, `team_member.removed`, `user.created`, `user.updated` (details: which fields), `user.deactivated`, `user.reactivated`, `user.change_requested` (details: which field); approved changes are recorded as `user.updated` with the approver; plus the role, reporting-line, ownership, and approval events on the [authorization](../architecture/authorization.md#audit-events) page.
 
 **Threats** ([threat model](../security/threat-model.md)): I1 and T3 (other companies' people), I2 (people outside scope), I3 (email already taken), E1 to E6 and E9 (access changes).
 
@@ -123,8 +133,11 @@ The seed script (`python -m scripts.seed_demo`) creates the same data on every r
 - Every escalation rule AZ1 to AZ15 has a test.
 - Deactivation ends the person's sessions and cancels their links.
 - Creating an account with an email used by the other company gives the generic answer.
+- A person's own name change does not take effect before approval; the approver must hold `user.manage` and be above them; nobody approves their own change.
+- (Next tier) An email change without a recent password re-entry is refused; an address taken between request and approval is refused at approval.
 
 ### Known limitations
 - No screen for creating companies or platform staff accounts yet; the seed script does it.
 - No bulk import of people.
-- People cannot edit their own name or email; an administrator does it.
+- Changing your own email arrives with the next tier; until then an administrator changes it.
+- A sole owner's name change waits for the platform operators' command-line tool until platform staff screens exist.
