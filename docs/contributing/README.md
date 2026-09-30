@@ -1,8 +1,8 @@
-# Contributor Documentation — Backend
+# Contributor Documentation: Backend
 
 **In short:** how to set up and work on the backend. The shared workflow (issues, branches, PRs, CI) is in the [contributor guide](https://github.com/workforce-ops-app/.github/tree/main/docs/contributing); this page covers what is specific to this repository.
 
-> Pending: setup commands will be added with the application scaffold.
+> Setup and run commands are added with the backend skeleton (Phase 1). Until then: install Python 3.13 and `pre-commit`, then run `pre-commit install` in this repository ([local setup](https://github.com/workforce-ops-app/.github/blob/main/docs/contributing/local-setup.md)).
 
 ## Quick reference
 
