@@ -4,7 +4,7 @@
 
 | Document | Status |
 |---|---|
-| Threat model | to do |
+| [Threat model](threat-model.md) (data flows, attacker profiles, STRIDE threats and protections) | design, core tier |
 | Security controls | to do |
 | Findings log | to do: entries are added only after a finding's fix merges ([security policy](https://github.com/workforce-ops-app/.github/blob/main/SECURITY.md)) |
 | Detection study (pattern-based detection results) | to do |
