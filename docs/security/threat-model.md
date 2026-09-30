@@ -10,7 +10,7 @@
 |---|---|
 | Company data: people, schedules, time-off requests | Personal and business information; each company must only ever see its own |
 | Credentials: password hashes, session tokens, one-time setup and reset links | Whoever holds them can act as the user |
-| Access rules: roles, role assignments, reporting lines | Whoever can change them can give themselves more power |
+| Access rules: roles, role assignments, reporting lines | Access is handed down from the owner: only the owner holds every permission, and each person can pass on at most what they hold, only to people below them. Whoever changes these rules outside that path could give themselves or others more power than the owner intended |
 | The audit log and its signing key | The trustworthy record of who did what |
 | Availability | People need to see their shifts and request time off when they need to |
 | Backups (next tier) | The way back after data is destroyed |
@@ -123,13 +123,14 @@ Each row names the threat, who could carry it out, the protection (with the deci
 | ID | Threat | Profiles | Protection | Tested by |
 |---|---|---|---|---|
 | E1 | Giving yourself more access: editing your own roles or reporting lines | P2, P3 | nobody changes their own role assignments or reporting lines ([0024](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md)) | escalation tests |
-| E2 | Granting a permission you do not hold, by editing a role or assigning one | P3 | nobody grants a permission they do not hold (0024) | escalation tests |
+| E2 | Granting a permission you do not hold, or copying your own level onto others without anyone above knowing | P3 | nobody grants a permission they do not hold (0024); giving a role at your own level needs approval from someone above you ([0032](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md)) | escalation tests; approval tests |
 | E3 | Acting on a peer or a superior, for example one administrator resetting another's password | P3 | acting on a person needs the permission **and** a position above them in the reporting chain (0024) | tests for peers, superiors, and people in other branches of the chain |
 | E4 | Rearranging reporting lines to get above someone | P3 | adding or ending a line needs a position above both people, `reporting_line.manage`, and the password re-entered; loops are rejected; every change is audited (0024, 0025) | tests for loops, self-changes, and missing positions |
 | E5 | Approving your own request | P2, P3 | nobody reviews their own request ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)) | self-approval tests |
-| E6 | Taking over a company: removing the last owner, or forcing an ownership transfer | P3 | the last owner cannot be removed or demoted; ownership changes only through a transfer that needs the password re-entered (0024, 0025) | last-owner tests |
+| E6 | Taking over a company: removing the last owner, adding yourself or an ally as owner, or one co-owner removing another | P3 | only owners add or remove owners, with the password re-entered; adding needs every current owner, removing needs every other owner; the last owner cannot be removed (0024, 0025, 0032) | owner-change and last-owner tests |
 | E7 | Weakening company security settings | P3 | companies can only make settings stricter, within platform limits (0025) | tests for values below the limits |
 | E8 | Calling the API directly for actions whose buttons are hidden | P2 | the interface only hides buttons for convenience; the API checks every action | every endpoint's permission test runs without the interface |
+| E9 | Changing a role held by peers or superiors, for example an administrator weakening or reshaping the Administrator role | P3 | a role can be changed only by someone above every current holder, or the Owner; the Owner role is locked (0032) | role-editing tests with holders above, beside, and below the editor |
 
 ## Course topics and audit checklist
 
@@ -140,7 +141,7 @@ Each row names the threat, who could carry it out, the protection (with the deci
 | Cross-site request forgery | S4 |
 | Cross-site scripting | T5 |
 | Cryptography | S1 (Argon2id), S5 and I5 (hashed tokens), T4 (HMAC chain) |
-| Secure coding and defense in depth | T3, I1 to I3, E1 to E8 |
+| Secure coding and defense in depth | T3, I1 to I3, E1 to E9 |
 
 The audits follow the applicable areas of OWASP ASVS Level 2 (0030):
 
@@ -148,7 +149,7 @@ The audits follow the applicable areas of OWASP ASVS Level 2 (0030):
 |---|---|
 | Authentication | S1, S5 |
 | Session management | S2, S3, S4 |
-| Access control | T3, I1, I2, E1 to E8 |
+| Access control | T3, I1, I2, E1 to E9 |
 | Validation, sanitization, and encoding | T1, T2, T5 |
 | Cryptography | T4, I5 |
 | Error handling and logging | I4, R1, R2 |
