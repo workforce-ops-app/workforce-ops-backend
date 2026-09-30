@@ -25,6 +25,9 @@ erDiagram
     roles ||--o{ role_assignments : "assigned as"
     users ||--o{ reporting_lines : "is reported to (manager_id)"
     users ||--o{ reporting_lines : "reports through (employee_id)"
+    users ||--o{ approval_requests : "requests"
+    approval_requests ||--o{ approval_decisions : "decided by"
+    users ||--o{ approval_decisions : "approves or denies"
     users ||--o{ sessions : "signs in with"
     departments ||--o{ shifts : "scheduled in"
     users |o--o{ shifts : "works (none while open)"
@@ -100,6 +103,24 @@ erDiagram
         uuid manager_id FK
         uuid employee_id FK
         datetime ended_at
+    }
+    approval_requests {
+        uuid id PK
+        uuid company_id FK
+        string kind
+        uuid requested_by FK
+        uuid subject_user_id FK
+        json payload
+        string status
+        int required_approvals
+        datetime expires_at
+    }
+    approval_decisions {
+        uuid company_id FK
+        uuid request_id FK
+        uuid approver_id FK
+        string decision
+        datetime decided_at
     }
     sessions {
         uuid id PK
@@ -292,6 +313,39 @@ A `CHECK (manager_id <> employee_id)` constraint stops anyone reporting to thems
 
 Loops and "not your own lines" cannot be checked by a single-row constraint, so they are enforced in the service and covered by security tests. What reporting lines allow (being above someone decides *whom* you may act on; permissions decide *what*), and who may add or end them (someone above both people, with `reporting_line.manage`), are set out in [0024](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md).
 
+### approval_requests
+
+**What it is:** something waiting for approval from people above the requester: giving someone a role at the granter's own level, adding or removing an owner ([0032](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md)), and later time-off and coverage reviews ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)).
+
+| Column | Type | Rules |
+|---|---|---|
+| `id` | `BINARY(16)` | primary key |
+| `company_id` | `BINARY(16)` | required |
+| `kind` | `VARCHAR(24)` | `role_assignment`, `owner_add`, `owner_remove`; later features add their own |
+| `requested_by` | `BINARY(16)` | company-aware foreign key to `users` |
+| `subject_user_id` | `BINARY(16)` | company-aware foreign key to `users`: the person the request is about |
+| `payload` | `JSON` | what will happen on approval, e.g. the role and scope; validated against the kind |
+| `status` | `VARCHAR(12)` | `pending`, `approved`, `denied`, `cancelled`, or `expired` |
+| `required_approvals` | `SMALLINT` | how many approvals it needs (1 for a same-level grant; the number of owners who must agree for owner changes) |
+| `expires_at` | `DATETIME(6)` | 7 days after creation by default |
+| `decided_at` | `DATETIME(6)` | null while pending |
+
+A pending request grants nothing: a role assignment is created only when the request is approved. Who may decide is checked again at the moment of each decision.
+
+### approval_decisions
+
+**What it is:** one person's approval or denial of a request.
+
+| Column | Type | Rules |
+|---|---|---|
+| `company_id` | `BINARY(16)` | required |
+| `request_id` | `BINARY(16)` | company-aware foreign key to `approval_requests` |
+| `approver_id` | `BINARY(16)` | company-aware foreign key to `users` |
+| `decision` | `VARCHAR(8)` | `approve` or `deny` |
+| `decided_at` | `DATETIME(6)` | required |
+
+Primary key: `(request_id, approver_id)`, so each person decides once. A request is approved when it has `required_approvals` approvals and is denied by any denial, unless a feature defines its own rule (time off escalates disagreements, [0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)).
+
 ### sessions
 
 **What it is:** a signed-in browser. Deleting the row signs that browser out.
@@ -393,6 +447,8 @@ The application's database user may only insert and read rows here.
 | roles | role_assignments | one to many | company-aware foreign key | A role can be given to many people |
 | role_assignments | departments / teams / users (scope) | many to one, only one of them | company-aware foreign keys + `CHECK` | Where the role applies: a department, a team, one employee, or (none set) the whole company |
 | users ↔ users | via reporting_lines | many to many | company-aware foreign keys + `CHECK (manager_id <> employee_id)`; loops rejected by the service | A person can report to several managers; a manager can have many reports |
+| users | approval_requests | one to many | company-aware foreign keys (`requested_by`, `subject_user_id`) | A person asks for something, or is the one it is about |
+| approval_requests | approval_decisions | one to many | company-aware foreign key + primary key `(request_id, approver_id)` | Each approver decides once |
 | users | sessions | one to many | company-aware foreign key | A person can be signed in on several browsers |
 | departments | shifts | one to many | company-aware foreign key | A shift happens in one department |
 | users | shifts | one to many (optional) | company-aware foreign key + `CHECK` on status | A shift is worked by one employee, or by nobody while it is open |

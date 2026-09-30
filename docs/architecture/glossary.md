@@ -11,6 +11,8 @@
 | **Self-service permission** | A permission ending in `_self` (such as `schedule.view_self`) that only ever applies to the user's own records. |
 | **Scope resolver** | Code a module registers to say which department, team, and employee one of its records belongs to, so permission checks work for it. |
 | **Scope filter** | The database condition that limits a list to the records a user's role assignments cover. |
+| **Same-level grant** | Giving someone a role that includes all of your own permissions for that scope. It needs approval from someone above you. |
+| **Approval request** | Something waiting for approval from people above the requester, such as a same-level grant or an owner change. |
 | **Candidate** | A coworker's answer to a coverage request (accept, or swap with one of their own shifts), waiting for the manager to choose. |
 | **Audit log** | Append-only, tamper-evident record of security-relevant actions. |
 | **Role assignment** | Giving a user a role together with its scope: the whole company, one department, one team, or one employee. |
