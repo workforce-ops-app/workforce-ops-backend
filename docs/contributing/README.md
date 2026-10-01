@@ -29,6 +29,7 @@ pre-commit install
 | Install git hooks | `pre-commit install` |
 | Run the API locally | `uvicorn app.main:create_app --factory --reload`, then http://localhost:8000/api/health |
 | Run the tests | `python -m pytest` |
+| Run the tests with coverage (which lines of `app/` the tests run; missing line numbers listed per file) | `python -m pytest --cov --cov-report=term` |
 | Format the code | `ruff format .` |
 | Lint (including security rules) | `ruff check .` (add `--fix` for automatic fixes) |
 | Type check | `mypy app` |
