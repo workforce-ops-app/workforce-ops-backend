@@ -43,8 +43,11 @@ requires = ["pyproject.toml", "app"]
 
 [[operation]]
 name = "unit-test"
-run = "pytest tests/unit -q"
+run = "pytest tests/unit --cov --cov-report=term"
 requires = ["tests/unit"]
+# Report summary: "6 passed · coverage 94%" (see the CI guide, summaries from the output).
+summary_patterns = ['(\d+) passed', 'TOTAL.* (\d+%)']
+summary_format = "{0} passed · coverage {1}"
 
 [[operation]]
 name = "migration-check"
