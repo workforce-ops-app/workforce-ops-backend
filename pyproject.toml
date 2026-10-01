@@ -28,6 +28,7 @@ dev = [
     "ruff==0.16.9",
     "mypy==2.3.1",
     "pytest==9.1.1",
+    "pytest-cov==7.1.0",
     "httpx2==2.13.1",
     "pip-audit==2.10.1",
 ]
@@ -67,3 +68,12 @@ plugins = ["pydantic.mypy"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+# Test coverage: which lines (and branches of if/else) of app/ the tests run.
+[tool.coverage.run]
+source = ["app"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
