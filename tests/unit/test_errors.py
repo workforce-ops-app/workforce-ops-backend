@@ -3,9 +3,17 @@
 Each test adds a small route to the app that fails on purpose, then checks the response.
 """
 
+import asyncio
+from collections.abc import Awaitable, Callable
+
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+
+from app.core import errors
+
+Handler = Callable[[Request, Exception], Awaitable[JSONResponse]]
 
 PROBLEM = "application/problem+json"
 
@@ -78,3 +86,16 @@ def test_unexpected_error_is_a_500_problem_that_hides_internals(
     assert secret not in response.text
     assert "Traceback" not in response.text
     assert "RuntimeError" not in response.text
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [errors.http_exception_handler, errors.request_validation_error_handler],
+)
+def test_handlers_do_not_answer_for_errors_they_do_not_own(handler: Handler) -> None:
+    # A handler that receives an exception type it does not own re-raises it
+    # instead of answering with the wrong status.
+    request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+
+    with pytest.raises(ValueError):
+        asyncio.run(handler(request, ValueError("not mine")))
