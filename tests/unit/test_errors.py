@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.testclient import TestClient
 
 from app.core import errors
-from app.core.config import Settings
+from app.core.config import AppEnvironment, Settings
 
 Handler = Callable[[Request, Exception], Awaitable[JSONResponse]]
 
@@ -127,8 +127,8 @@ def test_unexpected_error_log_has_the_error_id_but_not_the_message(
     assert SENSITIVE_MESSAGE not in caplog.text
 
 
-def settings_for(app_env: str) -> Settings:
-    return Settings(app_env=app_env, database_url="mysql+pymysql://test:test@localhost:3307/test")  # type: ignore[arg-type]
+def settings_for(app_env: AppEnvironment) -> Settings:
+    return Settings(app_env=app_env, database_url="mysql+pymysql://test:test@localhost:3307/test")
 
 
 # Overriding the settings fixture builds the app before the test starts capturing logs.

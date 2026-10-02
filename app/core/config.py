@@ -9,11 +9,17 @@ from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+AppEnvironment = Literal["development", "test", "production"]
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
-    app_env: Literal["development", "test", "production"] = "development"
+    app_env: AppEnvironment = "development"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     # Contains the database password, so it has no default (decision 0034: PyMySQL).
     database_url: str
@@ -21,6 +27,10 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
+
+    @property
+    def is_development(self) -> bool:
+        return self.app_env == "development"
 
 
 @lru_cache

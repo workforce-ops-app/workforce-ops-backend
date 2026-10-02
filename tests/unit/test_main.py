@@ -13,6 +13,18 @@ from app.core.config import Settings
 from app.main import create_app
 
 
+def test_app_loads_settings_when_none_are_supplied(monkeypatch: pytest.MonkeyPatch) -> None:
+    environment_settings = Settings(
+        app_env="development",
+        database_url="mysql+pymysql://test:test@localhost:3307/test",
+    )
+    monkeypatch.setattr(main, "get_settings", lambda: environment_settings)
+
+    app = create_app()
+
+    assert app.docs_url == "/api/docs"
+
+
 def test_api_docs_are_available_in_development(client: TestClient) -> None:
     assert client.get("/api/docs").status_code == 200
     assert client.get("/api/openapi.json").status_code == 200
