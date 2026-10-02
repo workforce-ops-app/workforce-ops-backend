@@ -71,3 +71,6 @@ name = "integration-test"
 run = "python -m scripts.integration_test"
 requires = ["docker-compose.yml", "tests/integration", "scripts/integration_test.py"]
 timeout_minutes = 20
+# Report summary: "4 passed" from the tests run against the started containers.
+summary_patterns = ['(\d+) passed']
+summary_format = "{0} passed"
