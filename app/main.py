@@ -44,15 +44,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings = get_settings()
     configure_logging(settings.log_level)
 
+    if settings.is_production:
+        docs_url = None
+        openapi_url = None
+    else:
+        docs_url = "/api/docs"
+        openapi_url = "/api/openapi.json"
+
     app = FastAPI(
         title="Workforce Operations API",
         # The interactive API docs are for development only; production does not
         # advertise every endpoint.
-        docs_url=None if settings.is_production else "/api/docs",
+        docs_url=docs_url,
         redoc_url=None,
-        openapi_url=None if settings.is_production else "/api/openapi.json",
+        openapi_url=openapi_url,
     )
-    register_error_handlers(app, log_full_errors=settings.is_development)
+    log_full_errors = settings.is_development
+    register_error_handlers(app, log_full_errors=log_full_errors)
     for router in discover_routers():
         app.include_router(router)
     return app
