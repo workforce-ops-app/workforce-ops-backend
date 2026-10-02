@@ -1,0 +1,21 @@
+# Only what the image needs; above all, never .env or other secrets.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.git
+.github
+.venv
+venv
+**/__pycache__
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage*
+ci-results
+ci-report
+docs
+tests
+scripts

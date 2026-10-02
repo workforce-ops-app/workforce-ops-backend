@@ -35,10 +35,12 @@ pre-commit install
 | Type check | `mypy app` |
 | Check dependencies for known vulnerabilities | `pip-audit --skip-editable` |
 | Check the migrations (needs Docker running) | `python -m scripts.check_migrations` |
+| Start the API and MySQL in Docker | `docker compose up -d --build` (see [running with Docker](#running-with-docker)) |
+| Run the integration test (needs Docker running) | `python -m scripts.integration_test` |
 
 ## Database and migrations
 
-How the database layer is built is in [layers and modules](../architecture/layers-and-modules.md#the-database-layer). The Alembic commands below use `DATABASE_URL` from `.env` and need a running MySQL 8.4 (Docker Compose arrives in the next slice).
+How the database layer is built is in [layers and modules](../architecture/layers-and-modules.md#the-database-layer). The Alembic commands below use `DATABASE_URL` from `.env` and need a running MySQL 8.4: start it with `docker compose up -d db` ([running with Docker](#running-with-docker)).
 
 | Task | Command |
 |---|---|
@@ -76,6 +78,40 @@ def add_note(session: Session, title: str) -> Note:
 ```
 
 SQLAlchemy sends `note_id` and `title` as bound parameters (`WHERE notes.id = %(id_1)s`), like a PDO prepared statement in PHP, so a value can never change the query. Never build SQL text out of values (f-strings, `+`, `%`); if raw SQL is ever needed, use `text()` with named placeholders such as `:note_id`.
+
+## Running with Docker
+
+`docker-compose.yml` runs the API and MySQL 8.4 together ([0034](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0034-database-driver-ids-and-local-layout.md)). Needs Docker Desktop running, and `MYSQL_ROOT_PASSWORD` and `MYSQL_APP_PASSWORD` set in `.env` (Compose refuses to start without them, so there is never a blank database password).
+
+| Task | Command |
+|---|---|
+| Start everything (builds the API image) | `docker compose up -d --build` |
+| Start only MySQL (to run the API with uvicorn instead) | `docker compose up -d db` |
+| See whether both are healthy | `docker compose ps` |
+| Follow the API's log lines | `docker compose logs -f api` |
+| Apply the migrations | `docker compose run --rm api alembic upgrade head` |
+| Stop (data is kept) | `docker compose down` |
+| Reset the database (**deletes all local data**) | `docker compose down --volumes` |
+
+- **Addresses:** the API is at http://localhost:8000/api/health and MySQL at `localhost:3307` (next to XAMPP's 3306). Both listen on `127.0.0.1` only, so other computers on your network cannot reach them.
+- **Two passwords, one user:** MySQL creates the `workforce_app` user with `MYSQL_APP_PASSWORD` the first time it starts. `DATABASE_URL` in `.env` must use the same password. Changing either later needs a database reset, because MySQL only reads them when the data volume is new. Everyone picks their own passwords (for example `python -c "import secrets; print(secrets.token_hex(16))"`, which also avoids characters such as `@` or `/` that break `DATABASE_URL`); they are never shared or committed, and CI generates throwaway ones.
+- **Networks:** MySQL is only on a private network with the API. The API also joins the shared `workforce-ops` network, where the frontend's nginx reaches it; nginx can never reach the database directly.
+- **The image** runs as an ordinary user (not root), and `.env` is never copied into it (`.dockerignore`); settings arrive as environment variables when the container starts.
+- **The integration test** (`python -m scripts.integration_test`, also run by CI) starts a separate copy with throwaway passwords and free ports, so it never touches your own running copy or its data, then removes it.
+
+### After pulling changes
+
+Each contributor has their own database; GitHub carries its **structure**, never its **data**.
+
+- **Structure** travels as migrations in `migrations/versions/`. After `git pull`, apply any you do not have yet with `docker compose run --rm api alembic upgrade head` (add `--build` to `docker compose up` too, so the API image has the new code). Alembic records the last migration it applied in the `alembic_version` table, so only new ones run, whoever pulls first.
+- **Data** stays on each computer and is never committed. To see the same data as everyone else, start from an empty database and load the demo data:
+
+  ```
+  docker compose down --volumes                      # deletes your local data
+  docker compose up -d --build
+  docker compose run --rm api alembic upgrade head
+  python -m scripts.seed_demo                        # once the seed script exists (Phase 2)
+  ```
 
 ## Conventions specific to this repository
 
