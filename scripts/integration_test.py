@@ -115,9 +115,18 @@ def main() -> int:
         #   down:             stop and remove both containers and their networks
         #   --volumes:        delete this copy's database (it was throwaway)
         #   --remove-orphans: remove any other container left in this project
-        subprocess.run(  # noqa: S603
-            [*compose, "down", "--volumes", "--remove-orphans"], env=env, capture_output=True
+        down = subprocess.run(  # noqa: S603
+            [*compose, "down", "--volumes", "--remove-orphans"],
+            env=env,
+            capture_output=True,
+            text=True,
         )
+        # Cleanup does not change the test result, but a failed cleanup must not go
+        # unnoticed: it would leave containers and a database volume behind. Say so, with
+        # Docker's own message and the command to remove them by hand.
+        if down.returncode != 0:
+            print(f"warning: cleanup failed; remove it with: docker compose -p {project} down -v")
+            print(down.stderr.strip())
 
 
 if __name__ == "__main__":
