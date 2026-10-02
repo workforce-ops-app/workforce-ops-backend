@@ -40,7 +40,8 @@ def discover_routers() -> list[APIRouter]:
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    settings = settings or get_settings()
+    if settings is None:
+        settings = get_settings()
     configure_logging(settings.log_level)
 
     app = FastAPI(
@@ -51,7 +52,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         redoc_url=None,
         openapi_url=None if settings.is_production else "/api/openapi.json",
     )
-    register_error_handlers(app, log_full_errors=settings.app_env == "development")
+    register_error_handlers(app, log_full_errors=settings.is_development)
     for router in discover_routers():
         app.include_router(router)
     return app
