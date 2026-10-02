@@ -11,12 +11,12 @@ other demo company and expects 404.
 from collections.abc import Iterator
 
 import pytest
-from sqlalchemy import delete, func, select, update
-from sqlalchemy.orm import aliased
+from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy.orm import Session, aliased
 
 from app.db.base import Base
 from app.tenancy.context import set_company
-from app.tenancy.filter import CompanyOwned, WrongCompanyError
+from app.tenancy.filter import CompanyOwned, TenancyError, UnsafeQueryError, WrongCompanyError
 from tests.tenant_data import TenantNote, TwoCompanies, make_two_companies
 
 
@@ -108,6 +108,53 @@ def test_cannot_move_own_row_into_another_company(data: TwoCompanies) -> None:
         note.company_id = data.company_b
         with pytest.raises(WrongCompanyError):
             session.commit()
+
+
+def test_bulk_update_cannot_move_rows_into_another_company(data: TwoCompanies) -> None:
+    # As company A, set company_id on A's own rows to B: that would hand A's data to B.
+    with data.session_for(data.company_a) as session, pytest.raises(WrongCompanyError):
+        session.execute(update(TenantNote).values(company_id=data.company_b))
+    # The same with the value passed separately to session.execute.
+    with data.session_for(data.company_a) as session, pytest.raises(WrongCompanyError):
+        session.execute(update(TenantNote), {"company_id": data.company_b})
+    # B still has only its own note.
+    with data.session_for(data.company_b) as session:
+        assert session.scalars(select(TenantNote.title)).all() == ["B's note"]
+
+
+def test_bulk_update_by_primary_key_cannot_reach_other_companys_rows(data: TwoCompanies) -> None:
+    # A list of rows keyed by ID is sent without the company condition, so it is refused.
+    with data.session_for(data.company_a) as session, pytest.raises(UnsafeQueryError):
+        session.execute(update(TenantNote), [{"id": data.note_b, "title": "hijacked"}])
+    assert b_note_title(data) == "B's note"
+
+
+@pytest.mark.parametrize("company", ["b", "none"])
+def test_bulk_insert_cannot_plant_rows(data: TwoCompanies, company: str) -> None:
+    # A bulk insert skips the save check, so company data must be added with session.add().
+    # Tried as company A claiming company B, and with no company set at all.
+    session = data.session_for(data.company_a) if company == "b" else Session(data.engine)
+    with session, pytest.raises(TenancyError):
+        session.execute(insert(TenantNote).values(title="planted", company_id=data.company_b))
+    with data.session_for(data.company_b) as session:
+        assert session.scalars(select(TenantNote.title)).all() == ["B's note"]
+
+
+@pytest.mark.parametrize("kind", ["select", "update", "delete", "insert"])
+def test_raw_table_statements_on_company_data_are_refused(data: TwoCompanies, kind: str) -> None:
+    # The table itself (TenantNote.__table__) instead of the model is not filtered, so any
+    # such statement on company data is refused, with a company set or without one.
+    table = TenantNote.__table__
+    statement = {
+        "select": select(table.c.title),
+        "update": update(table).values(title="raw"),
+        "delete": delete(table),
+        "insert": insert(table).values(id=data.note_a.bytes, title="raw"),
+    }[kind]
+    for session in (data.session_for(data.company_a), Session(data.engine)):
+        with session, pytest.raises(UnsafeQueryError):
+            session.execute(statement)
+    assert b_note_title(data) == "B's note"
 
 
 def test_every_model_with_company_id_is_covered_by_the_filter() -> None:

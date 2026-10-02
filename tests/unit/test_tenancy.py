@@ -6,12 +6,12 @@ The attacker's view (reaching another company's data) is in tests/security/.
 from collections.abc import Iterator
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.orm import Session
 
 from app.db.base import Base
 from app.tenancy.context import get_company, set_company
-from app.tenancy.filter import MissingCompanyError, WrongCompanyError
+from app.tenancy.filter import MissingCompanyError, UnsafeQueryError, WrongCompanyError
 from tests.tenant_data import TenantNote, TwoCompanies, make_two_companies
 
 
@@ -108,3 +108,58 @@ def test_saving_rows_that_are_not_company_owned_needs_no_company() -> None:
         session.commit()
         assert session.scalars(select(GlobalThing.name)).all() == ["shared"]
     engine.dispose()
+
+
+def test_add_all_is_the_way_to_add_many_rows(data: TwoCompanies) -> None:
+    # Bulk inserts are refused for company data; session.add_all() goes through the save
+    # check and works.
+    with data.session_for(data.company_a) as session:
+        session.add_all([TenantNote(title="one"), TenantNote(title="two")])
+        session.commit()
+        assert session.scalar(select(func.count(TenantNote.id))) == 3
+
+
+def test_bulk_insert_on_company_data_is_refused_with_a_hint(data: TwoCompanies) -> None:
+    with (
+        data.session_for(data.company_a) as session,
+        pytest.raises(UnsafeQueryError, match="session.add"),
+    ):
+        session.execute(insert(TenantNote).values(title="bulk"))
+
+
+@pytest.mark.parametrize("form", ["values", "ordered_values", "parameters"])
+def test_every_way_of_setting_company_id_in_a_bulk_update_is_refused(
+    data: TwoCompanies, form: str
+) -> None:
+    # .values(company_id=...), .ordered_values((company_id, ...)), or the value passed
+    # separately to session.execute: all three would move rows to another company.
+    with data.session_for(data.company_a) as session, pytest.raises(WrongCompanyError):
+        if form == "values":
+            session.execute(update(TenantNote).values(company_id=data.company_b))
+        elif form == "ordered_values":
+            session.execute(update(TenantNote).ordered_values(("company_id", data.company_b)))
+        else:
+            session.execute(update(TenantNote), {"company_id": data.company_b})
+
+
+def test_bulk_update_or_delete_by_primary_key_is_refused(data: TwoCompanies) -> None:
+    # A list of rows keyed by ID runs without the company condition.
+    with data.session_for(data.company_a) as session:
+        with pytest.raises(UnsafeQueryError):
+            session.execute(update(TenantNote), [{"id": data.note_a, "title": "x"}])
+        with pytest.raises(UnsafeQueryError):
+            session.execute(delete(TenantNote), [{"id": data.note_a}])
+
+
+def test_the_table_instead_of_the_model_is_refused(data: TwoCompanies) -> None:
+    with (
+        data.session_for(data.company_a) as session,
+        pytest.raises(UnsafeQueryError, match="model"),
+    ):
+        session.execute(select(TenantNote.__table__.c.title))
+
+
+def test_bulk_statements_without_a_company_are_refused(data: TwoCompanies) -> None:
+    # A filtered update with no company set fails like a query does.
+    with Session(data.engine) as session, pytest.raises(MissingCompanyError):
+        session.execute(update(TenantNote).values(title="x"))

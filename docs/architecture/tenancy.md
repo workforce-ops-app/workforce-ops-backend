@@ -35,10 +35,20 @@ flowchart LR
 |---|---|---|
 | The current company | `app/tenancy/context.py` | `set_company(session, company_id)` stores the company on the database session (`session.info`); `get_company(session)` reads it. A session works for one company only; switching is refused |
 | Company-owned models | `app/tenancy/filter.py` | `CompanyOwned` adds the required, indexed `company_id` column and turns the filter on for that model: `class Shift(IdAndTimestamps, CompanyOwned, Base)` |
-| The filter | `app/tenancy/filter.py` | On every ORM query (`do_orm_execute`), adds the company condition with `with_loader_criteria`; before every save (`before_flush`), fills in or checks `company_id` |
-| Tests | `tests/security/test_cross_company.py`, `tests/unit/test_tenancy.py` | Company A tries to list, fetch by ID, count, join, update, delete, create for, and move rows into company B; and every model with a `company_id` column must use `CompanyOwned` |
+| The filter | `app/tenancy/filter.py` | On every statement a session runs (`do_orm_execute`), adds the company condition with `with_loader_criteria` and refuses the forms it cannot make safe (below); before every save (`before_flush`), fills in or checks `company_id` |
+| Tests | `tests/security/test_cross_company.py`, `tests/unit/test_tenancy.py` | Company A tries to list, fetch by ID, count, join, update, delete, create for, and move rows into company B, including through bulk statements and the raw table; and every model with a `company_id` column must use `CompanyOwned` |
 
 **Why the company is stored on the session, not in a "current request" variable:** each request already gets its own database session, so the company travels with it and cannot leak into another request. FastAPI runs ordinary functions in worker threads, where a value set for one step is not reliably visible in the next.
+
+**Refused, because the filter cannot make them safe** (`UnsafeQueryError`, or `WrongCompanyError` for the last one):
+
+| Form | Why it is refused | Use instead |
+|---|---|---|
+| The table instead of the model, e.g. `select(Shift.__table__)` | the company condition is only added through models | the model: `select(Shift)` |
+| A query that names the model only in `select_from` (e.g. a count written as SQL text) | SQLAlchemy does not see the model there, so it would go unfiltered | name a model column: `select(func.count(Shift.id))` |
+| A bulk insert, `session.execute(insert(Shift)...)` | it skips the save check that fills in and checks `company_id` | `session.add()` or `session.add_all()` |
+| A bulk update or delete given a list of rows by ID | it runs without the company condition | load the rows and change them, or update with a `where` clause |
+| A bulk update that sets `company_id` | the condition only limits which rows change, not what they change to | never change `company_id` |
 
 **Raw SQL is not filtered.** `session.execute(text("SELECT ..."))` bypasses the ORM and therefore the filter. Repositories build every query with SQLAlchemy ([layers and modules](layers-and-modules.md#the-database-layer)), never as SQL text.
 
