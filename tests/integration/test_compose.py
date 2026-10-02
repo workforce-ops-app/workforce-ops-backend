@@ -38,13 +38,17 @@ def compose_exec(service: str, *command: str) -> str:
     #   exec:  run a command in an already running container
     #   -T:    no interactive terminal, so the output can be captured
     # capture_output and text return what the command printed, as a string.
-    # check=True raises an error if the command fails, which fails the test.
     # The arguments are fixed by the tests, never user input (hence noqa S603).
     result = subprocess.run(  # noqa: S603
         [docker, "compose", "--project-name", str(PROJECT), "exec", "-T", service, *command],
         capture_output=True,
         text=True,
-        check=True,
+    )
+
+    # A failed command fails the test, with its own error output in the message, so the
+    # reason is visible instead of only "exit status 1".
+    assert result.returncode == 0, (
+        f"{' '.join(command)} failed in {service}: {result.stderr.strip()}"
     )
 
     # Remove the trailing newline so tests can compare the output directly.
