@@ -4,7 +4,7 @@
 
 Decisions: [0004 feature modules](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0004-backend-feature-modules.md) · [0012 extension points](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0012-extensibility-patterns.md)
 
-> **Status:** partly built. `app/main.py`, `app/core/` (settings, logging, errors), `app/db/` (database connection, base model, migrations), and the health module exist; the other shared layers arrive in Phase 2.
+> **Status:** partly built. `app/main.py`, `app/core/` (settings, logging, errors), `app/db/` (database connection, base model, migrations), `app/tenancy/` (the company filter), and the health module exist; the other shared layers arrive in Phase 2.
 
 ## The package
 
@@ -15,7 +15,7 @@ app/
 ├── db/              session.py (engine, one session per request), base.py (base model), types.py (IDs)
 ├── auth/            sign-in, sessions, CSRF, password re-entry (Phase 2)
 ├── authz/           permissions, scopes, reporting chain, authorize() (Phase 2)
-├── tenancy/         the automatic company filter (Phase 2)
+├── tenancy/         context.py (the session's company), filter.py (CompanyOwned and the automatic company filter)
 ├── audit/           the signed audit log (Phase 2)
 └── modules/<feature>/
     ├── router.py       HTTP only: paths, status codes, request and response models
