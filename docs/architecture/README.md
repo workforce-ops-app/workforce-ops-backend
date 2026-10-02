@@ -12,7 +12,7 @@ The backend is organized by feature module ([decision 0004](https://github.com/w
 
 | Page | Status |
 |---|---|
-| Layers and modules (the `app/` structure, how modules plug in) | to do: written with the backend skeleton (Phase 1) |
+| [Layers and modules](layers-and-modules.md) (the `app/` structure, how requests flow, how modules plug in) | partly built |
 | [Data model](data-model.md) (core tables, conventions, time zones, retention) | design |
 | [Tenancy](tenancy.md) (keeping companies separate) | design |
 | [Authorization](authorization.md) (permissions, starting roles, scopes, reporting chain, escalation rules) | design |
