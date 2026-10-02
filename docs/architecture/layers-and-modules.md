@@ -4,7 +4,7 @@
 
 Decisions: [0004 feature modules](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0004-backend-feature-modules.md) · [0012 extension points](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0012-extensibility-patterns.md)
 
-> **Status:** partly built. `app/main.py`, `app/core/` (settings, logging, errors), and the health module exist; the other shared layers arrive in Phase 2.
+> **Status:** partly built. `app/main.py`, `app/core/` (settings, logging, errors), `app/db/` (database connection, base model, migrations), and the health module exist; the other shared layers arrive in Phase 2.
 
 ## The package
 
@@ -12,7 +12,7 @@ Decisions: [0004 feature modules](https://github.com/workforce-ops-app/.github/b
 app/
 ├── main.py          create_app(): builds the app, registers error handlers, discovers modules
 ├── core/            config.py (settings), logging.py (JSON logs), errors.py (problem details)
-├── db/              engine, session, base model (Phase 1, database slice)
+├── db/              session.py (engine, one session per request), base.py (base model), types.py (IDs)
 ├── auth/            sign-in, sessions, CSRF, password re-entry (Phase 2)
 ├── authz/           permissions, scopes, reporting chain, authorize() (Phase 2)
 ├── tenancy/         the automatic company filter (Phase 2)
@@ -77,6 +77,45 @@ def create_note(note: NoteIn) -> NoteOut: ...
 | `GET` | reading; never changes anything | 200 |
 | `POST` | creating, or an action such as `/approve` | 201 or 200 |
 | `PATCH` | changing some fields | 200 |
+
+## The database layer
+
+Decisions: [0019 IDs](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0019-uuidv7-ids.md) · [0021 time](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md) · [0022 SQLAlchemy and Alembic](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0022-sqlalchemy-and-alembic.md) · [0034 driver and ID library](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0034-database-driver-ids-and-local-layout.md)
+
+- **Connection** (`app/db/session.py`): one engine for the whole app, created on first use from the `DATABASE_URL` setting (SQLAlchemy 2 with the PyMySQL driver). It keeps a pool of connections and checks each one is alive before use. Each request gets its own session through the `get_session` dependency; FastAPI closes it when the request ends.
+- **Base model** (`app/db/base.py`): every model inherits from `Base`, and Alembic reads `Base.metadata` to know the tables. Before that, `import_all_models()` (`app/db/registry.py`) imports every feature's `models.py`; a feature without one is skipped, but a `models.py` that fails to import stops Alembic with the error, so a migration is never generated from an incomplete list of tables (the same rule as router discovery). `IdAndTimestamps` adds the columns every table has:
+
+  | Column | MySQL type | Filled in by |
+  |---|---|---|
+  | `id` | `BINARY(16)`, primary key | `new_id()`: a UUIDv7, when the row is first saved |
+  | `created_at` | `DATETIME(6)` (microseconds) | `utcnow()`, when the row is first saved; never changes |
+  | `updated_at` | `DATETIME(6)` | `utcnow()`, when the row is first saved and on every change |
+
+- **IDs** (`app/db/types.py`): `UUIDBinary` turns a Python `uuid.UUID` into its 16 raw bytes on the way into MySQL, and back on the way out; `NULL` stays `None`. UUIDv7 starts with the current time, so new rows go at the end of the primary-key index, and the rest is random, so IDs cannot be guessed (threat model I3). The API shows IDs in the usual hyphenated text form.
+- **Times:** every stored moment is UTC. MySQL `DATETIME` holds no time zone, so `utcnow()` takes the current moment in UTC and then removes the zone label; times are converted to local time only for display.
+- **Queries** live only in `repository.py` files, so security review knows where to look for SQL. They go through SQLAlchemy, which sends every value as a bound parameter, never as part of the SQL text (threat model T1). The automatic company filter is added in Phase 2 ([tenancy](tenancy.md)).
+- **Migrations** (`migrations/`, Alembic) are the versioned scripts that create and change tables. Each has an `upgrade()` that applies the change and a `downgrade()` that undoes it, and points to the one before it (`down_revision`), so they form one line. The first, `0001_baseline`, creates nothing; tables arrive with the features that need them. One migration per pull request; commands are in the [contributor docs](../contributing/README.md#database-and-migrations).
+
+How a model becomes a table:
+
+```python
+class Note(IdAndTimestamps, Base):
+    __tablename__ = "notes"
+
+    title: Mapped[str] = mapped_column(String(100))
+```
+
+```sql
+CREATE TABLE notes (
+    title VARCHAR(100) NOT NULL,
+    id BINARY(16) NOT NULL,
+    created_at DATETIME(6) NOT NULL,
+    updated_at DATETIME(6) NOT NULL,
+    PRIMARY KEY (id)
+)
+```
+
+A column is `NOT NULL` unless its type allows `None` (`Mapped[str | None]`).
 
 ## Errors: raising and adding types
 
