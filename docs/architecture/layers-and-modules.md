@@ -46,6 +46,8 @@ flowchart LR
 
 `create_app()` looks at every package in `app/modules/`. If it has a `router.py` with a variable named `router` (an `APIRouter`), that router is included. No list to edit, so two pull requests adding two modules never conflict on a shared file.
 
+A package without a `router.py` is simply skipped. But if a `router.py` exists and one of its own imports is missing (a typo, or a package that is not installed), the app refuses to start. Skipping it instead would start the server without that feature's endpoints while the health check still said everything was fine.
+
 ## Adding an endpoint
 
 In the feature's `router.py`, one function per method and path. Type hints are the validation rules: FastAPI checks every request against them before the function runs, and anything that does not fit becomes a 422 automatically.
@@ -79,7 +81,8 @@ def create_note(note: NoteIn) -> NoteOut: ...
 ## Errors: raising and adding types
 
 - Raise `HTTPException(status_code, detail)` for a known problem (`404`, `403`, `409`, ...). The handler in `core/errors.py` turns every one of them into problem details ([errors and status codes](../user/errors.md)).
-- FastAPI picks the **most specific** registered handler: validation errors go to the 422 handler, HTTP errors to the HTTP handler, and only unexpected exceptions reach the 500 catch-all, which must never filter or re-raise.
+- FastAPI picks the **most specific** registered handler: validation errors go to the 422 handler and HTTP errors to the HTTP handler. Both keep the exception's headers (such as `Allow` on a 405).
+- Anything else reaches `UnexpectedErrorMiddleware`, the 500 catch-all. It is middleware, not an exception handler, because Starlette re-raises an exception after its 500 handler runs and uvicorn then logs the full message. The middleware logs a safe line (an `error_id`, the error type, and file and line only) and does not raise again. Full messages and stack traces are logged only when `APP_ENV=development` ([errors](../user/errors.md#what-the-server-log-keeps)).
 - **Adding an error type** (for example `NotFoundError` raised by a service, so services need not know about HTTP): define the exception class in `core/errors.py`, write a handler that returns the matching problem response, and register it in `register_error_handlers`.
 
 ## Running it

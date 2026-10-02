@@ -44,10 +44,27 @@ def test_discovery_includes_only_real_routers(monkeypatch: pytest.MonkeyPatch) -
 
     def fake_import(name: str) -> object:
         if name not in modules_by_name:
-            raise ModuleNotFoundError(name)
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
         return modules_by_name[name]
 
     monkeypatch.setattr(pkgutil, "iter_modules", lambda path: found)
     monkeypatch.setattr(importlib, "import_module", fake_import)
 
     assert main.discover_routers() == [real_router]
+
+
+def test_discovery_fails_when_a_router_has_a_missing_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # router.py exists, but it imports something that does not: the app must not start
+    # quietly without that feature's endpoints.
+    found = [SimpleNamespace(name="broken", ispkg=True)]
+
+    def fake_import(name: str) -> object:
+        raise ModuleNotFoundError("No module named 'missing_dependency'", name="missing_dependency")
+
+    monkeypatch.setattr(pkgutil, "iter_modules", lambda path: found)
+    monkeypatch.setattr(importlib, "import_module", fake_import)
+
+    with pytest.raises(ModuleNotFoundError, match="missing_dependency"):
+        main.discover_routers()

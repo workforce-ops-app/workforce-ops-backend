@@ -39,6 +39,22 @@ Media type `application/problem+json`:
 
 `location` says where the problem is (`path`, `query`, or `body`, then the field name). The value that was sent is never copied back.
 
+**Unexpected errors (500)** add an `error_id`:
+
+```json
+{
+  "type": "about:blank",
+  "title": "Internal Server Error",
+  "status": 500,
+  "detail": "An unexpected error occurred.",
+  "error_id": "2ee9ff85-7336-4c33-9026-ea151ee6b013"
+}
+```
+
+The same `error_id` is in the server's log line for that error, so when someone reports a problem, quoting the `error_id` lets a developer find exactly what happened.
+
+Error responses keep the headers that belong to their status: a 405 says which methods the path accepts (`Allow: GET`), and later a 401 and a 429 will carry `WWW-Authenticate` and `Retry-After`.
+
 ## Status codes
 
 | Code | Title | Means | Example |
@@ -51,10 +67,17 @@ Media type `application/problem+json`:
 | 409 | Conflict | not allowed in the record's current state | changing a shift that has ended |
 | 422 | Unprocessable Content | the input failed validation | text where a number was expected |
 | 429 | Too Many Requests | a rate limit was hit (Phase 2) | too many sign-in attempts |
-| 500 | Internal Server Error | something unexpected broke | always `"An unexpected error occurred."` |
+| 500 | Internal Server Error | something unexpected broke | always `"An unexpected error occurred."`, plus an `error_id` |
 
 ## What is never in an error
 
-- stack traces, exception messages, SQL, file paths, or setting values (a 500 always has the same generic text; the real error is in the server log);
+- stack traces, exception messages, SQL, file paths, or setting values (a 500 always has the same generic text; the server log has the error type and where it happened);
 - the input that was sent (echoing it back is how reflected cross-site scripting starts);
 - whether a record exists in another company (those answer 404, exactly like a record that does not exist).
+
+## What the server log keeps
+
+Exception messages can contain passwords, SQL with submitted values, or employee details, so the log is protected the same way as the response ([0031](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0031-demo-environment-and-data.md)):
+
+- in `test` and `production`, an unexpected error is logged as its `error_id`, its type (for example `RuntimeError`), and the file, line, and function of each step that led to it, but never its message;
+- only in `development` does the log also get the full message and stack trace.

@@ -24,10 +24,15 @@ def discover_routers() -> list[APIRouter]:
     for module_info in pkgutil.iter_modules(modules.__path__):
         if not module_info.ispkg:
             continue
+        module_name = f"app.modules.{module_info.name}.router"
         try:
-            router_module = importlib.import_module(f"app.modules.{module_info.name}.router")
-        except ModuleNotFoundError:
-            continue  # a module without endpoints
+            router_module = importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name == module_name:
+                continue  # a module without endpoints
+            # router.py exists but one of its imports is missing: fail at startup instead
+            # of starting without that feature's endpoints.
+            raise
         router = getattr(router_module, "router", None)
         if isinstance(router, APIRouter):
             routers.append(router)
@@ -46,7 +51,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         redoc_url=None,
         openapi_url=None if settings.is_production else "/api/openapi.json",
     )
-    register_error_handlers(app)
+    register_error_handlers(app, log_full_errors=settings.app_env == "development")
     for router in discover_routers():
         app.include_router(router)
     return app
