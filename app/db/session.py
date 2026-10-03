@@ -16,10 +16,10 @@ from app.core.config import get_settings
 
 @lru_cache
 def get_engine() -> Engine:
-    """The engine, created on first use from DATABASE_URL."""
+    """The engine, created on first use from DATABASE_URL and DATABASE_PASSWORD."""
     # pool_pre_ping: check a pooled connection is still alive before using it, so a
     # MySQL restart does not turn into errors for the next requests.
-    return create_engine(get_settings().database_url, pool_pre_ping=True)
+    return create_engine(get_settings().sqlalchemy_url, pool_pre_ping=True)
 
 
 def get_session() -> Iterator[Session]:

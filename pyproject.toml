@@ -52,8 +52,8 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# Tests use plain assert on purpose.
-"tests/**" = ["S101"]
+# Tests use plain assert, and fake passwords (to check how real ones are handled), on purpose.
+"tests/**" = ["S101", "S105", "S106"]
 
 [tool.mypy]
 python_version = "3.13"
