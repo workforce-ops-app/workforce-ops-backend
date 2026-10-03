@@ -7,11 +7,17 @@ from collections.abc import Iterator
 
 import pytest
 from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.base import Base
 from app.tenancy.context import get_company, set_company
-from app.tenancy.filter import MissingCompanyError, UnsafeQueryError, WrongCompanyError
+from app.tenancy.filter import (
+    MissingCompanyError,
+    UnsafeQueryError,
+    WrongCompanyError,
+    trust_connection,
+)
 from tests.tenant_data import TenantNote, TwoCompanies, make_two_companies
 
 
@@ -163,3 +169,40 @@ def test_bulk_statements_without_a_company_are_refused(data: TwoCompanies) -> No
     # A filtered update with no company set fails like a query does.
     with Session(data.engine) as session, pytest.raises(MissingCompanyError):
         session.execute(update(TenantNote).values(title="x"))
+
+
+def test_deleting_own_row_works(data: TwoCompanies) -> None:
+    # Ordinary deletes within the company go through.
+    with data.session_for(data.company_a) as session:
+        note = session.get(TenantNote, data.note_a)
+        assert note is not None
+        session.delete(note)
+        session.commit()
+        assert session.scalars(select(TenantNote)).all() == []
+
+
+def test_a_failed_save_leaves_no_way_around_the_guard(data: TwoCompanies) -> None:
+    # A save that fails in the database (here: a duplicate ID) is rolled back. Afterwards
+    # the connection must not still count as "saving", or raw statements would slip past.
+    with data.session_for(data.company_a) as session:
+        session.add(TenantNote(id=data.note_a, title="duplicate"))
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+        with pytest.raises(UnsafeQueryError):
+            session.connection().execute(update(TenantNote.__table__).values(title="raw"))
+
+
+def test_trusted_connections_may_reach_company_data(data: TwoCompanies) -> None:
+    # Migrations are operator-run code that no request can reach; data fixes there may
+    # span companies, so migrations/env.py marks its connection as trusted.
+    with data.engine.connect() as connection:
+        trust_connection(connection)
+        titles = connection.execute(select(TenantNote.__table__.c.title)).scalars().all()
+    assert sorted(titles) == ["A's note", "B's note"]
+
+
+def test_statements_without_company_tables_pass_the_guard(data: TwoCompanies) -> None:
+    # The guard only looks at company tables; anything else runs normally.
+    with data.engine.connect() as connection:
+        assert connection.execute(select(1)).scalar() == 1

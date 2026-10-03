@@ -157,6 +157,56 @@ def test_raw_table_statements_on_company_data_are_refused(data: TwoCompanies, ki
     assert b_note_title(data) == "B's note"
 
 
+@pytest.mark.parametrize("method", ["insert_mappings", "update_mappings", "save_objects"])
+def test_legacy_bulk_methods_cannot_reach_another_company(data: TwoCompanies, method: str) -> None:
+    # SQLAlchemy's older bulk methods write straight to the database, without the query
+    # hook or the save check. As company A, use each to plant a row in B or change B's row.
+    with data.session_for(data.company_a) as session, pytest.raises(UnsafeQueryError):
+        if method == "insert_mappings":
+            session.bulk_insert_mappings(
+                TenantNote,  # type: ignore[arg-type]
+                [{"title": "planted", "company_id": data.company_b}],
+            )
+        elif method == "update_mappings":
+            session.bulk_update_mappings(
+                TenantNote,  # type: ignore[arg-type]
+                [{"id": data.note_b, "title": "hijacked"}],
+            )
+        else:
+            session.bulk_save_objects([TenantNote(title="planted", company_id=data.company_b)])
+        session.commit()
+    # B still has only its own, unchanged note.
+    with data.session_for(data.company_b) as session:
+        assert session.scalars(select(TenantNote.title)).all() == ["B's note"]
+
+
+@pytest.mark.parametrize("kind", ["select", "update"])
+def test_the_raw_connection_cannot_reach_company_data(data: TwoCompanies, kind: str) -> None:
+    # session.connection() hands out the database connection itself, which skips the
+    # query hook. Reading or changing company data through it is refused.
+    table = TenantNote.__table__
+    statement = select(table.c.title) if kind == "select" else update(table).values(title="raw")
+    with data.session_for(data.company_a) as session, pytest.raises(UnsafeQueryError):
+        session.connection().execute(statement)
+    assert b_note_title(data) == "B's note"
+
+
+def test_cannot_delete_another_companys_row(data: TwoCompanies) -> None:
+    # Company B's note, loaded through B and then detached from its session, as an object
+    # that reached company A's code some other way (a cache, a bug).
+    with data.session_for(data.company_b) as session:
+        b_note = session.get(TenantNote, data.note_b)
+        assert b_note is not None
+        session.expunge(b_note)
+
+    # As company A, attach it and delete it: refused, nothing is deleted.
+    with data.session_for(data.company_a) as session:
+        session.delete(b_note)
+        with pytest.raises(WrongCompanyError):
+            session.commit()
+    assert b_note_title(data) == "B's note"
+
+
 def test_every_model_with_company_id_is_covered_by_the_filter() -> None:
     # Layer 3 of tenancy.md: a new table that has a company_id column but forgets
     # CompanyOwned would not be filtered. This test finds any such model.
