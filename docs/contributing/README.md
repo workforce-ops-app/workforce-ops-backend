@@ -40,7 +40,7 @@ pre-commit install
 
 ## Database and migrations
 
-How the database layer is built is in [layers and modules](../architecture/layers-and-modules.md#the-database-layer). The Alembic commands below use `DATABASE_URL` from `.env` and need a running MySQL 8.4: start it with `docker compose up -d db` ([running with Docker](#running-with-docker)).
+How the database layer is built is in [layers and modules](../architecture/layers-and-modules.md#the-database-layer). The Alembic commands below use `DATABASE_URL` and `DATABASE_PASSWORD` from `.env` and need a running MySQL 8.4: start it with `docker compose up -d db` ([running with Docker](#running-with-docker)).
 
 | Task | Command |
 |---|---|
@@ -94,7 +94,7 @@ SQLAlchemy sends `note_id` and `title` as bound parameters (`WHERE notes.id = %(
 | Reset the database (**deletes all local data**) | `docker compose down --volumes` |
 
 - **Addresses:** the API is at http://localhost:8000/api/health and MySQL at `localhost:3307` (next to XAMPP's 3306). Both listen on `127.0.0.1` only, so other computers on your network cannot reach them.
-- **Two passwords, one user:** MySQL creates the `workforce_app` user with `MYSQL_APP_PASSWORD` the first time it starts. `DATABASE_URL` in `.env` must use the same password. Changing either later needs a database reset, because MySQL only reads them when the data volume is new. Everyone picks their own passwords (for example `python -c "import secrets; print(secrets.token_hex(16))"`, which also avoids characters such as `@` or `/` that break `DATABASE_URL`); they are never shared or committed, and CI generates throwaway ones.
+- **Passwords:** MySQL creates the `workforce_app` user with `MYSQL_APP_PASSWORD` the first time it starts. `DATABASE_PASSWORD` in `.env` must be the same password (it is kept out of `DATABASE_URL`, so any characters work, including `@`, `:`, `/`, and `%`). Changing either later needs a database reset, because MySQL only reads them when the data volume is new. Everyone picks their own passwords (for example `python -c "import secrets; print(secrets.token_hex(16))"`); they are never shared or committed, and CI generates throwaway ones.
 - **Networks:** MySQL is only on a private network with the API. The API also joins the shared `workforce-ops` network, where the frontend's nginx reaches it; nginx can never reach the database directly.
 - **The image** runs as an ordinary user (not root), and `.env` is never copied into it (`.dockerignore`); settings arrive as environment variables when the container starts.
 - **The integration test** (`python -m scripts.integration_test`, also run by CI) starts a separate copy with throwaway passwords and free ports, so it never touches your own running copy or its data, then removes it.

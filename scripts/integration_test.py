@@ -58,9 +58,11 @@ def main() -> int:
     # PATH and Docker's own settings still work) and add our values on top.
     env = {
         **os.environ,
-        # Random passwords for this run only; they are never written anywhere.
+        # Random passwords for this run only; they are never written anywhere. The app
+        # password starts with characters that mean something in a URL (@ : / % # ?), so
+        # the test proves the API still connects with such a password.
         "MYSQL_ROOT_PASSWORD": secrets.token_hex(16),
-        "MYSQL_APP_PASSWORD": secrets.token_hex(16),
+        "MYSQL_APP_PASSWORD": "p@ss:w/rd%41#x?y-" + secrets.token_hex(8),
         # Where this copy is published on this computer.
         "API_PORT": str(api_port),
         "DB_PORT": str(_free_port()),

@@ -7,7 +7,9 @@ so a missing secret stops the app at startup instead of silently using a weak va
 from functools import lru_cache
 from typing import Literal
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL, make_url
 
 AppEnvironment = Literal["development", "test", "production"]
 
@@ -21,8 +23,31 @@ class Settings(BaseSettings):
 
     app_env: AppEnvironment = "development"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
-    # Contains the database password, so it has no default (decision 0034: PyMySQL).
+    # Where the database is, e.g. mysql+pymysql://workforce_app@localhost:3307/workforce_ops
+    # (decision 0034: PyMySQL). Required: there is no safe default database.
     database_url: str
+    # The database password, kept apart from the URL (see sqlalchemy_url below). SecretStr
+    # hides it when the settings are printed or logged. Optional, so a password already
+    # written inside DATABASE_URL keeps working.
+    database_password: SecretStr | None = None
+
+    @property
+    def sqlalchemy_url(self) -> URL:
+        """The database address as SQLAlchemy's URL object, with the password filled in.
+
+        A password pasted into URL text breaks when it contains characters that mean
+        something in a URL: "p@ss:word" would be read as user "p", host "ss", and so on.
+        Setting it as a separate part of the URL object needs no escaping at all.
+        """
+        # Read the address (driver, user, host, port, database) from the text.
+        url = make_url(self.database_url)
+
+        # Put the password in as its own part, if one was given separately. It wins over
+        # a password inside DATABASE_URL.
+        if self.database_password is not None:
+            url = url.set(password=self.database_password.get_secret_value())
+
+        return url
 
     @property
     def is_production(self) -> bool:
