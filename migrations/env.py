@@ -21,14 +21,14 @@ target_metadata = Base.metadata
 
 def run_migrations_offline() -> None:
     """Write the SQL instead of running it (`alembic upgrade head --sql`)."""
-    context.configure(url=get_settings().database_url, target_metadata=target_metadata)
+    context.configure(url=get_settings().sqlalchemy_url, target_metadata=target_metadata)
     with context.begin_transaction():
         context.run_migrations()
 
 
 def run_migrations_online() -> None:
     """Run the migrations against the database."""
-    engine = create_engine(get_settings().database_url)
+    engine = create_engine(get_settings().sqlalchemy_url)
     with engine.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata)
         with context.begin_transaction():

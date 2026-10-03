@@ -39,8 +39,11 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      # Inside Compose the database is the "db" service on its normal port.
-      DATABASE_URL: mysql+pymysql://workforce_app:${MYSQL_APP_PASSWORD}@db:3306/workforce_ops
+      # Inside Compose the database is the "db" service on its normal port. The password
+      # is passed on its own, never pasted into the URL: characters such as @ : / % in it
+      # would break the URL (the app combines the two safely, app/core/config.py).
+      DATABASE_URL: mysql+pymysql://workforce_app@db:3306/workforce_ops
+      DATABASE_PASSWORD: ${MYSQL_APP_PASSWORD:?set MYSQL_APP_PASSWORD in .env}
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
     # Start the API only once MySQL reports healthy, so its first requests do not fail.

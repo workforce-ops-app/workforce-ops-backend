@@ -66,8 +66,9 @@ def test_health_check_answers_through_the_published_port() -> None:
 
 def test_api_reaches_the_database() -> None:
     # Inside the API container, open a database connection with the app's own
-    # settings (DATABASE_URL pointing at the "db" service) and run SELECT 1.
-    # Printing 1 proves the network, the user name, and the password all work.
+    # settings (DATABASE_URL pointing at the "db" service, DATABASE_PASSWORD) and run
+    # SELECT 1. Printing 1 proves the network, the user name, and the password all work,
+    # including a password full of URL characters (scripts/integration_test.py sets one).
     output = compose_exec(
         "api",
         "python",

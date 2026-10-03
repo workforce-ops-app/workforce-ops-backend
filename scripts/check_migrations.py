@@ -25,7 +25,7 @@ import time
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, make_url, text
 from sqlalchemy.exc import OperationalError
 
 MYSQL_IMAGE = "mysql:8.4"
@@ -99,8 +99,12 @@ def main() -> int:
         container, url = _start_mysql()
     try:
         _wait_until_ready(url)
-        # migrations/env.py reads the URL from the app settings.
-        os.environ["DATABASE_URL"] = url
+        # migrations/env.py reads the URL from the app settings: the address goes in
+        # DATABASE_URL and the password in DATABASE_PASSWORD, the same split the app uses.
+        # Setting both here also overrides any DATABASE_PASSWORD in the developer's .env.
+        parsed = make_url(url)
+        os.environ["DATABASE_URL"] = parsed.set(password=None).render_as_string()
+        os.environ["DATABASE_PASSWORD"] = parsed.password or ""
         from app.core.config import get_settings
 
         get_settings.cache_clear()
