@@ -56,8 +56,11 @@ requires = ["alembic.ini", "scripts/check_migrations.py"]
 
 [[operation]]
 name = "security-test"
-run = "pytest tests/security -q"
+run = "pytest tests/security"
 requires = ["tests/security"]
+# Report summary: "11 passed" (pyproject.toml already adds -q).
+summary_patterns = ['(\d+) passed']
+summary_format = "{0} passed"
 
 [[operation]]
 name = "build"
