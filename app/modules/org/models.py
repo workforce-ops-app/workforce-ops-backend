@@ -6,7 +6,8 @@ belongs to one home department, and people can be on several teams.
 
 Two protections keep companies apart here (tenancy.md):
 - Layer 1, the automatic company filter: every table except companies inherits
-  CompanyOwned, so every query on it is limited to the session's company.
+  CompanyOwned, so every query on it is limited to the session's company; companies
+  itself is marked CompanyRecord, so a session sees and changes only its own company.
 - Layer 2, company-aware keys: each of those tables has a unique key on
   (company_id, id), and every link to another row goes through (company_id, <x>_id).
   The database itself then refuses a link to another company's row, for example a team
@@ -24,18 +25,27 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.dialects import mysql
+from sqlalchemy.orm import Mapped, mapped_column, validates
 
 from app.db.base import UTC_DATETIME, Base, IdAndTimestamps, Timestamps
 from app.db.types import UUIDBinary
-from app.tenancy.filter import CompanyOwned
+from app.tenancy.filter import CompanyOwned, CompanyRecord
+
+# Email addresses compared exactly in MySQL (binary collation). MySQL's default comparison
+# ignores case and accents, which would make the lowercase CHECK below always pass and
+# treat "jose@..." and "josé@..." as the same address. Other databases compare exactly
+# anyway, so the plain type is used there.
+EMAIL = String(254).with_variant(mysql.VARCHAR(254, collation="utf8mb4_bin"), "mysql")
 
 
-class Company(IdAndTimestamps, Base):
+class Company(IdAndTimestamps, CompanyRecord, Base):
     """One customer organization (a tenant). Everything else belongs to exactly one company.
 
-    Not company-owned itself: only platform code (for now the seed script) creates or
-    archives companies, so the company filter does not apply to this table.
+    Not company-owned itself (each row is a company), but protected by the company filter
+    as CompanyRecord: a session working for a company sees and changes only its own row.
+    Only platform code (for now the seed script, in a session with no company) creates or
+    archives companies.
     """
 
     __tablename__ = "companies"
@@ -114,7 +124,7 @@ class User(IdAndTimestamps, CompanyOwned, Base):
     department_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary)
     # Unique across the whole platform, not only the company, so signing in needs only an
     # email and a password (decision 0016).
-    email: Mapped[str] = mapped_column(String(254), unique=True)
+    email: Mapped[str] = mapped_column(EMAIL, unique=True)
     # Argon2id hash (decision 0027); null until the person sets a password with their
     # setup link. Never the password itself.
     password_hash: Mapped[str | None] = mapped_column(String(255))
@@ -126,6 +136,13 @@ class User(IdAndTimestamps, CompanyOwned, Base):
     locked_until: Mapped[datetime | None] = mapped_column(UTC_DATETIME)
     # Null while active; deactivated people cannot sign in (never deleted, decision 0020).
     deactivated_at: Mapped[datetime | None] = mapped_column(UTC_DATETIME)
+
+    @validates("email")
+    def _lowercase_email(self, key: str, email: str) -> str:
+        """Store every email in lowercase, so "Ana@Example.com" and "ana@example.com" are
+        one address. Called by SQLAlchemy whenever email is set. The CHECK constraint in
+        the database is the backstop if anything ever writes around this."""
+        return email.lower()
 
 
 class TeamMember(Timestamps, CompanyOwned, Base):

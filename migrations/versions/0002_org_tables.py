@@ -97,7 +97,14 @@ def upgrade() -> None:
         _id(),
         _company_id(),
         sa.Column("department_id", sa.BINARY(16), nullable=False),
-        sa.Column("email", sa.String(254), nullable=False, unique=True),
+        # Compared exactly in MySQL (binary collation): the default ignores case and
+        # accents, which would defeat the lowercase CHECK and the uniqueness of addresses.
+        sa.Column(
+            "email",
+            sa.String(254).with_variant(mysql.VARCHAR(254, collation="utf8mb4_bin"), "mysql"),
+            nullable=False,
+            unique=True,
+        ),
         sa.Column("password_hash", sa.String(255), nullable=True),
         sa.Column("display_name", sa.String(120), nullable=False),
         _moment("password_changed_at", True),

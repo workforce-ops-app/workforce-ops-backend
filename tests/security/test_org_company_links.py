@@ -14,16 +14,18 @@ these models.
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.base import Base
 from app.modules.org.models import Company, Department, Team, TeamMember, User
 from app.tenancy.context import set_company
+from app.tenancy.filter import UnsafeQueryError, WrongCompanyError
 
 ORG_TABLES = [model.__table__ for model in (Company, Department, Team, User, TeamMember)]
 
@@ -133,13 +135,44 @@ def test_an_email_belongs_to_one_account_on_the_whole_platform(org: Org) -> None
 
 
 def test_emails_are_stored_in_lowercase(org: Org) -> None:
-    # "Ana@Example.com" and "ana@example.com" must not become two accounts.
+    # The model lowercases every email before saving.
     with org.session_for(org.company_a) as session:
-        session.add(
-            User(email="Ana@Example.com", display_name="Ana", department_id=org.department_a)
-        )
+        user = User(email="Cara@Example.COM", display_name="Cara", department_id=org.department_a)
+        session.add(user)
+        session.commit()
+        assert user.email == "cara@example.com"
+
+
+def test_the_same_address_in_another_case_is_still_one_account(org: Org) -> None:
+    # "ANA@example.com" becomes "ana@example.com", which company A already uses.
+    with org.session_for(org.company_b) as session:
+        session.add(User(email="ANA@example.com", display_name="Copy", department_id=uuid.uuid4()))
         with pytest.raises(IntegrityError):
             session.commit()
+
+
+def test_the_database_refuses_a_mixed_case_email_written_around_the_model(org: Org) -> None:
+    # The backstop: a write that skips the model (only migrations may, so the connection is
+    # trusted here) still cannot store a mixed-case address. The migration check repeats
+    # this on MySQL, whose default comparison would otherwise let it through.
+    from sqlalchemy import insert
+
+    from app.tenancy.filter import trust_connection
+
+    with org.engine.connect() as connection, pytest.raises(IntegrityError):
+        trust_connection(connection)
+        connection.execute(
+            insert(User.__table__).values(
+                id=uuid.uuid4(),
+                company_id=org.company_a,
+                department_id=org.department_a,
+                email="Mixed@Example.com",
+                display_name="Mixed",
+                failed_sign_ins=0,
+                created_at=datetime.now(UTC).replace(tzinfo=None),
+                updated_at=datetime.now(UTC).replace(tzinfo=None),
+            )
+        )
 
 
 def test_links_within_one_company_work(org: Org) -> None:
@@ -148,3 +181,71 @@ def test_links_within_one_company_work(org: Org) -> None:
         session.add(TeamMember(team_id=org.team_a, user_id=org.user_a))
         session.commit()
         assert session.get(TeamMember, (org.team_a, org.user_a)) is not None
+
+
+# --- The companies table itself ---------------------------------------------------------
+# companies is not company-owned (each row is a company), so the plain company filter
+# would not cover it. These tests make sure a company still cannot read or change another
+# company through it.
+
+
+def test_a_company_sees_only_itself_in_the_companies_table(org: Org) -> None:
+    with org.session_for(org.company_a) as session:
+        # Listing companies shows only company A's own row.
+        assert session.scalars(select(Company.name)).all() == ["Northwind Cafe"]
+        # Company B by its exact ID looks like it does not exist.
+        assert session.get(Company, org.company_b) is None
+
+
+def test_a_company_cannot_rename_another_company(org: Org) -> None:
+    # Company B, loaded by platform code and detached, then attached to company A's
+    # session and renamed: refused.
+    with Session(org.engine) as platform:
+        other = platform.get(Company, org.company_b)
+        assert other is not None
+        platform.expunge(other)
+    with org.session_for(org.company_a) as session:
+        session.add(other)
+        other.name = "Renamed by A"
+        with pytest.raises(WrongCompanyError):
+            session.commit()
+    with Session(org.engine) as platform:
+        assert platform.get(Company, org.company_b).name == "Summit Outfitters"  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("action", ["create", "delete"])
+def test_a_company_cannot_create_or_delete_companies(org: Org, action: str) -> None:
+    # Creating and deleting companies is platform work, even for a company's own row.
+    with org.session_for(org.company_a) as session:
+        if action == "create":
+            session.add(Company(name="Shell company", timezone="UTC"))
+        else:
+            own = session.get(Company, org.company_a)
+            assert own is not None
+            session.delete(own)
+        with pytest.raises(UnsafeQueryError):
+            session.commit()
+
+
+def test_the_raw_companies_table_is_refused(org: Org) -> None:
+    # Reading Company.__table__ directly would skip the "own company only" condition.
+    with org.session_for(org.company_a) as session, pytest.raises(UnsafeQueryError):
+        session.execute(select(Company.__table__.c.name))
+
+
+def test_a_company_can_change_its_own_row(org: Org) -> None:
+    with org.session_for(org.company_a) as session:
+        own = session.get(Company, org.company_a)
+        assert own is not None
+        own.name = "Northwind Cafe and Bakery"
+        session.commit()
+    with org.session_for(org.company_a) as session:
+        assert session.scalars(select(Company.name)).all() == ["Northwind Cafe and Bakery"]
+
+
+def test_platform_code_without_a_company_manages_companies(org: Org) -> None:
+    # The seed script works in a session with no company: it sees and creates companies.
+    with Session(org.engine) as platform:
+        platform.add(Company(name="Third Company", timezone="UTC"))
+        platform.commit()
+        assert len(platform.scalars(select(Company)).all()) == 3
