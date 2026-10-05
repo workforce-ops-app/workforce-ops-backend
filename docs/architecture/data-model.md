@@ -4,7 +4,7 @@
 
 Decisions behind this page: [0016 tenancy](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0016-tenant-isolation.md) · [0017 scoped roles](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0017-scoped-role-assignments.md) · [0018 audit](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0018-audit-log-chains.md) · [0019 IDs](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0019-uuidv7-ids.md) · [0020 deletion](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md) · [0021 time](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md) · [0022 SQLAlchemy](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0022-sqlalchemy-and-alembic.md)
 
-> **Status:** design. Tables are created when the features that need them are built. Feature tables (time off, coverage and swaps, tasks, announcements, notifications) are documented on their feature pages.
+> **Status:** partly built. `companies`, `departments`, `teams`, `users`, and `team_members` exist (`app/modules/org/models.py`, migration `0002`); the other tables are created when the features that need them are built. Feature tables (time off, coverage and swaps, tasks, announcements, notifications) are documented on their feature pages.
 
 **How to read this page:** the [diagram](#overview-diagram) is a summary. The [entities](#entities) and [relationships](#relationships) sections are the detailed, authoritative version. A change to a table updates all three (see [adding a table](#adding-a-table)).
 

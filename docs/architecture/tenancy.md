@@ -4,7 +4,7 @@
 
 Decision: [0016](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0016-tenant-isolation.md).
 
-> **Status:** layer 1 (the automatic filter) and the first layer 3 tests are built: `app/tenancy/`, `tests/security/test_cross_company.py`. Layer 2 arrives with the first company-owned tables; layer 4 with the first endpoints.
+> **Status:** layers 1 and 2 are built, with their layer 3 tests: the filter in `app/tenancy/`, the company-aware keys on the first tables (`app/modules/org/models.py`, migration `0002`), and `tests/security/test_cross_company.py` and `test_org_company_links.py`. Layer 4 arrives with the first endpoints.
 
 ## Where the company comes from
 

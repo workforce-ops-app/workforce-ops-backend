@@ -4,7 +4,7 @@
 
 Decisions: [0004 feature modules](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0004-backend-feature-modules.md) · [0012 extension points](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0012-extensibility-patterns.md)
 
-> **Status:** partly built. `app/main.py`, `app/core/` (settings, logging, errors), `app/db/` (database connection, base model, migrations), `app/tenancy/` (the company filter), and the health module exist; the other shared layers arrive in Phase 2.
+> **Status:** partly built. `app/main.py`, `app/core/` (settings, logging, errors), `app/db/` (database connection, base model, migrations), `app/tenancy/` (the company filter), the health module, and the tables of the org module (`app/modules/org/models.py`) exist; the other shared layers arrive in Phase 2.
 
 ## The package
 

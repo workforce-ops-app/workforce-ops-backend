@@ -1,6 +1,6 @@
 # Company structure, people, and access
 
-- **Status:** planned (core tier)
+- **Status:** tables built (`app/modules/org/models.py`, migration `0002`); endpoints and demo data planned (core tier)
 - **Related:** workforce-ops-app/workforce-ops-backend#8; frontend page: administration screens (workforce-ops-app/workforce-ops-frontend#3); design: [data model](../architecture/data-model.md), [authorization](../architecture/authorization.md), [authentication](../architecture/authentication.md)
 
 ## In short

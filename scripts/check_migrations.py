@@ -7,6 +7,9 @@
    modularity).
 2. upgrade head → downgrade base → upgrade head on an empty MySQL 8.4, so every migration
    works in both directions.
+3. The tables the migrations created match the models exactly (Alembic compares the
+   database with Base.metadata). A hand-written or edited migration that drifted from
+   its models fails here.
 
 The database is a throwaway Docker container (removed afterwards), unless
 MIGRATION_CHECK_DATABASE_URL points at an empty database to use instead.
@@ -23,7 +26,9 @@ import sys
 import time
 
 from alembic import command
+from alembic.autogenerate import compare_metadata
 from alembic.config import Config
+from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, make_url, text
 from sqlalchemy.exc import OperationalError
@@ -86,6 +91,29 @@ def _start_mysql() -> tuple[str, str]:
     return name, url
 
 
+def _differences_from_models(url: str) -> list[str]:
+    """What differs between the migrated database and the models (empty when they match)."""
+    # Load every feature's models into Base.metadata, the same way migrations/env.py does.
+    from app.db.base import Base
+    from app.db.registry import import_all_models
+
+    import_all_models()
+
+    # Let Alembic compare the real tables with the models, as autogenerate would; any
+    # difference means a migration and its models disagree. alembic_version is Alembic's
+    # own bookkeeping table, not a model.
+    engine = create_engine(url)
+    try:
+        with engine.connect() as connection:
+            context = MigrationContext.configure(
+                connection,
+                opts={"include_name": lambda name, kind, parent: name != "alembic_version"},
+            )
+            return [str(difference) for difference in compare_metadata(context, Base.metadata)]
+    finally:
+        engine.dispose()
+
+
 def main() -> int:
     config = Config("alembic.ini")
     heads = ScriptDirectory.from_config(config).get_heads()
@@ -111,12 +139,19 @@ def main() -> int:
         command.upgrade(config, "head")
         command.downgrade(config, "base")
         command.upgrade(config, "head")
+        differences = _differences_from_models(url)
     finally:
         if container:
             subprocess.run([_docker(), "stop", container], capture_output=True)  # noqa: S603
 
+    if differences:
+        print("the migrated tables do not match the models:")
+        for difference in differences:
+            print(f"  {difference}")
+        return 1
+
     where = "a fresh MySQL 8.4" if container else "MIGRATION_CHECK_DATABASE_URL"
-    print(f"one head ({heads[0]}); upgrade, downgrade, upgrade passed on {where}")
+    print(f"one head ({heads[0]}); upgrade, downgrade, upgrade passed on {where}; models match")
     return 0
 
 
