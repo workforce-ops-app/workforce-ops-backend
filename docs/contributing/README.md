@@ -110,8 +110,24 @@ Each contributor has their own database; GitHub carries its **structure**, never
   docker compose down --volumes                      # deletes your local data
   docker compose up -d --build
   docker compose run --rm api alembic upgrade head
-  python -m scripts.seed_demo                        # once the seed script exists (Phase 2)
+  python -m scripts.seed_demo                        # the two demo companies
   ```
+
+## Demo data
+
+`python -m scripts.seed_demo` fills the database with the two demo companies, Northwind Cafe (America/Chicago, `@example.com`) and Summit Outfitters (America/Denver, `@example.org`), each with the same departments, teams, and kinds of people ([organization: demo data](../features/organization.md#demo-data)). Run it from your `.venv` with MySQL running and the migrations applied:
+
+```
+docker compose up -d db
+alembic upgrade head
+python -m scripts.seed_demo
+```
+
+- **Same result on every run:** a company that already exists is left unchanged. To start over, reset the database (`docker compose down --volumes`), then run the three commands again.
+- **Refuses to run when `APP_ENV=production`.**
+- **Built alike on purpose:** the same department and team names in both companies, so a leak from one company into the other is obvious in tests and demos.
+- **No passwords yet:** sign-in arrives with S1, which gives the demo accounts a password from an environment variable. Roles (Z1) and shifts (SD1) are added to the script by those slices.
+- It runs on your computer, not in the API container (the image does not include `scripts/`).
 
 ## Conventions specific to this repository
 
