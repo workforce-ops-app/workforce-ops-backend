@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     # hides it when the settings are printed or logged. Optional, so a password already
     # written inside DATABASE_URL keeps working.
     database_password: SecretStr | None = None
+    # The password the demo seed script (scripts/seed_demo.py) gives every demo account,
+    # so the demo can sign in. Local and demo use only; never in production.
+    demo_password: SecretStr | None = None
 
     @property
     def sqlalchemy_url(self) -> URL:
