@@ -23,6 +23,9 @@ session (app/db/session.py, background jobs, tests):
   - bulk updates or deletes given a list of rows by primary key, which run without the
     company condition: load the rows and change them, or update with a where clause.
   A bulk update that sets company_id itself is refused as WrongCompanyError.
+  - in a session working for a company, a bulk delete of companies (UnsafeQueryError) or
+    a bulk update that sets a company's id (WrongCompanyError): both skip the save check
+    that enforces the companies-table rules above.
 - Last guard, at the database connection: any read or write of a company table that
   reaches the database without passing the checks above is refused. That covers
   SQLAlchemy's older bulk methods (bulk_insert_mappings, bulk_update_mappings,
@@ -131,8 +134,8 @@ def _company_table_names() -> set[str]:
     return _table_names(mappers, _is_company_owned) | _table_names(mappers, _is_company_record)
 
 
-def _sets_company_id(state: ORMExecuteState) -> bool:
-    """Whether an UPDATE statement assigns a value to company_id."""
+def _sets_column(state: ORMExecuteState, column: str) -> bool:
+    """Whether an UPDATE statement assigns a value to the given column (by name)."""
     names: set[str] = set()
 
     # The values written with .values(...): SQLAlchemy keeps them on the statement as
@@ -152,7 +155,7 @@ def _sets_company_id(state: ORMExecuteState) -> bool:
     if isinstance(parameters, Mapping):
         names.update(parameters.keys())
 
-    return "company_id" in names
+    return column in names
 
 
 @event.listens_for(Session, "do_orm_execute")
@@ -216,8 +219,22 @@ def _add_company_filter(state: ORMExecuteState) -> None:
 
     # Setting company_id in a bulk update would move rows into another company (the
     # condition below only limits WHICH rows change, not what they change to).
-    if state.is_update and _sets_company_id(state):
+    if state.is_update and _sets_column(state, "company_id"):
         raise WrongCompanyError("company_id cannot be changed")
+
+    # The companies table as the target of a bulk update or delete. These statements go
+    # straight to the database without the save check (_check_saved_rows), so its rules for
+    # companies are repeated here. bind_mapper is the model the statement changes (for
+    # delete(Department).where(...Company...) that is Department, so this stays narrow).
+    target = state.bind_mapper
+    if target is not None and _is_company_record(target.class_):
+        # Deleting companies is platform work, even the session's own company.
+        if state.is_delete:
+            raise UnsafeQueryError("companies are created and deleted by platform code only")
+        # A company's id is the value this filter uses to tell companies apart. Changing it
+        # would re-key the company, so it is refused like changing company_id above.
+        if state.is_update and _sets_column(state, "id"):
+            raise WrongCompanyError("a company's id cannot be changed")
 
     # Add "company_id = <company>" for every CompanyOwned model in the statement, wherever
     # it appears: the main table, joins, aliases (include_aliases), and later loads of
