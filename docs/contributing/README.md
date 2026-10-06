@@ -18,6 +18,7 @@ pre-commit install
 - **`-e` (editable)** means code changes take effect without reinstalling.
 - **Dependencies** are pinned to exact versions in `pyproject.toml`; Dependabot proposes updates. After pulling a change to `pyproject.toml`, run the install line again.
 - **Settings** come from environment variables; `.env` holds them for local use and is never committed. Every setting is listed in `.env.example`.
+- **The audit signing key:** set your own `AUDIT_SIGNING_KEY` in `.env` (at least 32 characters; `.env.example` shows how to generate one). Without it, any action that writes an audit entry fails ([audit log](../architecture/audit-log.md#the-signing-key)).
 
 
 ## Quick reference
