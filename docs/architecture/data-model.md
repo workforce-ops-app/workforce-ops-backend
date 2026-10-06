@@ -447,7 +447,7 @@ Primary key: `(company_id, module, setting_key)`. A missing row means "use the d
 | `last_seq` | `BIGINT` | number of the newest entry (0 before the first) |
 | `last_signature` | `BINARY(32)` | signature of the newest entry (32 zero bytes before the first) |
 
-The application's database user may only read and update rows here, never delete them.
+The application's database user may only add, read, and update rows here (a chain's first entry adds its head), never delete them.
 
 ### audit_events
 

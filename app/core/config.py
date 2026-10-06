@@ -7,7 +7,7 @@ so a missing secret stops the app at startup instead of silently using a weak va
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL, make_url
 
@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     # The password the demo seed script (scripts/seed_demo.py) gives every demo account,
     # so the demo can sign in. Local and demo use only; never in production.
     demo_password: SecretStr | None = None
+    # The secret key that signs every audit log entry (decision 0018, audit-log.md), and
+    # its ID, which is stored with each entry so the key can be rotated later. Kept out of
+    # the database and the repository: whoever has the key can forge a valid-looking log.
+    # Optional here, so migrations and scripts run without it; writing an audit entry
+    # without a key is refused (app/audit/record.py), and the action fails with it.
+    audit_signing_key: SecretStr | None = Field(default=None, min_length=32)
+    audit_key_id: str = Field(default="local-1", min_length=1, max_length=40)
 
     @property
     def sqlalchemy_url(self) -> URL:
