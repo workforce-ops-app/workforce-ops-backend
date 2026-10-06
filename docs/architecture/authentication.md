@@ -4,7 +4,7 @@
 
 Decisions: [0027 authentication and sessions](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md) · [0025 sensitive actions and security settings](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md) · [0003 one address for pages and API](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0003-same-origin-deployment.md) · Threats: S1 to S5, I3, D1 in the [threat model](../security/threat-model.md)
 
-> **Status:** passwords (`app/auth/passwords.py`) and sign-in with sessions (`app/auth/sessions.py`, the `sessions` endpoints, migration `0004`) are built; CSRF, lockouts, links, and re-entry follow in the next Phase 2 slices. Until lockouts (S4) exist, an account with `locked_until` in the future is refused, but failures are not counted yet.
+> **Status:** passwords (`app/auth/passwords.py`), sign-in with sessions (`app/auth/sessions.py`, the `sessions` endpoints, migration `0004`), and CSRF protection (`app/auth/csrf.py`) are built; lockouts, links, and re-entry follow in the next Phase 2 slices. Until lockouts (S4) exist, an account with `locked_until` in the future is refused, but failures are not counted yet.
 
 ## Passwords
 
@@ -97,6 +97,16 @@ Three defenses, so one mistake is not enough:
 
 `GET` requests never change anything, so they need no token.
 
+**How it is built** (`app/auth/csrf.py`): a middleware checks every `POST`, `PUT`, `PATCH`, and `DELETE` before any endpoint runs, so no endpoint can forget it.
+- **The application's own address** is the `APP_ORIGIN` setting (for example `http://localhost:8080` under Docker Compose, where the frontend's nginx serves pages and API). Unset, it is the address the request was sent to, which is right when the API runs directly (`uvicorn`). The comparison ignores case and a trailing slash; a missing `Origin`, or `null`, is refused.
+- **The token** is required whenever the browser sends a session cookie, with one exception: **sign-in** (`POST /api/sessions`) is checked for `Origin` only. It starts a session rather than acting in one, and a browser may still carry the cookie of a session that already ended; demanding that dead session's token would lock the person out. A forged sign-in (signing the victim into the attacker's account) is still refused by the `Origin` check.
+- The token is returned as `csrf_token` by `POST /api/sessions` and `GET /api/sessions/current`, and compared in constant time (`hmac.compare_digest`).
+- **Every refusal** is a 403 with the same message, whichever check failed, so an attacker learns nothing about which part was wrong.
+- The API does not start without `CSRF_KEY` (at least 32 characters), or when it is the same as `AUDIT_SIGNING_KEY`: one leaked secret must not weaken the other protection.
+- Another site cannot read the API's answers (the API sends no CORS headers that would allow it), so it can never learn the token from `GET /api/sessions/current`.
+
+**Why `SameSite=Strict` alone is not enough:** browsers decide "same site" by the registered domain, so a page on any subdomain (or a sibling application on the same domain) counts as the same site and its requests carry the cookie; older or unusual browsers may not enforce `SameSite` at all; and sign-in has no cookie to protect yet. The `Origin` check and the token do not depend on any of that.
+
 ## Lockouts and rate limits
 
 | Limit | Value | Kept in |
@@ -152,7 +162,7 @@ This limits the damage from a session left open on a shared computer or stolen b
 | Method and path | Who | Does |
 |---|---|---|
 | `POST /api/sessions` | anyone | sign in |
-| `GET /api/sessions/current` | signed in | current user (with their home `department_id`), their company, their effective permissions (empty until Z1), CSRF token (from S3) |
+| `GET /api/sessions/current` | signed in | current user (with their home `department_id`), their company, their effective permissions (empty until Z1), CSRF token (`csrf_token`) |
 | `DELETE /api/sessions/current` | signed in | sign out |
 | `DELETE /api/sessions` | signed in | sign out everywhere (own sessions) |
 | `POST /api/sessions/current/reauth` | signed in | re-enter the password |
@@ -202,4 +212,4 @@ Entries never contain passwords, tokens, or hashes. Failed sign-ins for emails t
 | CSRF and Origin checks | `app/auth/csrf.py` |
 | Lockouts and rate limits | `app/auth/limits.py` |
 | Setup and reset links | `app/auth/links.py` |
-| Tests | `tests/unit/test_sessions_api.py`, `tests/security/test_sign_in.py` (AU3, AU4, AU5, and companies), `tests/unit/test_passwords.py`, `tests/security/test_password_rules.py` (AU1) |
+| Tests | `tests/unit/test_sessions_api.py`, `tests/security/test_sign_in.py` (AU3, AU4, AU5, and companies), `tests/security/test_csrf.py` (AU6), `tests/unit/test_passwords.py`, `tests/security/test_password_rules.py` (AU1) |

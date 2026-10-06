@@ -37,3 +37,5 @@ class SessionInfo(BaseModel):
     permissions: list[str]
     # When the session ends at the latest (the 30-day maximum), in UTC.
     expires_at: datetime
+    # Sent back as X-CSRF-Token on every request that changes something (app/auth/csrf.py).
+    csrf_token: str

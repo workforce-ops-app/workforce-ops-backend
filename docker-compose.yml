@@ -48,6 +48,11 @@ services:
       # without a key every such action would fail.
       AUDIT_SIGNING_KEY: ${AUDIT_SIGNING_KEY:?set AUDIT_SIGNING_KEY in .env}
       AUDIT_KEY_ID: ${AUDIT_KEY_ID:-local-1}
+      # The key behind CSRF tokens; the API does not start without it.
+      CSRF_KEY: ${CSRF_KEY:?set CSRF_KEY in .env}
+      # The address browsers use: the frontend's nginx, which serves the pages and passes
+      # /api on (decision 0003). Changes must come from it (the Origin check).
+      APP_ORIGIN: ${APP_ORIGIN:-http://localhost:8080}
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
     # Start the API only once MySQL reports healthy, so its first requests do not fail.

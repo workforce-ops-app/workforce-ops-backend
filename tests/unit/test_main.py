@@ -11,12 +11,14 @@ from fastapi.testclient import TestClient
 from app import main
 from app.core.config import Settings
 from app.main import create_app
+from tests.conftest import TEST_CSRF_KEY
 
 
 def test_app_loads_settings_when_none_are_supplied(monkeypatch: pytest.MonkeyPatch) -> None:
     environment_settings = Settings(
         app_env="development",
         database_url="mysql+pymysql://test:test@localhost:3307/test",
+        csrf_key=TEST_CSRF_KEY,  # type: ignore[arg-type]
     )
     monkeypatch.setattr(main, "get_settings", lambda: environment_settings)
 
@@ -33,12 +35,35 @@ def test_api_docs_are_available_in_development(client: TestClient) -> None:
 def test_api_docs_are_hidden_in_production() -> None:
     # A production server must not advertise every endpoint (threat model I4).
     settings = Settings(
-        app_env="production", database_url="mysql+pymysql://test:test@localhost:3307/test"
+        app_env="production",
+        database_url="mysql+pymysql://test:test@localhost:3307/test",
+        csrf_key=TEST_CSRF_KEY,  # type: ignore[arg-type]
     )
     client = TestClient(create_app(settings))
 
     assert client.get("/api/docs").status_code == 404
     assert client.get("/api/openapi.json").status_code == 404
+
+
+def test_the_api_does_not_start_without_a_csrf_key() -> None:
+    # Every change to data depends on the key, so a missing one stops the API at startup
+    # instead of leaving changes unprotected.
+    settings = Settings(
+        app_env="test", database_url="mysql+pymysql://test:test@localhost:3307/test"
+    )
+    with pytest.raises(RuntimeError, match="CSRF_KEY"):
+        create_app(settings)
+
+
+def test_the_csrf_key_must_differ_from_the_audit_key() -> None:
+    settings = Settings(
+        app_env="test",
+        database_url="mysql+pymysql://test:test@localhost:3307/test",
+        csrf_key=TEST_CSRF_KEY,  # type: ignore[arg-type]
+        audit_signing_key=TEST_CSRF_KEY,  # type: ignore[arg-type]
+    )
+    with pytest.raises(RuntimeError, match="differ"):
+        create_app(settings)
 
 
 def test_discovery_includes_only_real_routers(monkeypatch: pytest.MonkeyPatch) -> None:
