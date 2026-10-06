@@ -124,6 +124,7 @@ python -m scripts.seed_demo
 ```
 
 - **Same result on every run:** a company that already exists is left unchanged. To start over, reset the database (`docker compose down --volumes`), then run the three commands again.
+- **All or nothing per company:** each company and everything in it are saved in one transaction. If a run stops part way (an error, a lost connection), nothing of that company is kept, so running the script again builds it from the start.
 - **Refuses to run when `APP_ENV=production`.**
 - **Built alike on purpose:** the same department and team names in both companies, so a leak from one company into the other is obvious in tests and demos.
 - **No passwords yet:** sign-in arrives with S1, which gives the demo accounts a password from an environment variable. Roles (Z1) and shifts (SD1) are added to the script by those slices.
