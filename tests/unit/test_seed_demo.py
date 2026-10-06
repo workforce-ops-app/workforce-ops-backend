@@ -99,6 +99,34 @@ def test_running_it_twice_changes_nothing(engine: Engine) -> None:
         assert count(engine, company_id, User) == 8
 
 
+def test_a_failure_part_way_leaves_nothing_behind_and_a_rerun_completes(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Fail while creating the people: after the company row and the departments exist,
+    # before the company is finished.
+    def broken_email(person: seed_demo.Person, domain: str) -> str:
+        raise RuntimeError("simulated failure part way through")
+
+    monkeypatch.setattr(seed_demo, "email_for", broken_email)
+    with pytest.raises(RuntimeError, match="simulated"):
+        seed_demo.seed(engine)
+
+    # Nothing was saved, not even the company row: otherwise the next run would find the
+    # name, report "already there", and never finish the company.
+    assert company_ids(engine) == {}
+
+    # Once the cause is gone, the next run creates both companies completely.
+    monkeypatch.undo()
+    lines = seed_demo.seed(engine)
+    assert [line.split(";")[0] for line in lines] == [
+        "Northwind Cafe: created",
+        "Summit Outfitters: created",
+    ]
+    for company_id in company_ids(engine).values():
+        assert count(engine, company_id, Department) == 3
+        assert count(engine, company_id, User) == 8
+
+
 def test_emails_use_the_reserved_domains(engine: Engine) -> None:
     seed_demo.seed(engine)
     ids = company_ids(engine)

@@ -8,6 +8,8 @@ kinds of people), so a leak from one company into the other is obvious in tests 
 
 - Gives the same result on every run: a company that already exists is left alone, so
   running the script twice changes nothing.
+- Creates each company all or nothing (one transaction): if a step fails, nothing of that
+  company is kept, so the next run builds it again from the start.
 - Refuses to run against a production database (APP_ENV=production).
 - Uses the reserved example.com and example.org email domains.
 - Creates companies the only way the design allows: from a session with no company
@@ -109,53 +111,73 @@ def email_for(person: Person, domain: str) -> str:
 
 
 def seed_company(engine: Engine, plan: CompanyPlan) -> bool:
-    """Create one demo company with everything in it. Returns False if it already exists."""
-    # 1. The company itself, created by platform code: a session with no company. If a
-    #    company with this name already exists, leave it as it is.
-    with Session(engine) as platform:
-        if platform.scalars(select(Company.id).where(Company.name == plan.name)).first():
-            return False
-        company = Company(name=plan.name, timezone=plan.timezone)
-        platform.add(company)
-        platform.commit()
-        company_id = company.id
+    """Create one demo company with everything in it. Returns False if it already exists.
 
-    # 2. Everything inside the company, from a session working for it: the company filter
-    #    fills in company_id on every row and refuses anything for another company.
-    with Session(engine) as session:
-        set_company(session, company_id)
+    All or nothing: the company and everything in it are saved in one database
+    transaction. If any step fails, nothing is kept, not even the company row, so the next
+    run starts this company again instead of finding a half-built one and skipping it.
+    """
+    # One connection and one transaction for the whole company. engine.begin() commits
+    # when the block ends normally and rolls everything back if anything inside raises.
+    # Both sessions below run inside this transaction: a session given a connection that
+    # is already in a transaction only flushes (sends its rows); it never commits or rolls
+    # back the transaction itself.
+    with engine.begin() as connection:
+        # 1. The company itself, created by platform code: a session with no company. If a
+        #    company with this name already exists, leave it as it is. (Because creating a
+        #    company is all or nothing, an existing one is always complete.)
+        with Session(connection) as platform:
+            if platform.scalars(select(Company.id).where(Company.name == plan.name)).first():
+                return False
+            company = Company(name=plan.name, timezone=plan.timezone)
+            platform.add(company)
+            platform.flush()  # sends the row and gives the company its ID; not saved yet
+            company_id = company.id
 
-        # Departments, then their teams.
-        departments = {name: Department(name=name) for name in DEPARTMENTS}
-        session.add_all(departments.values())
-        session.flush()  # gives the departments their IDs for the teams and people
-        teams = {
-            team: Team(name=team, department_id=departments[department].id)
-            for department, team_names in DEPARTMENTS.items()
-            for team in team_names
-        }
-        session.add_all(teams.values())
-
-        # The people, each with a home department (no password yet: see S1).
-        users = {
-            person.name: User(
-                email=email_for(person, plan.email_domain),
-                display_name=person.name,
-                department_id=departments[person.department].id,
-            )
-            for person in plan.people
-        }
-        session.add_all(users.values())
-        session.flush()  # gives the teams and people their IDs for the memberships
-
-        # Team memberships.
-        session.add_all(
-            TeamMember(team_id=teams[team].id, user_id=users[person.name].id)
-            for person in plan.people
-            for team in person.teams
-        )
-        session.commit()
+        # 2. Everything inside the company, from a session working for it: the company
+        #    filter fills in company_id on every row and refuses anything for another
+        #    company.
+        with Session(connection) as session:
+            set_company(session, company_id)
+            _seed_inside_company(session, plan)
     return True
+
+
+def _seed_inside_company(session: Session, plan: CompanyPlan) -> None:
+    """Add a company's departments, teams, people, and team memberships to the session."""
+    # Departments, then their teams.
+    departments = {name: Department(name=name) for name in DEPARTMENTS}
+    session.add_all(departments.values())
+    session.flush()  # gives the departments their IDs for the teams and people
+    teams = {
+        team: Team(name=team, department_id=departments[department].id)
+        for department, team_names in DEPARTMENTS.items()
+        for team in team_names
+    }
+    session.add_all(teams.values())
+
+    # The people, each with a home department (passwords come afterwards, from
+    # set_demo_passwords).
+    users = {
+        person.name: User(
+            email=email_for(person, plan.email_domain),
+            display_name=person.name,
+            department_id=departments[person.department].id,
+        )
+        for person in plan.people
+    }
+    session.add_all(users.values())
+    session.flush()  # gives the teams and people their IDs for the memberships
+
+    # Team memberships.
+    session.add_all(
+        TeamMember(team_id=teams[team].id, user_id=users[person.name].id)
+        for person in plan.people
+        for team in person.teams
+    )
+    # Send the memberships too, inside the caller's transaction: closing a session drops
+    # anything not yet flushed, and only the caller's transaction decides what is kept.
+    session.flush()
 
 
 def check_demo_password(password: str) -> None:
