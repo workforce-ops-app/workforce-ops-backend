@@ -4,7 +4,7 @@
 
 Decisions: [0027 authentication and sessions](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md) · [0025 sensitive actions and security settings](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md) · [0003 one address for pages and API](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0003-same-origin-deployment.md) · Threats: S1 to S5, I3, D1 in the [threat model](../security/threat-model.md)
 
-> **Status:** passwords are built (`app/auth/passwords.py`); sessions, CSRF, lockouts, links, and re-entry follow in the next Phase 2 slices.
+> **Status:** passwords (`app/auth/passwords.py`) and sign-in with sessions (`app/auth/sessions.py`, the `sessions` endpoints, migration `0004`) are built; CSRF, lockouts, links, and re-entry follow in the next Phase 2 slices. Until lockouts (S4) exist, an account with `locked_until` in the future is refused, but failures are not counted yet.
 
 ## Passwords
 
@@ -53,6 +53,10 @@ sequenceDiagram
 - **One message for every failure.** An unknown email, a wrong password, a locked, deactivated, or not-yet-set-up account all get the same answer in the same time: "Email or password is incorrect. After several failed attempts, sign-in is paused for a while." Otherwise the sign-in form would tell an attacker which emails have accounts (threat I3). A locked account is refused even with the correct password until the lock ends.
 - Emails are unique across the platform, so an email and a password identify exactly one account and one company ([data model](data-model.md#users)).
 - The session's company is the user's company; it is never taken from the request ([tenancy](tenancy.md)).
+- **Finding the account before the company is known.** Every company table is filtered by the session's company, but at sign-in there is none yet. Two lookups, and only these, are allowed to look across companies with `cross_company_read()`: the account by email at sign-in, and the session by its token's hash on each request. Each reads only the ID and company; everything after that runs for the company found. A security test fails if any other file uses it ([tenancy](tenancy.md)).
+- **No planted sessions (session fixation).** Sign-in always creates a new random token; a token the browser already carried is never turned into a signed-in session. If that earlier token still belonged to a working session, the session is ended, so a copy of the old token stops working.
+- **The same time for every failure.** Each failure does exactly one Argon2id check (against a dummy hash when there is no real one), and a failed sign-in also waits until at least 0.5 s have passed (`FAILED_SIGN_IN_SECONDS`, kept above the Argon2id time). That hides the few milliseconds a failure for an existing account spends writing its audit entry.
+- Failed sign-ins for unknown emails are logged without the email, which might be a password typed into the wrong field.
 
 ## Sessions
 
@@ -64,6 +68,7 @@ sequenceDiagram
 | **Maximum length** | 30 days after sign-in, however active (`expires_at`) |
 | **New session ID** | at sign-in, when the password changes, and after using a reset link; the old session row is deleted |
 | **Signing out** | deletes the session row and clears the cookie; "sign out everywhere" deletes all of the user's sessions |
+| **Ended sessions** | deleted when their token is next presented, and at each sign-in of the same person; a regular cleanup of sessions nobody returns to follows with the first scheduled job |
 
 What each cookie attribute does:
 - `__Host-` prefix: the browser only accepts the cookie over HTTPS, for this exact host, with `Path=/`, so a subdomain cannot plant or overwrite it.
@@ -147,7 +152,7 @@ This limits the damage from a session left open on a shared computer or stolen b
 | Method and path | Who | Does |
 |---|---|---|
 | `POST /api/sessions` | anyone | sign in |
-| `GET /api/sessions/current` | signed in | current user, their effective permissions, CSRF token |
+| `GET /api/sessions/current` | signed in | current user (with their home `department_id`), their company, their effective permissions (empty until Z1), CSRF token (from S3) |
 | `DELETE /api/sessions/current` | signed in | sign out |
 | `DELETE /api/sessions` | signed in | sign out everywhere (own sessions) |
 | `POST /api/sessions/current/reauth` | signed in | re-enter the password |
@@ -162,7 +167,7 @@ This limits the damage from a session left open on a shared computer or stolen b
 | Action | When |
 |---|---|
 | `auth.signed_in` | successful sign-in |
-| `auth.sign_in_failed` | wrong password for an existing account |
+| `auth.sign_in_failed` | a failed sign-in for an existing account; `details.reason` is `wrong_password`, `no_password`, `deactivated`, or `locked`. The actor is `system` (nobody is signed in) and the target is the account tried |
 | `auth.locked`, `auth.unlocked` | an account is locked by the schedule, or unlocked by an administrator |
 | `auth.password_changed` | a user changes their own password |
 | `auth.link_created`, `auth.link_used` | a setup or reset link is created or used |
@@ -191,8 +196,10 @@ Entries never contain passwords, tokens, or hashes. Failed sign-ins for emails t
 | Part | Location |
 |---|---|
 | Password rules, hashing, blocklist | `app/auth/passwords.py` |
-| Sessions, cookie, idle and maximum limits, re-entry | `app/auth/sessions.py` |
+| Sessions, cookie, idle and maximum limits, re-entry | `app/auth/sessions.py` (rules), `app/auth/models.py` (`UserSession`, the `sessions` table) |
+| Requiring a signed-in person in an endpoint | `app/auth/dependencies.py`: a parameter typed `SignedInPerson` loads the session (401 without one) and sets its company on the request's database session; `Database` is the request's database session |
+| The session endpoints | `app/modules/sessions/` (router and response shapes) |
 | CSRF and Origin checks | `app/auth/csrf.py` |
 | Lockouts and rate limits | `app/auth/limits.py` |
 | Setup and reset links | `app/auth/links.py` |
-| Tests | `tests/unit/auth/`, `tests/security/` |
+| Tests | `tests/unit/test_sessions_api.py`, `tests/security/test_sign_in.py` (AU3, AU4, AU5, and companies), `tests/unit/test_passwords.py`, `tests/security/test_password_rules.py` (AU1) |

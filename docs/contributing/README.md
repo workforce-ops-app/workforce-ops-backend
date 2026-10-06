@@ -82,7 +82,7 @@ SQLAlchemy sends `note_id` and `title` as bound parameters (`WHERE notes.id = %(
 
 ## Running with Docker
 
-`docker-compose.yml` runs the API and MySQL 8.4 together ([0034](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0034-database-driver-ids-and-local-layout.md)). Needs Docker Desktop running, and `MYSQL_ROOT_PASSWORD` and `MYSQL_APP_PASSWORD` set in `.env` (Compose refuses to start without them, so there is never a blank database password).
+`docker-compose.yml` runs the API and MySQL 8.4 together ([0034](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0034-database-driver-ids-and-local-layout.md)). Needs Docker Desktop running, and `MYSQL_ROOT_PASSWORD`, `MYSQL_APP_PASSWORD`, and `AUDIT_SIGNING_KEY` set in `.env` (Compose refuses to start without them, so there is never a blank database password or an unsigned audit log).
 
 | Task | Command |
 |---|---|
