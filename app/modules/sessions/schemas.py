@@ -33,7 +33,8 @@ class SessionInfo(BaseModel):
 
     user: SessionUser
     company: SessionCompany
-    # The person's effective permissions. Empty until permissions exist (Z1).
+    # Every permission the person holds somewhere (from their roles), sorted. For the
+    # interface's menu only; the API checks each request itself.
     permissions: list[str]
     # When the session ends at the latest (the 30-day maximum), in UTC.
     expires_at: datetime

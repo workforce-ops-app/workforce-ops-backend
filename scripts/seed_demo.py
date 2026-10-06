@@ -21,7 +21,7 @@ without a password gets that one, checked against the password rules and hashed 
 Argon2id like any other (app/auth/passwords.py). Without it, the accounts have no password
 and cannot sign in. The password itself is never written in the repository.
 
-Later slices extend it: Z1 gives each person the role recorded below, and SD1 adds two
+Each person gets the role recorded below (Z1), with the starting roles; SD1 adds two
 weeks of shifts. Reporting lines follow after the midterm (Z2).
 """
 
@@ -33,7 +33,9 @@ from dataclasses import dataclass
 from sqlalchemy import Engine, create_engine, select
 from sqlalchemy.orm import Session
 
+from app.audit import Actor
 from app.auth.passwords import PasswordRejected, check_password, hash_password
+from app.authz.roles import assign_role, create_starting_roles
 from app.core.config import get_settings
 from app.db.base import utcnow
 from app.modules.org.models import Company, Department, Team, TeamMember, User
@@ -175,8 +177,43 @@ def _seed_inside_company(session: Session, plan: CompanyPlan) -> None:
         for person in plan.people
         for team in person.teams
     )
-    # Send the memberships too, inside the caller's transaction: closing a session drops
-    # anything not yet flushed, and only the caller's transaction decides what is kept.
+    session.flush()
+
+    # The starting roles, and each person's roles (authorization.md, typical scopes):
+    # everyone is an Employee of their home department; owners and administrators hold
+    # their role for the whole company; managers for their home department. Created by
+    # the system (platform code), and audited like any role change.
+    roles = create_starting_roles(session, Actor.system())
+    for person in plan.people:
+        user = users[person.name]
+        assign_role(
+            session,
+            Actor.system(),
+            user_id=user.id,
+            role=roles["employee"],
+            scope_type="department",
+            scope_id=user.department_id,
+        )
+        if person.role in ("owner", "administrator"):
+            assign_role(
+                session,
+                Actor.system(),
+                user_id=user.id,
+                role=roles[person.role],
+                scope_type="company",
+            )
+        elif person.role == "manager":
+            assign_role(
+                session,
+                Actor.system(),
+                user_id=user.id,
+                role=roles["manager"],
+                scope_type="department",
+                scope_id=user.department_id,
+            )
+
+    # Send everything, inside the caller's transaction: closing a session drops anything
+    # not yet flushed, and only the caller's transaction decides what is kept.
     session.flush()
 
 

@@ -10,10 +10,12 @@ from base64 import urlsafe_b64decode
 import pytest
 from sqlalchemy import select
 
+from app.audit import Actor
 from app.audit.models import AuditEvent
 from app.auth import sessions
 from app.auth.models import UserSession
 from app.auth.sessions import COOKIE_NAME
+from app.authz.roles import assign_role, create_starting_roles
 from app.modules.org.models import User
 from tests.session_data import PASSWORD, SignInSetup, email, signin
 
@@ -33,7 +35,7 @@ def test_signing_in_returns_the_person_and_company_and_sets_the_cookie(
     assert body["user"]["display_name"] == "Ana"
     assert body["user"]["department_id"]  # the department week's default
     assert body["company"]["name"] == "Northwind Cafe"
-    assert body["permissions"] == []  # filled in by Z1
+    assert body["permissions"] == []  # no roles yet in this setup
     assert signin.client.cookies.get(COOKIE_NAME)
 
 
@@ -139,3 +141,33 @@ def test_sign_ins_are_written_to_the_companys_audit_log(signin: SignInSetup) -> 
         ("auth.sign_in_failed", "system", "user"),
     ]
     assert events[1].details == {"reason": "wrong_password"}
+
+
+def test_the_session_lists_the_persons_permissions(signin: SignInSetup) -> None:
+    # Give Ana the Employee role of her department; the next request shows it, without
+    # signing in again (permissions are read on every request).
+    signin.sign_in(signin.client, email(signin, "a_ana"))
+    with signin.session_for(signin.company_a) as db:
+        roles = create_starting_roles(db, Actor.system())
+        ana = db.get(User, signin.people["a_ana"])
+        assert ana is not None
+        assign_role(
+            db,
+            Actor.system(),
+            user_id=ana.id,
+            role=roles["employee"],
+            scope_type="department",
+            scope_id=ana.department_id,
+        )
+        db.commit()
+
+    permissions = signin.client.get("/api/sessions/current").json()["permissions"]
+    assert permissions == sorted(
+        [
+            "schedule.view_self",
+            "schedule.view",
+            "time_off.request",
+            "time_off.cancel_self",
+            "account.change_self",
+        ]
+    )

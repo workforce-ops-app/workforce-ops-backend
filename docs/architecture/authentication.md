@@ -162,7 +162,7 @@ This limits the damage from a session left open on a shared computer or stolen b
 | Method and path | Who | Does |
 |---|---|---|
 | `POST /api/sessions` | anyone | sign in |
-| `GET /api/sessions/current` | signed in | current user (with their home `department_id`), their company, their effective permissions (empty until Z1), CSRF token (`csrf_token`) |
+| `GET /api/sessions/current` | signed in | current user (with their home `department_id`), their company, their effective permissions (every permission they hold somewhere, read fresh on each request; for the menu only), CSRF token (`csrf_token`) |
 | `DELETE /api/sessions/current` | signed in | sign out |
 | `DELETE /api/sessions` | signed in | sign out everywhere (own sessions) |
 | `POST /api/sessions/current/reauth` | signed in | re-enter the password |

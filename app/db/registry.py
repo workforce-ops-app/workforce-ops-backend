@@ -18,6 +18,7 @@ import pkgutil
 # (a feature's tables are found below instead).
 import app.audit.models  # noqa: F401  (imported for its tables)
 import app.auth.models  # noqa: F401  (imported for its tables)
+import app.authz.models  # noqa: F401  (imported for its tables)
 from app import modules
 
 

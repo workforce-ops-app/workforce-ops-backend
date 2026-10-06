@@ -129,7 +129,8 @@ python -m scripts.seed_demo
 - **All or nothing per company:** each company and everything in it are saved in one transaction. If a run stops part way (an error, a lost connection), nothing of that company is kept, so running the script again builds it from the start.
 - **Refuses to run when `APP_ENV=production`.**
 - **Built alike on purpose:** the same department and team names in both companies, so a leak from one company into the other is obvious in tests and demos.
-- **Demo password:** set `DEMO_PASSWORD` in `.env` (at least 15 characters, not a common password; a few words with spaces work) and every demo account without a password gets it, checked against the password rules and hashed like any other. A weak one is refused before anything changes. Without it, the accounts have no password. Roles (Z1) and shifts (SD1) are added to the script by those slices.
+- **Demo password:** set `DEMO_PASSWORD` in `.env` (at least 15 characters, not a common password; a few words with spaces work) and every demo account without a password gets it, checked against the password rules and hashed like any other. A weak one is refused before anything changes. Without it, the accounts have no password. Each company gets the four starting roles, and every person their roles: Employee of their home department for everyone, plus Owner or Administrator for the whole company, or Manager of their home department. Shifts (SD1) are added to the script by that slice.
+- **Needs `AUDIT_SIGNING_KEY`:** creating roles and assignments writes audit entries.
 - It runs on your computer, not in the API container (the image does not include `scripts/`).
 
 ## Conventions specific to this repository

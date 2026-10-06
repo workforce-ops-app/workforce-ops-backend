@@ -25,6 +25,7 @@ from app.auth.sessions import (
     sign_out,
     sign_out_everywhere,
 )
+from app.authz.check import effective_permissions
 from app.modules.org.models import Company, User
 from app.modules.sessions.schemas import (
     SessionCompany,
@@ -68,7 +69,9 @@ def _info(request: Request, db: Session, user: User, session: UserSession) -> Se
             department_id=user.department_id,
         ),
         company=SessionCompany(id=company.id, name=company.name, timezone=company.timezone),
-        permissions=[],
+        # Every permission the person holds somewhere, read fresh on every request, so a
+        # role change shows at once. Only for the menu: the API checks every request.
+        permissions=effective_permissions(db, user),
         expires_at=session.expires_at.replace(tzinfo=UTC),
         # The key create_app keeps on the app, the same one the CSRF check uses.
         csrf_token=csrf_token(request.app.state.csrf_key, session.token_hash),
