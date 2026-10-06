@@ -12,6 +12,10 @@ session (app/db/session.py, background jobs, tests):
   refused before anything is written.
 - No company set: any query or save on a company-owned model raises an error instead of
   silently returning everything.
+- The companies table itself (models marked CompanyRecord): each row is a company, so a
+  session working for a company sees and changes only its own row, and cannot create or
+  delete companies. Only sessions with no company (platform code, the seed script) manage
+  companies.
 - Refused, because the filter cannot make them safe (UnsafeQueryError):
   - statements on a company table itself (TenantNote.__table__) instead of the model;
   - bulk inserts (session.execute(insert(Model)...)), which skip the save check: add
@@ -19,6 +23,9 @@ session (app/db/session.py, background jobs, tests):
   - bulk updates or deletes given a list of rows by primary key, which run without the
     company condition: load the rows and change them, or update with a where clause.
   A bulk update that sets company_id itself is refused as WrongCompanyError.
+  - in a session working for a company, a bulk delete of companies (UnsafeQueryError) or
+    a bulk update that sets a company's id (WrongCompanyError): both skip the save check
+    that enforces the companies-table rules above.
 - Last guard, at the database connection: any read or write of a company table that
   reaches the database without passing the checks above is refused. That covers
   SQLAlchemy's older bulk methods (bulk_insert_mappings, bulk_update_mappings,
@@ -74,6 +81,18 @@ class CompanyOwned:
     company_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary, nullable=False, index=True)
 
 
+class CompanyRecord:
+    """Marker for the companies table itself: each row is a company, and its id is the
+    company's ID.
+
+    In a session that works for a company, queries see only that company's row, and only
+    that row can be changed; creating or deleting companies is refused. Sessions with no
+    company (platform code, the seed script) manage companies.
+
+    Use it on the Company model only:  class Company(IdAndTimestamps, CompanyRecord, Base)
+    """
+
+
 # Markers for the last guard (_guard_connection below). They are execution options:
 # CHECKED on a single statement that passed the query hook, SAVING and TRUSTED on one
 # connection handle. Execution options belong to that handle only, never to the pooled
@@ -97,17 +116,26 @@ def _is_company_owned(mapped_class: type) -> bool:
     return issubclass(mapped_class, CompanyOwned)
 
 
-def _company_table_names() -> set[str]:
-    """The names of the tables that belong to companies (their models inherit CompanyOwned)."""
+def _is_company_record(mapped_class: type) -> bool:
+    """Whether a model class is the companies table itself (marked CompanyRecord)."""
+    return issubclass(mapped_class, CompanyRecord)
+
+
+def _table_names(mappers: Any, kind: Any) -> set[str]:
+    """The table names of the given mappers whose model passes the check `kind`."""
     return {
-        str(getattr(mapper.local_table, "name", ""))
-        for mapper in Base.registry.mappers
-        if _is_company_owned(mapper.class_)
+        str(getattr(mapper.local_table, "name", "")) for mapper in mappers if kind(mapper.class_)
     }
 
 
-def _sets_company_id(state: ORMExecuteState) -> bool:
-    """Whether an UPDATE statement assigns a value to company_id."""
+def _company_table_names() -> set[str]:
+    """Every table the filter protects: company-owned tables and the companies table."""
+    mappers = Base.registry.mappers
+    return _table_names(mappers, _is_company_owned) | _table_names(mappers, _is_company_record)
+
+
+def _sets_column(state: ORMExecuteState, column: str) -> bool:
+    """Whether an UPDATE statement assigns a value to the given column (by name)."""
     names: set[str] = set()
 
     # The values written with .values(...): SQLAlchemy keeps them on the statement as
@@ -127,7 +155,7 @@ def _sets_company_id(state: ORMExecuteState) -> bool:
     if isinstance(parameters, Mapping):
         names.update(parameters.keys())
 
-    return "company_id" in names
+    return column in names
 
 
 @event.listens_for(Session, "do_orm_execute")
@@ -160,14 +188,12 @@ def _add_company_filter(state: ORMExecuteState) -> None:
     if not touched:
         return
 
-    # The tables reached through a company-owned model. Only those get the company
-    # condition below; a company table reached any other way would go unfiltered.
-    through_models = {
-        str(getattr(mapper.local_table, "name", ""))
-        for mapper in state.all_mappers
-        if _is_company_owned(mapper.class_)
-    }
-    if touched - through_models:
+    # The tables reached through a model the filter knows (company-owned, or the companies
+    # table). Only those get the conditions below; a table reached any other way (its raw
+    # Table object) would go unfiltered.
+    owned = _table_names(state.all_mappers, _is_company_owned)
+    records = _table_names(state.all_mappers, _is_company_record)
+    if touched - (owned | records):
         raise UnsafeQueryError("use the model, not its table, for company data")
 
     # Bulk inserts go straight to the database, past the save check that fills in and
@@ -177,10 +203,14 @@ def _add_company_filter(state: ORMExecuteState) -> None:
 
     # From here on the statement involves company data, so the session must know its
     # company. Without one, refuse loudly instead of reading or changing every company's
-    # rows.
+    # rows. The one exception: a statement on the companies table alone, from a session
+    # with no company, is platform code (the seed script) managing companies.
     company_id = get_company(state.session)
     if company_id is None:
-        raise MissingCompanyError("query on company data without a company set on the session")
+        if owned:
+            raise MissingCompanyError("query on company data without a company set on the session")
+        state.update_execution_options(**{_CHECKED: True})
+        return
 
     # A bulk update or delete given a list of rows by primary key runs without the
     # company condition, so it could reach another company's rows by their IDs.
@@ -189,19 +219,45 @@ def _add_company_filter(state: ORMExecuteState) -> None:
 
     # Setting company_id in a bulk update would move rows into another company (the
     # condition below only limits WHICH rows change, not what they change to).
-    if state.is_update and _sets_company_id(state):
+    if state.is_update and _sets_column(state, "company_id"):
         raise WrongCompanyError("company_id cannot be changed")
+
+    # The companies table as the target of a bulk update or delete. These statements go
+    # straight to the database without the save check (_check_saved_rows), so its rules for
+    # companies are repeated here. bind_mapper is the model the statement changes (for
+    # delete(Department).where(...Company...) that is Department, so this stays narrow).
+    target = state.bind_mapper
+    if target is not None and _is_company_record(target.class_):
+        # Deleting companies is platform work, even the session's own company.
+        if state.is_delete:
+            raise UnsafeQueryError("companies are created and deleted by platform code only")
+        # A company's id is the value this filter uses to tell companies apart. Changing it
+        # would re-key the company, so it is refused like changing company_id above.
+        if state.is_update and _sets_column(state, "id"):
+            raise WrongCompanyError("a company's id cannot be changed")
 
     # Add "company_id = <company>" for every CompanyOwned model in the statement, wherever
     # it appears: the main table, joins, aliases (include_aliases), and later loads of
     # related rows. SQLAlchemy sends company_id as a bound parameter, never as SQL text.
-    state.statement = state.statement.options(
+    criteria = [
         with_loader_criteria(
             CompanyOwned,
             lambda cls: cls.company_id == company_id,
             include_aliases=True,
         )
-    )
+    ]
+    # On the companies table the company is the row itself, so the condition there is
+    # "id = <company>": a session working for one company never sees another company. It
+    # is added for each company model in the statement (the marker class has no id column
+    # of its own to build the condition from).
+    for mapper in state.all_mappers:
+        if _is_company_record(mapper.class_):
+            criteria.append(
+                with_loader_criteria(
+                    mapper.class_, lambda cls: cls.id == company_id, include_aliases=True
+                )
+            )
+    state.statement = state.statement.options(*criteria)
 
     # Tell the last guard (_guard_connection) this statement passed the checks above.
     state.update_execution_options(**{_CHECKED: True})
@@ -215,20 +271,28 @@ def _check_saved_rows(session: Session, flush_context: Any, instances: Any) -> N
     then lets the last guard know these writes were checked.
     """
     # session.new holds rows about to be inserted, session.dirty loaded rows with changed
-    # attributes, and session.deleted rows about to be deleted. Only company-owned ones
-    # matter here.
-    rows = [
-        row
-        for row in (*session.new, *session.dirty, *session.deleted)
-        if _is_company_owned(type(row))
-    ]
-    if not rows:
+    # attributes, and session.deleted rows about to be deleted. Company-owned rows and
+    # rows of the companies table matter here.
+    pending = (*session.new, *session.dirty, *session.deleted)
+    rows = [row for row in pending if _is_company_owned(type(row))]
+    companies = [row for row in pending if _is_company_record(type(row))]
+    if not rows and not companies:
         return
 
     # Saving company data needs a company on the session, exactly as reading does.
     company_id = get_company(session)
-    if company_id is None:
+    if company_id is None and rows:
         raise MissingCompanyError("save of company data without a company set on the session")
+
+    # Companies themselves: with no company on the session (platform code, the seed
+    # script) they may be managed freely. A session working for a company may only change
+    # its own company's row; creating or deleting companies is platform work.
+    if company_id is not None:
+        for company in companies:
+            if company in session.new or company in session.deleted:
+                raise UnsafeQueryError("companies are created and deleted by platform code only")
+            if company.id != company_id:
+                raise WrongCompanyError("a session may only change its own company")
 
     for row in rows:
         # A new row with no company yet belongs to the session's company.

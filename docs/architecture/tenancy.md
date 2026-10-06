@@ -4,7 +4,7 @@
 
 Decision: [0016](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0016-tenant-isolation.md).
 
-> **Status:** layer 1 (the automatic filter) and the first layer 3 tests are built: `app/tenancy/`, `tests/security/test_cross_company.py`. Layer 2 arrives with the first company-owned tables; layer 4 with the first endpoints.
+> **Status:** layers 1 and 2 are built, with their layer 3 tests: the filter in `app/tenancy/`, the company-aware keys on the first tables (`app/modules/org/models.py`, migration `0002`), and `tests/security/test_cross_company.py` and `test_org_company_links.py`. Layer 4 arrives with the first endpoints.
 
 ## Where the company comes from
 
@@ -35,13 +35,14 @@ flowchart LR
 |---|---|---|
 | The current company | `app/tenancy/context.py` | `set_company(session, company_id)` stores the company on the database session (`session.info`); `get_company(session)` reads it. A session works for one company only; switching is refused |
 | Company-owned models | `app/tenancy/filter.py` | `CompanyOwned` adds the required, indexed `company_id` column and turns the filter on for that model: `class Shift(IdAndTimestamps, CompanyOwned, Base)` |
+| The companies table | `app/tenancy/filter.py` | `CompanyRecord` marks `Company`: each row is a company, so a session working for a company sees only its own row (`id = <company>`), may change only that row, and cannot create or delete companies. Sessions with no company (platform code, the seed script) manage companies |
 | The filter | `app/tenancy/filter.py` | On every statement a session runs (`do_orm_execute`), adds the company condition with `with_loader_criteria` and refuses the forms it cannot make safe (below); before every save (`before_flush`), fills in or checks `company_id` on new, changed, and deleted rows |
 | The last guard | `app/tenancy/filter.py` | On every statement any connection runs (`before_execute`), refuses a read or write of a company table that neither passed the query hook nor belongs to a checked save. That catches SQLAlchemy's older bulk methods and `session.connection().execute(...)`. Only migrations mark their connection as trusted (`trust_connection`) |
 | Tests | `tests/security/test_cross_company.py`, `tests/unit/test_tenancy.py` | Company A tries to list, fetch by ID, count, join, update, delete, create for, and move rows into company B, including through bulk statements and the raw table; and every model with a `company_id` column must use `CompanyOwned` |
 
 **Why the company is stored on the session, not in a "current request" variable:** each request already gets its own database session, so the company travels with it and cannot leak into another request. FastAPI runs ordinary functions in worker threads, where a value set for one step is not reliably visible in the next.
 
-**Refused, because the filter cannot make them safe** (`UnsafeQueryError`, or `WrongCompanyError` for the last one):
+**Refused, because the filter cannot make them safe** (`UnsafeQueryError`, or `WrongCompanyError` where a statement would change which company a row or company is):
 
 | Form | Why it is refused | Use instead |
 |---|---|---|
@@ -50,6 +51,7 @@ flowchart LR
 | A bulk insert, `session.execute(insert(Shift)...)` | it skips the save check that fills in and checks `company_id` | `session.add()` or `session.add_all()` |
 | A bulk update or delete given a list of rows by ID | it runs without the company condition | load the rows and change them, or update with a `where` clause |
 | A bulk update that sets `company_id` | the condition only limits which rows change, not what they change to | never change `company_id` |
+| In a session working for a company: a bulk delete of companies, `delete(Company)`, or a bulk update that sets a company's `id` | both skip the save check that keeps companies from being deleted, and a company's `id` is the value the filter uses to tell companies apart | companies are deleted by platform code only; a company's `id` never changes |
 | The older bulk methods (`bulk_insert_mappings`, `bulk_update_mappings`, `bulk_save_objects`) and statements on `session.connection()` | they write to the database without the query hook or the save check (refused by the last guard) | `session.add()`, loaded rows, or a `where` update through the session |
 
 **Raw SQL is not filtered.** `session.execute(text("SELECT ..."))` bypasses the ORM and therefore the filter. Repositories build every query with SQLAlchemy ([layers and modules](layers-and-modules.md#the-database-layer)), never as SQL text.

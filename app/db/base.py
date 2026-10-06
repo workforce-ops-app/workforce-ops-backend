@@ -19,15 +19,25 @@ def utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-_TIMESTAMP = DateTime().with_variant(DATETIME(fsp=6), "mysql")
+# A moment in UTC with microseconds: DATETIME(6) in MySQL (decision 0021). Use it for every
+# moment column, e.g.  archived_at: Mapped[datetime | None] = mapped_column(UTC_DATETIME)
+UTC_DATETIME = DateTime().with_variant(DATETIME(fsp=6), "mysql")
 
 
-class IdAndTimestamps:
+class Timestamps:
+    """created_at and updated_at, for tables whose key is not a single id column.
+
+    Example: team_members, whose key is (team_id, user_id).
+    """
+
+    created_at: Mapped[datetime] = mapped_column(UTC_DATETIME, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(UTC_DATETIME, default=utcnow, onupdate=utcnow)
+
+
+class IdAndTimestamps(Timestamps):
     """Columns every table has: id, created_at, updated_at.
 
     Use it together with Base:  class Shift(IdAndTimestamps, Base): ...
     """
 
     id: Mapped[uuid.UUID] = mapped_column(UUIDBinary, primary_key=True, default=new_id)
-    created_at: Mapped[datetime] = mapped_column(_TIMESTAMP, default=utcnow)
-    updated_at: Mapped[datetime] = mapped_column(_TIMESTAMP, default=utcnow, onupdate=utcnow)
