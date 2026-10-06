@@ -117,7 +117,8 @@ The seed script (`python -m scripts.seed_demo`) creates the same data on every r
 - **Two companies**, for example *Northwind Cafe* (America/Chicago) and *Summit Outfitters* (America/Denver), built alike on purpose: same department names and similar people, so a leak between companies is obvious in tests and demos.
 - In each company: two or three departments, a team or two in each, and people in every starting role. Each company gets the four starting roles; everyone holds Employee for their home department, owners and administrators their role for the whole company, and managers Manager for their home department (built, Z1).
 - **Reporting lines** that exercise the rules: a two-level chain, someone with two managers, an administrator over other administrators, and someone with no manager.
-- Two weeks of shifts, including open shifts, and a few time-off requests in each state.
+- **Two weeks of shifts** (built, SD1): the current week and the next, counted from Monday in each company's time zone, so the demo always shows a live schedule. The same weekly pattern in both companies: 21 shifts a week in Kitchen and Front of House, three of them open, one with a note and one with an event in the first week, nobody booked twice at the same time. Each shift is written to the audit log as `shift.created` by the system. A company that already has shifts gets no more; a company seeded before shifts existed gets them on the next run.
+- A few time-off requests in each state (after the midterm, SD2).
 - Emails use the reserved `example.com` and `example.org` domains. Demo passwords come from an environment variable, never from the repository.
 - The script refuses to run against a production database.
 

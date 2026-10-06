@@ -1,6 +1,6 @@
 # Schedules and shifts
 
-- **Status:** creating, viewing, changing, assigning, and cancelling single shifts is built (`app/modules/schedules/`, migration `0006`, slice SC1); changes to several shifts at once follow in SC2, and the time-off check with the time-off slices
+- **Status:** creating, viewing, changing, assigning, and cancelling single shifts is built (`app/modules/schedules/`, migration `0006`, slice SC1); the demo companies get two weeks of shifts from the seed script (SD1, [demo data](organization.md#demo-data)); changes to several shifts at once follow in SC2, and the time-off check with the time-off slices
 - **Related:** workforce-ops-app/workforce-ops-backend#9; frontend page: schedule screens (workforce-ops-app/workforce-ops-frontend#3); design: [data model](../architecture/data-model.md#shifts), [authorization](../architecture/authorization.md)
 
 ## In short
