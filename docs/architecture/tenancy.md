@@ -42,7 +42,7 @@ flowchart LR
 
 **Why the company is stored on the session, not in a "current request" variable:** each request already gets its own database session, so the company travels with it and cannot leak into another request. FastAPI runs ordinary functions in worker threads, where a value set for one step is not reliably visible in the next.
 
-**Refused, because the filter cannot make them safe** (`UnsafeQueryError`, or `WrongCompanyError` for the last one):
+**Refused, because the filter cannot make them safe** (`UnsafeQueryError`, or `WrongCompanyError` where a statement would change which company a row or company is):
 
 | Form | Why it is refused | Use instead |
 |---|---|---|
@@ -51,6 +51,7 @@ flowchart LR
 | A bulk insert, `session.execute(insert(Shift)...)` | it skips the save check that fills in and checks `company_id` | `session.add()` or `session.add_all()` |
 | A bulk update or delete given a list of rows by ID | it runs without the company condition | load the rows and change them, or update with a `where` clause |
 | A bulk update that sets `company_id` | the condition only limits which rows change, not what they change to | never change `company_id` |
+| In a session working for a company: a bulk delete of companies, `delete(Company)`, or a bulk update that sets a company's `id` | both skip the save check that keeps companies from being deleted, and a company's `id` is the value the filter uses to tell companies apart | companies are deleted by platform code only; a company's `id` never changes |
 | The older bulk methods (`bulk_insert_mappings`, `bulk_update_mappings`, `bulk_save_objects`) and statements on `session.connection()` | they write to the database without the query hook or the save check (refused by the last guard) | `session.add()`, loaded rows, or a `where` update through the session |
 
 **Raw SQL is not filtered.** `session.execute(text("SELECT ..."))` bypasses the ORM and therefore the filter. Repositories build every query with SQLAlchemy ([layers and modules](layers-and-modules.md#the-database-layer)), never as SQL text.

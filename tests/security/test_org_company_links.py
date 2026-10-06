@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from sqlalchemy import Engine, create_engine, event, select
+from sqlalchemy import Engine, create_engine, delete, event, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -225,6 +225,43 @@ def test_a_company_cannot_create_or_delete_companies(org: Org, action: str) -> N
             session.delete(own)
         with pytest.raises(UnsafeQueryError):
             session.commit()
+
+
+def test_a_company_cannot_bulk_delete_companies(org: Org) -> None:
+    # A bulk delete skips the save check above, so the query hook refuses it itself. Without
+    # that, delete(Company) would remove company A's own row (the filter limits it to that
+    # row, but deleting companies is platform work).
+    with org.session_for(org.company_a) as session, pytest.raises(UnsafeQueryError):
+        session.execute(delete(Company))
+    with Session(org.engine) as platform:
+        assert len(platform.scalars(select(Company)).all()) == 2
+
+
+@pytest.mark.parametrize("form", ["values", "parameters"])
+def test_a_company_cannot_change_its_company_id_in_bulk(org: Org, form: str) -> None:
+    # A company's id is the value the filter uses to tell companies apart. Changing it with
+    # a bulk update would re-key the company (and could take over an ID chosen by the
+    # attacker), so it is refused, whether the new value is in .values() or passed separately.
+    new_id = uuid.uuid4()
+    with org.session_for(org.company_a) as session, pytest.raises(WrongCompanyError):
+        if form == "values":
+            session.execute(update(Company).values(id=new_id))
+        else:
+            session.execute(update(Company), {"id": new_id})
+    with Session(org.engine) as platform:
+        assert platform.get(Company, org.company_a) is not None
+        assert platform.get(Company, new_id) is None
+
+
+def test_a_company_can_still_rename_itself_in_bulk(org: Org) -> None:
+    # The refusals above are narrow: a bulk update of other columns of its own row works,
+    # and the filter still keeps it to that one row.
+    with org.session_for(org.company_a) as session:
+        session.execute(update(Company).values(name="Northwind Cafe and Bakery"))
+        session.commit()
+    with Session(org.engine) as platform:
+        assert platform.get(Company, org.company_a).name == "Northwind Cafe and Bakery"  # type: ignore[union-attr]
+        assert platform.get(Company, org.company_b).name == "Summit Outfitters"  # type: ignore[union-attr]
 
 
 def test_the_raw_companies_table_is_refused(org: Org) -> None:
