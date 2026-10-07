@@ -1,6 +1,6 @@
 # Schedules and shifts
 
-- **Status:** creating, viewing, changing, assigning, and cancelling single shifts is built (`app/modules/schedules/`, migration `0006`, slice SC1); the demo companies get two weeks of shifts from the seed script (SD1, [demo data](organization.md#demo-data)); changes to several shifts at once follow in SC2, and the time-off check with the time-off slices
+- **Status:** creating, viewing, changing, assigning, and cancelling single shifts is built (`app/modules/schedules/`, migration `0006`, slice SC1); the demo companies get two weeks of shifts from the seed script, created under the same rules (SD1, [demo data](organization.md#demo-data)); changes to several shifts at once follow in SC2, and the time-off check with the time-off slices
 - **Related:** workforce-ops-app/workforce-ops-backend#9; frontend page: schedule screens (workforce-ops-app/workforce-ops-frontend#3); design: [data model](../architecture/data-model.md#shifts), [authorization](../architecture/authorization.md)
 
 ## In short
@@ -47,7 +47,6 @@ stateDiagram-v2
 - **No double booking:** a person cannot have two shifts that overlap (409). Back-to-back shifts are fine. The person's row is locked while this is checked, so two requests at the same moment cannot both book them.
 - **Time off:** a person cannot be assigned during their approved time off (409). Checked once time-off requests exist.
 - **Past shifts:** once a shift has ended it cannot be changed or cancelled (409); its notes are history. A shift that has already ended cannot be created either (422), so the past cannot be written in after the fact.
-- **Demo data, the one exception:** the seed script's demo weeks start on the current Monday, so it also adds shifts earlier in the week that have already ended; otherwise the demo would open on an empty start of the week. This is allowed only for operator-run demo data, never through the API: the script refuses to run in production, and each shift's audit entry (`shift.created`, actor `system`) is dated when the script ran, so the log never pretends the shift was planned earlier ([demo data](organization.md#demo-data)). Every other rule above holds for demo shifts too, including who can be assigned.
 - **Cancelling** keeps the shift with status `cancelled` ([0020](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md)); it disappears from normal views.
 - **Several shifts at once:** a manager can create the same shift on several chosen days, or cancel or reassign several selected shifts. When the change affects 10 or more shifts, the request must repeat the count it expects (`confirm_count`); a wrong or missing count is refused (409) and nothing is saved.
 - **Text fields** (details, notes, event) are shown as plain text only ([threat model](../security/threat-model.md) T5).

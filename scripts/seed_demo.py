@@ -22,11 +22,12 @@ Argon2id like any other (app/auth/passwords.py). Without it, the accounts have n
 and cannot sign in. The password itself is never written in the repository.
 
 Each person gets the role recorded below (Z1), with the starting roles. Each company then
-gets two weeks of shifts (SD1): the current week and the next, counted from Monday in the
-company's time zone, so the demo always has a schedule to show. The shifts are added once:
-a company that already has shifts is left alone. They wait until every person they go to
-has a password, because the application never assigns a shift to someone who has not set
-up their account. Reporting lines follow after the midterm (Z2).
+gets two weeks of shifts (SD1), from the day the script runs (in the company's time zone)
+for 14 days, so the demo always has a schedule ahead. Like a manager using the
+application, the script never creates a shift that has already ended. The shifts are added
+once: a company that already has shifts is left alone. They wait until every person they
+go to has a password, because the application never assigns a shift to someone who has
+not set up their account. Reporting lines follow after the midterm (Z2).
 """
 
 from __future__ import annotations
@@ -189,8 +190,8 @@ WEEK_PATTERN = (
     ShiftPlan(6, "Front of House", "10:00", "18:00", FRONT_B, "Host"),
 )
 
-# How many weeks of shifts each company gets: the current week and the next.
-DEMO_WEEKS = 2
+# How many days of shifts each company gets, starting on the day the script runs.
+DEMO_DAYS = 14
 
 
 def email_for(person: Person, domain: str) -> str:
@@ -303,14 +304,6 @@ def _seed_inside_company(session: Session, plan: CompanyPlan) -> None:
     session.flush()
 
 
-def week_start(timezone: str, today: date | None = None) -> date:
-    """The Monday of the current week in a time zone (a company's week starts on its own
-    Monday, not on the server's)."""
-    if today is None:
-        today = datetime.now(ZoneInfo(timezone)).date()
-    return today - timedelta(days=today.weekday())
-
-
 def local_to_utc(day: date, clock: str, timezone: str) -> datetime:
     """A local wall-clock time on a day, as the UTC moment the database stores (without a
     zone, like every stored moment). ZoneInfo applies that day's daylight-saving rule."""
@@ -319,23 +312,26 @@ def local_to_utc(day: date, clock: str, timezone: str) -> datetime:
     return local.astimezone(UTC).replace(tzinfo=None)
 
 
-def seed_shifts(engine: Engine, plan: CompanyPlan, monday: date | None = None) -> int | None:
+def seed_shifts(engine: Engine, plan: CompanyPlan, now: datetime | None = None) -> int | None:
     """Give a company two weeks of shifts, unless it already has some. Returns how many
     shifts were added: 0 if it had shifts already, None if they have to wait because
     someone they go to has no password yet.
 
-    The shifts start on the current week's Monday, so on most days some of them have
-    already ended. The API refuses to create an ended shift, so that nobody can write the
-    past in after the fact; demo data is the one documented exception (schedules.md,
-    "Demo data"). It is added by the operator, not by a user, and each audit entry says
-    truthfully that the system added the shift today.
+    The shifts run from today (in the company's time zone) for DEMO_DAYS days, following
+    WEEK_PATTERN by weekday. A shift that has already ended at this moment is skipped (for
+    example the 7:00 to 15:00 shift when the script runs at 16:00): the API refuses to
+    create one, so that nobody can write the past in after the fact, and the demo data
+    keeps that rule too. Seeded a few days before a demo, the start of the demo week then
+    holds shifts that were planned ahead and have since happened, as in real use.
 
-    monday is the first week's Monday; by default the current week's, in the company's
-    time zone. All or nothing, like the company itself: every shift and its audit entry
-    are saved in one transaction. Shifts are added by the system (platform code), not by a
-    person, and each is written to the audit log as "shift.created", the action the API
-    records when a manager creates one.
+    now is the current moment (with a time zone); tests pass a fixed one. All or nothing,
+    like the company itself: every shift and its audit entry are saved in one
+    transaction. Shifts are added by the system (platform code), not by a person, and each
+    is written to the audit log as "shift.created", the action the API records when a
+    manager creates one.
     """
+    if now is None:
+        now = datetime.now(UTC)
     # Find the company, as platform code (no company on the session).
     with Session(engine) as platform:
         company_id = platform.scalars(select(Company.id).where(Company.name == plan.name)).one()
@@ -359,23 +355,33 @@ def seed_shifts(engine: Engine, plan: CompanyPlan, monday: date | None = None) -
             if people[name].password_hash is None or people[name].deactivated_at is not None:
                 return None
 
-        first_monday = monday or week_start(plan.timezone)
+        # Today in the company's time zone, and the moment the stored times compare with.
+        today = now.astimezone(ZoneInfo(plan.timezone)).date()
+        stored_now = now.astimezone(UTC).replace(tzinfo=None)
 
         added = 0
-        for week in range(DEMO_WEEKS):
+        for offset in range(DEMO_DAYS):
+            day = today + timedelta(days=offset)
             for item in WEEK_PATTERN:
-                day = first_monday + timedelta(days=7 * week + item.weekday)
+                if item.weekday != day.weekday():
+                    continue
                 department = departments[item.department]
                 # The workplace zone, worked out the way the API does it: the department's
                 # own, or else the company's.
                 zone = shift_repository.workplace_zone(session, department)
+                starts_at = local_to_utc(day, item.start, zone)
+                ends_at = local_to_utc(day, item.end, zone)
+                # Already over (earlier today): skip it, as the API would refuse it.
+                if ends_at <= stored_now:
+                    continue
                 worker = None if item.worker is None else people[plan.people[item.worker].name]
-                first_week = week == 0
+                # Notes and events only the first time a weekday comes round.
+                first_week = offset < 7
                 shift = Shift(
                     department_id=department.id,
                     employee_id=worker.id if worker else None,
-                    starts_at=local_to_utc(day, item.start, zone),
-                    ends_at=local_to_utc(day, item.end, zone),
+                    starts_at=starts_at,
+                    ends_at=ends_at,
                     timezone=zone,
                     status="scheduled" if worker else "open",
                     details=item.details,
@@ -442,9 +448,12 @@ def set_demo_passwords(engine: Engine, plan: CompanyPlan, password: str) -> int:
         return len(users)
 
 
-def seed(engine: Engine, demo_password: str | None = None) -> list[str]:
+def seed(
+    engine: Engine, demo_password: str | None = None, now: datetime | None = None
+) -> list[str]:
     """Create every demo company that does not exist yet, give accounts without a password
-    the demo password if one is given, then add the shifts; one line per company."""
+    the demo password if one is given, then add the shifts from now on; one line per
+    company. now is the current moment; tests pass a fixed one."""
     # Check the demo password first, so a weak one changes nothing at all.
     if demo_password is not None:
         check_demo_password(demo_password)
@@ -463,7 +472,7 @@ def seed(engine: Engine, demo_password: str | None = None) -> list[str]:
 
         # Shifts last, so a company seeded before shifts existed, or before it had
         # passwords, gets them on the next run.
-        added = seed_shifts(engine, plan)
+        added = seed_shifts(engine, plan, now)
         shifts = "shifts wait for passwords" if added is None else f"{added} shifts added"
         lines.append(f"{plan.name}: {state}; {passwords}; {shifts}")
     return lines
