@@ -52,6 +52,7 @@ SHIFTS_PER_COMPANY = 2 * len(seed_demo.WEEK_PATTERN)
 # Parts of the summary line the script prints for each company.
 ADDED = f"{SHIFTS_PER_COMPANY} shifts added"
 NO_PASSWORD = "no DEMO_PASSWORD, so no one can sign in"
+WAITING = "shifts wait for passwords"
 
 DEMO_PASSWORD = "a calm river bends at dusk"
 
@@ -104,8 +105,8 @@ def test_it_creates_two_alike_companies(engine: Engine) -> None:
     lines = seed_demo.seed(engine)
 
     assert lines == [
-        f"Northwind Cafe: created; {ADDED}; {NO_PASSWORD}",
-        f"Summit Outfitters: created; {ADDED}; {NO_PASSWORD}",
+        f"Northwind Cafe: created; {NO_PASSWORD}; {WAITING}",
+        f"Summit Outfitters: created; {NO_PASSWORD}; {WAITING}",
     ]
     ids = company_ids(engine)
     assert set(ids) == {"Northwind Cafe", "Summit Outfitters"}
@@ -127,12 +128,12 @@ def test_it_creates_two_alike_companies(engine: Engine) -> None:
 
 
 def test_running_it_twice_changes_nothing(engine: Engine) -> None:
-    seed_demo.seed(engine)
-    lines = seed_demo.seed(engine)
+    seed_demo.seed(engine, DEMO_PASSWORD)
+    lines = seed_demo.seed(engine, DEMO_PASSWORD)
 
     assert lines == [
-        "Northwind Cafe: already there; 0 shifts added; no DEMO_PASSWORD, so no one can sign in",
-        "Summit Outfitters: already there; 0 shifts added; no DEMO_PASSWORD, so no one can sign in",
+        "Northwind Cafe: already there; demo password set for 0 accounts; 0 shifts added",
+        "Summit Outfitters: already there; demo password set for 0 accounts; 0 shifts added",
     ]
     assert len(company_ids(engine)) == 2
     for company_id in company_ids(engine).values():
@@ -202,8 +203,8 @@ def test_a_demo_password_is_hashed_for_every_account(engine: Engine) -> None:
     lines = seed_demo.seed(engine, DEMO_PASSWORD)
 
     assert lines == [
-        f"Northwind Cafe: created; {ADDED}; demo password set for 8 accounts",
-        f"Summit Outfitters: created; {ADDED}; demo password set for 8 accounts",
+        f"Northwind Cafe: created; demo password set for 8 accounts; {ADDED}",
+        f"Summit Outfitters: created; demo password set for 8 accounts; {ADDED}",
     ]
     users = all_users(engine)
     # Stored as hashes that verify, each with its own salt, never as the password itself.
@@ -218,12 +219,11 @@ def test_a_rerun_only_fills_in_missing_passwords(engine: Engine) -> None:
     lines = seed_demo.seed(engine, DEMO_PASSWORD)
     hashes = {u.id: u.password_hash for u in all_users(engine)}
 
-    assert (
-        lines[0]
-        == "Northwind Cafe: already there; 0 shifts added; demo password set for 8 accounts"
+    assert lines[0] == f"Northwind Cafe: already there; demo password set for 8 accounts; {ADDED}"
+    # A third run changes nothing: everyone already has a password, and the shifts exist.
+    assert seed_demo.seed(engine, DEMO_PASSWORD)[0] == (
+        "Northwind Cafe: already there; demo password set for 0 accounts; 0 shifts added"
     )
-    # A third run changes nothing: everyone already has a password.
-    assert seed_demo.seed(engine, DEMO_PASSWORD)[0].endswith("demo password set for 0 accounts")
     assert {u.id: u.password_hash for u in all_users(engine)} == hashes
 
 
@@ -310,7 +310,7 @@ def shifts_of(engine: Engine, company_id: uuid.UUID) -> list[Shift]:
 
 
 def test_each_company_gets_two_alike_weeks_of_shifts(engine: Engine) -> None:
-    seed_demo.seed(engine)
+    seed_demo.seed(engine, DEMO_PASSWORD)
 
     summaries = []
     for _name, company_id in sorted(company_ids(engine).items()):
@@ -337,11 +337,11 @@ def test_each_company_gets_two_alike_weeks_of_shifts(engine: Engine) -> None:
 
 
 def test_shifts_start_at_local_times_in_each_company_zone(engine: Engine) -> None:
-    seed_demo.seed_company(engine, seed_demo.DEMO_COMPANIES[0])
-    seed_demo.seed_company(engine, seed_demo.DEMO_COMPANIES[1])
     # A fixed Monday in October (daylight-saving time in both zones).
     monday = date(2026, 10, 5)
     for plan in seed_demo.DEMO_COMPANIES:
+        seed_demo.seed_company(engine, plan)
+        seed_demo.set_demo_passwords(engine, plan, DEMO_PASSWORD)
         seed_demo.seed_shifts(engine, plan, monday)
     ids = company_ids(engine)
 
@@ -371,13 +371,14 @@ def test_week_start_is_the_monday_of_the_week() -> None:
 
 
 def test_demo_shifts_follow_the_rules_the_api_enforces(engine: Engine) -> None:
-    seed_demo.seed(engine)
+    seed_demo.seed(engine, DEMO_PASSWORD)
 
     for company_id in company_ids(engine).values():
         shifts = shifts_of(engine, company_id)
         with Session(engine) as session:
             set_company(session, company_id)
-            homes = {u.id: u.department_id for u in session.scalars(select(User))}
+            users = {u.id: u for u in session.scalars(select(User))}
+            homes = {u.id: u.department_id for u in users.values()}
             team_departments: dict[uuid.UUID, set[uuid.UUID]] = {}
             for member, department_id in session.execute(
                 select(TeamMember.user_id, Team.department_id).join(
@@ -391,8 +392,12 @@ def test_demo_shifts_follow_the_rules_the_api_enforces(engine: Engine) -> None:
             assert timedelta(0) < shift.ends_at - shift.starts_at <= timedelta(hours=12)
             # Open shifts have nobody; scheduled ones have someone.
             assert (shift.status == "open") == (shift.employee_id is None)
-            # Only someone whose home department it is, or who is on a team in it.
+            # Only someone whose home department it is, or who is on a team in it, who has
+            # set up their account and is not deactivated.
             if shift.employee_id is not None:
+                worker = users[shift.employee_id]
+                assert worker.password_hash is not None
+                assert worker.deactivated_at is None
                 allowed = {homes[shift.employee_id], *team_departments.get(shift.employee_id, ())}
                 assert shift.department_id in allowed
 
@@ -407,7 +412,7 @@ def test_demo_shifts_follow_the_rules_the_api_enforces(engine: Engine) -> None:
 
 
 def test_notes_and_events_appear_in_the_first_week_only(engine: Engine) -> None:
-    seed_demo.seed(engine)
+    seed_demo.seed(engine, DEMO_PASSWORD)
     shifts = shifts_of(engine, company_ids(engine)["Northwind Cafe"])
     first_week_end = min(s.starts_at for s in shifts) + timedelta(days=7)
 
@@ -417,7 +422,7 @@ def test_notes_and_events_appear_in_the_first_week_only(engine: Engine) -> None:
 
 
 def test_every_demo_shift_is_in_the_audit_log(engine: Engine) -> None:
-    seed_demo.seed(engine)
+    seed_demo.seed(engine, DEMO_PASSWORD)
 
     for company_id in company_ids(engine).values():
         with Session(engine) as session:
@@ -439,8 +444,34 @@ def test_a_company_seeded_before_shifts_gets_them_on_the_next_run(engine: Engine
     for plan in seed_demo.DEMO_COMPANIES:
         seed_demo.seed_company(engine, plan)
 
-    lines = seed_demo.seed(engine)
+    lines = seed_demo.seed(engine, DEMO_PASSWORD)
 
-    assert lines[0].startswith(f"Northwind Cafe: already there; {SHIFTS_PER_COMPANY} shifts added")
+    assert lines[0] == f"Northwind Cafe: already there; demo password set for 8 accounts; {ADDED}"
     for company_id in company_ids(engine).values():
         assert count(engine, company_id, Shift) == SHIFTS_PER_COMPANY
+
+
+def test_shifts_wait_until_everyone_on_them_has_a_password(engine: Engine) -> None:
+    # The API never gives a shift to someone who has not set up their account (an invited
+    # person, without a password), so the seed does not either.
+    seed_demo.seed(engine)
+    for company_id in company_ids(engine).values():
+        assert count(engine, company_id, Shift) == 0
+
+    # Once DEMO_PASSWORD is set, the next run adds them.
+    lines = seed_demo.seed(engine, DEMO_PASSWORD)
+    assert all(line.endswith(ADDED) for line in lines)
+
+
+def test_a_deactivated_worker_holds_back_the_shifts(engine: Engine) -> None:
+    plan = seed_demo.DEMO_COMPANIES[0]
+    seed_demo.seed_company(engine, plan)
+    seed_demo.set_demo_passwords(engine, plan, DEMO_PASSWORD)
+    with Session(engine) as session:
+        set_company(session, company_ids(engine)[plan.name])
+        worker = plan.people[seed_demo.KITCHEN_A].name
+        user = session.scalars(select(User).where(User.display_name == worker)).one()
+        user.deactivated_at = datetime(2026, 1, 1)
+        session.commit()
+
+    assert seed_demo.seed_shifts(engine, plan) is None

@@ -24,8 +24,9 @@ and cannot sign in. The password itself is never written in the repository.
 Each person gets the role recorded below (Z1), with the starting roles. Each company then
 gets two weeks of shifts (SD1): the current week and the next, counted from Monday in the
 company's time zone, so the demo always has a schedule to show. The shifts are added once:
-a company that already has shifts is left alone. Reporting lines follow after the midterm
-(Z2).
+a company that already has shifts is left alone. They wait until every person they go to
+has a password, because the application never assigns a shift to someone who has not set
+up their account. Reporting lines follow after the midterm (Z2).
 """
 
 from __future__ import annotations
@@ -318,9 +319,16 @@ def local_to_utc(day: date, clock: str, timezone: str) -> datetime:
     return local.astimezone(UTC).replace(tzinfo=None)
 
 
-def seed_shifts(engine: Engine, plan: CompanyPlan, monday: date | None = None) -> int:
+def seed_shifts(engine: Engine, plan: CompanyPlan, monday: date | None = None) -> int | None:
     """Give a company two weeks of shifts, unless it already has some. Returns how many
-    shifts were added (0 if it had shifts already).
+    shifts were added: 0 if it had shifts already, None if they have to wait because
+    someone they go to has no password yet.
+
+    The shifts start on the current week's Monday, so on most days some of them have
+    already ended. The API refuses to create an ended shift, so that nobody can write the
+    past in after the fact; demo data is the one documented exception (schedules.md,
+    "Demo data"). It is added by the operator, not by a user, and each audit entry says
+    truthfully that the system added the shift today.
 
     monday is the first week's Monday; by default the current week's, in the company's
     time zone. All or nothing, like the company itself: every shift and its audit entry
@@ -343,6 +351,14 @@ def seed_shifts(engine: Engine, plan: CompanyPlan, monday: date | None = None) -
 
         departments = {d.name: d for d in session.scalars(select(Department))}
         people = {u.display_name: u for u in session.scalars(select(User))}
+
+        # The same rule as the API: only someone who has set up their account (has a
+        # password) and is not deactivated can be given a shift. Until then, add none.
+        workers = {plan.people[i.worker].name for i in WEEK_PATTERN if i.worker is not None}
+        for name in workers:
+            if people[name].password_hash is None or people[name].deactivated_at is not None:
+                return None
+
         first_monday = monday or week_start(plan.timezone)
 
         added = 0
@@ -427,8 +443,8 @@ def set_demo_passwords(engine: Engine, plan: CompanyPlan, password: str) -> int:
 
 
 def seed(engine: Engine, demo_password: str | None = None) -> list[str]:
-    """Create every demo company that does not exist yet, and give accounts without a
-    password the demo password if one is given; one line per company."""
+    """Create every demo company that does not exist yet, give accounts without a password
+    the demo password if one is given, then add the shifts; one line per company."""
     # Check the demo password first, so a weak one changes nothing at all.
     if demo_password is not None:
         check_demo_password(demo_password)
@@ -437,14 +453,19 @@ def seed(engine: Engine, demo_password: str | None = None) -> list[str]:
     for plan in DEMO_COMPANIES:
         created = seed_company(engine, plan)
         state = "created" if created else "already there"
-        # Shifts come after the company, so a company seeded before shifts existed gets
-        # them on the next run.
-        state += f"; {seed_shifts(engine, plan)} shifts added"
+
+        # Passwords before shifts: shifts only go to people who have one.
         if demo_password is None:
-            lines.append(f"{plan.name}: {state}; no DEMO_PASSWORD, so no one can sign in")
-            continue
-        given = set_demo_passwords(engine, plan, demo_password)
-        lines.append(f"{plan.name}: {state}; demo password set for {given} accounts")
+            passwords = "no DEMO_PASSWORD, so no one can sign in"
+        else:
+            given = set_demo_passwords(engine, plan, demo_password)
+            passwords = f"demo password set for {given} accounts"
+
+        # Shifts last, so a company seeded before shifts existed, or before it had
+        # passwords, gets them on the next run.
+        added = seed_shifts(engine, plan)
+        shifts = "shifts wait for passwords" if added is None else f"{added} shifts added"
+        lines.append(f"{plan.name}: {state}; {passwords}; {shifts}")
     return lines
 
 
