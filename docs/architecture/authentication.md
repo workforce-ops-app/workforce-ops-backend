@@ -4,7 +4,7 @@
 
 Decisions: [0027 authentication and sessions](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md) · [0025 sensitive actions and security settings](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md) · [0003 one address for pages and API](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0003-same-origin-deployment.md) · Threats: S1 to S5, I3, D1 in the [threat model](../security/threat-model.md)
 
-> **Status:** design. Code references will be added when the `auth` layer is built (Phase 2).
+> **Status:** passwords are built (`app/auth/passwords.py`); sessions, CSRF, lockouts, links, and re-entry follow in the next Phase 2 slices.
 
 ## Passwords
 
@@ -16,6 +16,10 @@ Decisions: [0027 authentication and sessions](https://github.com/workforce-ops-a
 | No composition or rotation rules | no "must contain a digit", no forced changes | these make passwords weaker and more predictable; change only when compromised |
 | Blocklist | rejected if it is one of the 100,000 most common passwords (from a public list, compared ignoring case), or contains the company's name or the person's email name or display name | stops the guesses attackers try first |
 | Stored as | **Argon2id**, tuned to about 0.5 s on the server (starting point: 64 MiB memory, 3 passes); the settings are saved inside each hash | slow and memory-hard, so a stolen database is expensive to crack |
+
+The blocklist is `app/auth/common-passwords.txt`: the UK National Cyber Security Centre's 100,000 most-used passwords (as published in SecLists, MIT License), keeping only the 327 entries of 15 characters or more, since shorter ones are already refused by length and the minimum can only be raised. A password also may not contain the company's name, the email name, the display name, or any word of 4 letters or more from them, compared ignoring case, spaces, and punctuation.
+
+The starting settings take about 0.1 s per hash on a developer laptop; they are raised towards 0.5 s once there is a server to measure on, and existing passwords are re-hashed at their next sign-in (`needs_rehash`).
 
 Companies may raise the minimum length (up to 64), never lower it ([0025](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md)). When the hashing settings are raised later, each password is re-hashed with the new settings the next time its owner signs in.
 

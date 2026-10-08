@@ -16,10 +16,13 @@ kinds of people), so a leak from one company into the other is obvious in tests 
   (platform code), then everything inside a company from a session for that company, so
   the company filter fills in and checks company_id as it does for the app.
 
-Later slices extend it: S1 gives the accounts a demo password from an environment
-variable (until then they have none and cannot sign in), Z1 gives each person the role
-recorded below, and SD1 adds two weeks of shifts. Reporting lines follow after the
-midterm (Z2).
+Demo passwords: with DEMO_PASSWORD set (in .env or the environment), every demo account
+without a password gets that one, checked against the password rules and hashed with
+Argon2id like any other (app/auth/passwords.py). Without it, the accounts have no password
+and cannot sign in. The password itself is never written in the repository.
+
+Later slices extend it: Z1 gives each person the role recorded below, and SD1 adds two
+weeks of shifts. Reporting lines follow after the midterm (Z2).
 """
 
 from __future__ import annotations
@@ -30,7 +33,9 @@ from dataclasses import dataclass
 from sqlalchemy import Engine, create_engine, select
 from sqlalchemy.orm import Session
 
+from app.auth.passwords import PasswordRejected, check_password, hash_password
 from app.core.config import get_settings
+from app.db.base import utcnow
 from app.modules.org.models import Company, Department, Team, TeamMember, User
 from app.tenancy.context import set_company
 
@@ -151,7 +156,8 @@ def _seed_inside_company(session: Session, plan: CompanyPlan) -> None:
     }
     session.add_all(teams.values())
 
-    # The people, each with a home department (no password yet: see S1).
+    # The people, each with a home department (passwords come afterwards, from
+    # set_demo_passwords).
     users = {
         person.name: User(
             email=email_for(person, plan.email_domain),
@@ -174,13 +180,58 @@ def _seed_inside_company(session: Session, plan: CompanyPlan) -> None:
     session.flush()
 
 
-def seed(engine: Engine) -> list[str]:
-    """Create every demo company that does not exist yet; one line per company."""
+def check_demo_password(password: str) -> None:
+    """Refuse a demo password that breaks the password rules for any demo person (too
+    short, too common, or containing their name or their company's name), before anything
+    is changed."""
+    for plan in DEMO_COMPANIES:
+        for person in plan.people:
+            check_password(
+                password,
+                company_name=plan.name,
+                email=email_for(person, plan.email_domain),
+                display_name=person.name,
+            )
+
+
+def set_demo_passwords(engine: Engine, plan: CompanyPlan, password: str) -> int:
+    """Give the company's accounts that have no password yet the demo password, hashed.
+
+    Accounts that already have a password are left alone, so running the script again
+    changes nothing. Returns how many accounts got the password.
+    """
+    # Find the company, as platform code (no company on the session).
+    with Session(engine) as platform:
+        company_id = platform.scalars(select(Company.id).where(Company.name == plan.name)).one()
+
+    # Then its people, in a session working for that company.
+    with Session(engine) as session:
+        set_company(session, company_id)
+        users = session.scalars(select(User).where(User.password_hash.is_(None))).all()
+        for user in users:
+            # A separate hash per account: each gets its own random salt.
+            user.password_hash = hash_password(password)
+            user.password_changed_at = utcnow()
+        session.commit()
+        return len(users)
+
+
+def seed(engine: Engine, demo_password: str | None = None) -> list[str]:
+    """Create every demo company that does not exist yet, and give accounts without a
+    password the demo password if one is given; one line per company."""
+    # Check the demo password first, so a weak one changes nothing at all.
+    if demo_password is not None:
+        check_demo_password(demo_password)
+
     lines = []
     for plan in DEMO_COMPANIES:
         created = seed_company(engine, plan)
-        state = "created" if created else "already there, left unchanged"
-        lines.append(f"{plan.name}: {state}")
+        state = "created" if created else "already there"
+        if demo_password is None:
+            lines.append(f"{plan.name}: {state}; no DEMO_PASSWORD, so no one can sign in")
+            continue
+        given = set_demo_passwords(engine, plan, demo_password)
+        lines.append(f"{plan.name}: {state}; demo password set for {given} accounts")
     return lines
 
 
@@ -193,9 +244,18 @@ def main() -> int:
         print("refusing to seed demo data: APP_ENV is production")
         return 1
 
+    # The demo password, if one is set; a password that breaks the rules stops here.
+    demo_password = settings.demo_password.get_secret_value() if settings.demo_password else None
+    if demo_password is not None:
+        try:
+            check_demo_password(demo_password)
+        except PasswordRejected as rejected:
+            print(f"refusing DEMO_PASSWORD: {rejected}")
+            return 1
+
     engine = create_engine(settings.sqlalchemy_url)
     try:
-        for line in seed(engine):
+        for line in seed(engine, demo_password):
             print(line)
     finally:
         engine.dispose()
