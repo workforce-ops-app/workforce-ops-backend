@@ -21,6 +21,8 @@ dependencies = [
     # PyMySQL needs this for MySQL 8's default sign-in method (caching_sha2_password).
     "cryptography==50.0.2",
     "uuid6==2025.0.1",
+    # Argon2id password hashing (decision 0027).
+    "argon2-cffi==25.1.0",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +37,10 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["app*"]
+
+# Data files that ship with the package (the image installs it with pip).
+[tool.setuptools.package-data]
+"app.auth" = ["common-passwords.txt"]
 
 [tool.ruff]
 target-version = "py313"
