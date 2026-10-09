@@ -87,7 +87,9 @@ The audit tables are not `CompanyOwned` (the platform chain has no company), so 
 - **On demand:** owners (through a dedicated audit permission) can run verification for their company.
 - **Outside copy:** each night the latest head signature per chain is written to the application log, so a database rollback to an older state can also be detected.
 
-A verification failure names the first bad `seq` and raises a security event.
+- **The end of the chain:** after checking every entry, verification compares the last entry it found with the chain head: its `seq` must equal `last_seq` and its signature must equal `last_signature`. Each entry only vouches for the one before it, so deleting the newest entries leaves a chain that still checks out entry by entry; only the head shows that it used to be longer.
+
+A verification failure names the first bad `seq` (or, when the end is missing, the `seq` the head expected) and raises a security event.
 
 ## Protection in the database
 
