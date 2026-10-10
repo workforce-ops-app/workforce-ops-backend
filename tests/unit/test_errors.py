@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from app.core import errors
 from app.core.config import AppEnvironment, Settings
+from tests.conftest import TEST_CSRF_KEY
 
 Handler = Callable[[Request, Exception], Awaitable[JSONResponse]]
 
@@ -128,7 +129,11 @@ def test_unexpected_error_log_has_the_error_id_but_not_the_message(
 
 
 def settings_for(app_env: AppEnvironment) -> Settings:
-    return Settings(app_env=app_env, database_url="mysql+pymysql://test:test@localhost:3307/test")
+    return Settings(
+        app_env=app_env,
+        database_url="mysql+pymysql://test:test@localhost:3307/test",
+        csrf_key=TEST_CSRF_KEY,  # type: ignore[arg-type]
+    )
 
 
 # Overriding the settings fixture builds the app before the test starts capturing logs.

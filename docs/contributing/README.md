@@ -18,6 +18,7 @@ pre-commit install
 - **`-e` (editable)** means code changes take effect without reinstalling.
 - **Dependencies** are pinned to exact versions in `pyproject.toml`; Dependabot proposes updates. After pulling a change to `pyproject.toml`, run the install line again.
 - **Settings** come from environment variables; `.env` holds them for local use and is never committed. Every setting is listed in `.env.example`.
+- **The CSRF key:** set your own `CSRF_KEY` in `.env` (at least 32 characters, different from the audit key); the API does not start without it. Requests that change something must send an `Origin` header (browsers do this themselves; with `curl`, add `-H "Origin: http://localhost:8000"`) and, when signed in, the `X-CSRF-Token` from the sign-in answer.
 - **The audit signing key:** set your own `AUDIT_SIGNING_KEY` in `.env` (at least 32 characters; `.env.example` shows how to generate one). Without it, any action that writes an audit entry fails ([audit log](../architecture/audit-log.md#the-signing-key)).
 
 
@@ -82,7 +83,7 @@ SQLAlchemy sends `note_id` and `title` as bound parameters (`WHERE notes.id = %(
 
 ## Running with Docker
 
-`docker-compose.yml` runs the API and MySQL 8.4 together ([0034](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0034-database-driver-ids-and-local-layout.md)). Needs Docker Desktop running, and `MYSQL_ROOT_PASSWORD` and `MYSQL_APP_PASSWORD` set in `.env` (Compose refuses to start without them, so there is never a blank database password).
+`docker-compose.yml` runs the API and MySQL 8.4 together ([0034](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0034-database-driver-ids-and-local-layout.md)). Needs Docker Desktop running, and `MYSQL_ROOT_PASSWORD`, `MYSQL_APP_PASSWORD`, `AUDIT_SIGNING_KEY`, and `CSRF_KEY` set in `.env` (Compose refuses to start without them, so there is never a blank database password, an unsigned audit log, or unprotected changes).
 
 | Task | Command |
 |---|---|

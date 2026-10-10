@@ -40,6 +40,15 @@ class Settings(BaseSettings):
     # without a key is refused (app/audit/record.py), and the action fails with it.
     audit_signing_key: SecretStr | None = Field(default=None, min_length=32)
     audit_key_id: str = Field(default="local-1", min_length=1, max_length=40)
+    # The secret key that turns a session into its CSRF token (app/auth/csrf.py). Separate
+    # from the audit key, so leaking one does not weaken the other. The API refuses to
+    # start without it (app/main.py): every change to data depends on it.
+    csrf_key: SecretStr | None = Field(default=None, min_length=32)
+    # The application's own address as browsers see it, e.g. https://workforce.example or
+    # http://localhost:8080 (decision 0003: pages and API at one address). Requests that
+    # change something must come from it (the Origin check). Unset: the address the
+    # request itself was sent to, which is right when nothing in front rewrites it.
+    app_origin: str | None = None
 
     @property
     def sqlalchemy_url(self) -> URL:
