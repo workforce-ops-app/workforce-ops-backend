@@ -1,6 +1,6 @@
 # Company structure, people, and access
 
-- **Status:** tables built (`app/modules/org/models.py`, migration `0002`); demo companies, structure, and people seeded by `scripts/seed_demo.py`; endpoints planned (core tier)
+- **Status:** tables built (`app/modules/org/models.py`, migration `0002`); demo companies, structure, people, and their roles seeded by `scripts/seed_demo.py`; this module's permissions declared (`app/modules/org/permissions.py`); endpoints planned (core tier)
 - **Related:** workforce-ops-app/workforce-ops-backend#8; frontend page: administration screens (workforce-ops-app/workforce-ops-frontend#3); design: [data model](../architecture/data-model.md), [authorization](../architecture/authorization.md), [authentication](../architecture/authentication.md)
 
 ## In short
@@ -115,7 +115,7 @@ Setup links, reset links, unlocking, and signing someone out are on the [authent
 The seed script (`python -m scripts.seed_demo`) creates the same data on every run, for local use, CI, and the demos ([0031](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0031-demo-environment-and-data.md)):
 
 - **Two companies**, for example *Northwind Cafe* (America/Chicago) and *Summit Outfitters* (America/Denver), built alike on purpose: same department names and similar people, so a leak between companies is obvious in tests and demos.
-- In each company: two or three departments, a team or two in each, and people in every starting role.
+- In each company: two or three departments, a team or two in each, and people in every starting role. Each company gets the four starting roles; everyone holds Employee for their home department, owners and administrators their role for the whole company, and managers Manager for their home department (built, Z1).
 - **Reporting lines** that exercise the rules: a two-level chain, someone with two managers, an administrator over other administrators, and someone with no manager.
 - Two weeks of shifts, including open shifts, and a few time-off requests in each state.
 - Emails use the reserved `example.com` and `example.org` domains. Demo passwords come from an environment variable, never from the repository.

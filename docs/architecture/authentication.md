@@ -4,7 +4,7 @@
 
 Decisions: [0027 authentication and sessions](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md) · [0025 sensitive actions and security settings](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md) · [0003 one address for pages and API](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0003-same-origin-deployment.md) · Threats: S1 to S5, I3, D1 in the [threat model](../security/threat-model.md)
 
-> **Status:** passwords are built (`app/auth/passwords.py`); sessions, CSRF, lockouts, links, and re-entry follow in the next Phase 2 slices.
+> **Status:** passwords (`app/auth/passwords.py`), sign-in with sessions (`app/auth/sessions.py`, the `sessions` endpoints, migration `0004`), and CSRF protection (`app/auth/csrf.py`) are built; lockouts, links, and re-entry follow in the next Phase 2 slices. Until lockouts (S4) exist, an account with `locked_until` in the future is refused, but failures are not counted yet.
 
 ## Passwords
 
@@ -53,6 +53,10 @@ sequenceDiagram
 - **One message for every failure.** An unknown email, a wrong password, a locked, deactivated, or not-yet-set-up account all get the same answer in the same time: "Email or password is incorrect. After several failed attempts, sign-in is paused for a while." Otherwise the sign-in form would tell an attacker which emails have accounts (threat I3). A locked account is refused even with the correct password until the lock ends.
 - Emails are unique across the platform, so an email and a password identify exactly one account and one company ([data model](data-model.md#users)).
 - The session's company is the user's company; it is never taken from the request ([tenancy](tenancy.md)).
+- **Finding the account before the company is known.** Every company table is filtered by the session's company, but at sign-in there is none yet. Two lookups, and only these, are allowed to look across companies with `cross_company_read()`: the account by email at sign-in, and the session by its token's hash on each request. Each reads only the ID and company; everything after that runs for the company found. A security test fails if any other file uses it ([tenancy](tenancy.md)).
+- **No planted sessions (session fixation).** Sign-in always creates a new random token; a token the browser already carried is never turned into a signed-in session. If that earlier token still belonged to a working session, the session is ended, so a copy of the old token stops working.
+- **The same time for every failure.** Each failure does exactly one Argon2id check (against a dummy hash when there is no real one), and a failed sign-in also waits until at least 0.5 s have passed (`FAILED_SIGN_IN_SECONDS`, kept above the Argon2id time). That hides the few milliseconds a failure for an existing account spends writing its audit entry.
+- Failed sign-ins for unknown emails are logged without the email, which might be a password typed into the wrong field.
 
 ## Sessions
 
@@ -64,6 +68,7 @@ sequenceDiagram
 | **Maximum length** | 30 days after sign-in, however active (`expires_at`) |
 | **New session ID** | at sign-in, when the password changes, and after using a reset link; the old session row is deleted |
 | **Signing out** | deletes the session row and clears the cookie; "sign out everywhere" deletes all of the user's sessions |
+| **Ended sessions** | deleted when their token is next presented, and at each sign-in of the same person; a regular cleanup of sessions nobody returns to follows with the first scheduled job |
 
 What each cookie attribute does:
 - `__Host-` prefix: the browser only accepts the cookie over HTTPS, for this exact host, with `Path=/`, so a subdomain cannot plant or overwrite it.
@@ -91,6 +96,16 @@ Three defenses, so one mistake is not enough:
 3. **CSRF token:** every request that changes something must send the header `X-CSRF-Token`. The token is `HMAC-SHA256(csrf_key, session token hash)`: it changes with every session, needs no database column, and cannot be computed without the server's `csrf_key` (a secret in the environment, separate from the audit key). The API returns it at sign-in and from `GET /api/sessions/current`; `js/api/client.js` adds it to every request.
 
 `GET` requests never change anything, so they need no token.
+
+**How it is built** (`app/auth/csrf.py`): a middleware checks every `POST`, `PUT`, `PATCH`, and `DELETE` before any endpoint runs, so no endpoint can forget it.
+- **The application's own address** is the `APP_ORIGIN` setting (for example `http://localhost:8080` under Docker Compose, where the frontend's nginx serves pages and API). Unset, it is the address the request was sent to, which is right when the API runs directly (`uvicorn`). The comparison ignores case and a trailing slash; a missing `Origin`, or `null`, is refused.
+- **The token** is required whenever the browser sends a session cookie, with one exception: **sign-in** (`POST /api/sessions`) is checked for `Origin` only. It starts a session rather than acting in one, and a browser may still carry the cookie of a session that already ended; demanding that dead session's token would lock the person out. A forged sign-in (signing the victim into the attacker's account) is still refused by the `Origin` check.
+- The token is returned as `csrf_token` by `POST /api/sessions` and `GET /api/sessions/current`, and compared in constant time (`hmac.compare_digest`).
+- **Every refusal** is a 403 with the same message, whichever check failed, so an attacker learns nothing about which part was wrong.
+- The API does not start without `CSRF_KEY` (at least 32 characters), or when it is the same as `AUDIT_SIGNING_KEY`: one leaked secret must not weaken the other protection.
+- Another site cannot read the API's answers (the API sends no CORS headers that would allow it), so it can never learn the token from `GET /api/sessions/current`.
+
+**Why `SameSite=Strict` alone is not enough:** browsers decide "same site" by the registered domain, so a page on any subdomain (or a sibling application on the same domain) counts as the same site and its requests carry the cookie; older or unusual browsers may not enforce `SameSite` at all; and sign-in has no cookie to protect yet. The `Origin` check and the token do not depend on any of that.
 
 ## Lockouts and rate limits
 
@@ -147,7 +162,7 @@ This limits the damage from a session left open on a shared computer or stolen b
 | Method and path | Who | Does |
 |---|---|---|
 | `POST /api/sessions` | anyone | sign in |
-| `GET /api/sessions/current` | signed in | current user, their effective permissions, CSRF token |
+| `GET /api/sessions/current` | signed in | current user (with their home `department_id`), their company, their effective permissions (every permission they hold somewhere, read fresh on each request; for the menu only), CSRF token (`csrf_token`) |
 | `DELETE /api/sessions/current` | signed in | sign out |
 | `DELETE /api/sessions` | signed in | sign out everywhere (own sessions) |
 | `POST /api/sessions/current/reauth` | signed in | re-enter the password |
@@ -162,7 +177,7 @@ This limits the damage from a session left open on a shared computer or stolen b
 | Action | When |
 |---|---|
 | `auth.signed_in` | successful sign-in |
-| `auth.sign_in_failed` | wrong password for an existing account |
+| `auth.sign_in_failed` | a failed sign-in for an existing account; `details.reason` is `wrong_password`, `no_password`, `deactivated`, or `locked`. The actor is `system` (nobody is signed in) and the target is the account tried |
 | `auth.locked`, `auth.unlocked` | an account is locked by the schedule, or unlocked by an administrator |
 | `auth.password_changed` | a user changes their own password |
 | `auth.link_created`, `auth.link_used` | a setup or reset link is created or used |
@@ -191,8 +206,10 @@ Entries never contain passwords, tokens, or hashes. Failed sign-ins for emails t
 | Part | Location |
 |---|---|
 | Password rules, hashing, blocklist | `app/auth/passwords.py` |
-| Sessions, cookie, idle and maximum limits, re-entry | `app/auth/sessions.py` |
+| Sessions, cookie, idle and maximum limits, re-entry | `app/auth/sessions.py` (rules), `app/auth/models.py` (`UserSession`, the `sessions` table) |
+| Requiring a signed-in person in an endpoint | `app/auth/dependencies.py`: a parameter typed `SignedInPerson` loads the session (401 without one) and sets its company on the request's database session; `Database` is the request's database session |
+| The session endpoints | `app/modules/sessions/` (router and response shapes) |
 | CSRF and Origin checks | `app/auth/csrf.py` |
 | Lockouts and rate limits | `app/auth/limits.py` |
 | Setup and reset links | `app/auth/links.py` |
-| Tests | `tests/unit/auth/`, `tests/security/` |
+| Tests | `tests/unit/test_sessions_api.py`, `tests/security/test_sign_in.py` (AU3, AU4, AU5, and companies), `tests/security/test_csrf.py` (AU6), `tests/unit/test_passwords.py`, `tests/security/test_password_rules.py` (AU1) |

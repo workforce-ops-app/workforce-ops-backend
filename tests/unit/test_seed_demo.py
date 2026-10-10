@@ -12,15 +12,35 @@ from argon2 import PasswordHasher
 from sqlalchemy import Engine, create_engine, func, select
 from sqlalchemy.orm import Session
 
+from app.audit.models import AuditChainHead, AuditEvent
 from app.auth import passwords
 from app.auth.passwords import PasswordRejected, verify_password
+from app.authz.models import Permission, Role, RoleAssignment, RolePermission
 from app.core.config import get_settings
 from app.db.base import Base
 from app.modules.org.models import Company, Department, Team, TeamMember, User
 from app.tenancy.context import set_company
 from scripts import seed_demo
+from tests.audit_data import TEST_KEY, use_key
 
-ORG_TABLES = [model.__table__ for model in (Company, Department, Team, User, TeamMember)]
+# The tables the seed fills: the company's structure and people, its roles, and the audit
+# log their creation is written to.
+ORG_TABLES = [
+    model.__table__
+    for model in (
+        Company,
+        Department,
+        Team,
+        User,
+        TeamMember,
+        Permission,
+        Role,
+        RolePermission,
+        RoleAssignment,
+        AuditChainHead,
+        AuditEvent,
+    )
+]
 
 DEMO_PASSWORD = "a calm river bends at dusk"
 
@@ -32,6 +52,15 @@ def quick_hashing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         passwords, "_hasher", PasswordHasher(time_cost=1, memory_cost=8, parallelism=1)
     )
+
+
+@pytest.fixture(autouse=True)
+def audit_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
+    """A test signing key: creating roles writes audit entries. Settings are read again
+    after each test, without this test's environment."""
+    use_key(monkeypatch, tmp_path, TEST_KEY)
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture
@@ -107,6 +136,7 @@ def test_a_failure_part_way_leaves_nothing_behind_and_a_rerun_completes(
     def broken_email(person: seed_demo.Person, domain: str) -> str:
         raise RuntimeError("simulated failure part way through")
 
+    real_email_for = seed_demo.email_for
     monkeypatch.setattr(seed_demo, "email_for", broken_email)
     with pytest.raises(RuntimeError, match="simulated"):
         seed_demo.seed(engine)
@@ -116,7 +146,8 @@ def test_a_failure_part_way_leaves_nothing_behind_and_a_rerun_completes(
     assert company_ids(engine) == {}
 
     # Once the cause is gone, the next run creates both companies completely.
-    monkeypatch.undo()
+    # (Only this one patch is undone: the signing key from the fixture stays set.)
+    monkeypatch.setattr(seed_demo, "email_for", real_email_for)
     lines = seed_demo.seed(engine)
     assert [line.split(";")[0] for line in lines] == [
         "Northwind Cafe: created",

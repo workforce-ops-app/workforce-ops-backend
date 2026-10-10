@@ -32,6 +32,9 @@ session (app/db/session.py, background jobs, tests):
   bulk_save_objects), statements run on session.connection() directly, and any other
   path that skips the ORM hooks. Only migrations, marked with trust_connection(), may
   touch company tables directly.
+- One read across companies: sign-in must find a person by email, and a request must
+  find its session by token, before the company is known. Those SELECTs, and only those,
+  are marked with cross_company_read(); a security test fails if any other file uses it.
 
 Feature code never filters by company itself and never turns this off. Queries written
 as raw SQL text (session.execute(text(...))) name no tables SQLAlchemy can see, so they
@@ -46,6 +49,7 @@ from typing import Any, cast
 
 from sqlalchemy import Connection, Engine, event
 from sqlalchemy.orm import Mapped, ORMExecuteState, Session, mapped_column, with_loader_criteria
+from sqlalchemy.sql.base import Executable
 from sqlalchemy.sql.elements import ClauseElement
 from sqlalchemy.sql.util import find_tables
 
@@ -100,6 +104,8 @@ class CompanyRecord:
 _CHECKED = "tenancy_checked"
 _SAVING = "tenancy_saving"
 _TRUSTED = "tenancy_trusted"
+# Marker for the one sanctioned read across companies (cross_company_read below).
+_CROSS_COMPANY = "tenancy_cross_company_read"
 
 
 def trust_connection(connection: Connection) -> None:
@@ -109,6 +115,18 @@ def trust_connection(connection: Connection) -> None:
     reach, where a data fix may legitimately span companies. Never used by the app.
     """
     connection.execution_options(**{_TRUSTED: True})
+
+
+def cross_company_read[S: Executable](statement: S) -> S:
+    """Mark a SELECT as allowed to read company data without a company on the session.
+
+    Only for sign-in (app/auth/sessions.py): before anyone is signed in, the company is not
+    known yet, so finding a person by email or a session by its token must look across
+    companies. Everything after that runs in a session for the company found. The filter
+    still refuses this mark on anything but a SELECT, and in a session that already works
+    for a company. tests/security/test_cross_company.py fails if any other file uses it.
+    """
+    return statement.execution_options(**{_CROSS_COMPANY: True})
 
 
 def _is_company_owned(mapped_class: type) -> bool:
@@ -206,6 +224,15 @@ def _add_company_filter(state: ORMExecuteState) -> None:
     # rows. The one exception: a statement on the companies table alone, from a session
     # with no company, is platform code (the seed script) managing companies.
     company_id = get_company(state.session)
+
+    # The one sanctioned read across companies (cross_company_read): a SELECT, from a
+    # session with no company yet. Anything else carrying the mark is refused.
+    if state.execution_options.get(_CROSS_COMPANY):
+        if not state.is_select or company_id is not None:
+            raise UnsafeQueryError("a cross-company read is a SELECT before a company is set")
+        state.update_execution_options(**{_CHECKED: True})
+        return
+
     if company_id is None:
         if owned:
             raise MissingCompanyError("query on company data without a company set on the session")
