@@ -210,10 +210,17 @@ def test_cannot_delete_another_companys_row(data: TwoCompanies) -> None:
 def test_every_model_with_company_id_is_covered_by_the_filter() -> None:
     # Layer 3 of tenancy.md: a new table that has a company_id column but forgets
     # CompanyOwned would not be filtered. This test finds any such model.
+    # The only exceptions, each for a stated reason:
+    # - the audit log's tables: the platform chain has no company (company_id is null), so
+    #   they cannot be CompanyOwned. Only app/audit/record.py writes them, and it takes the
+    #   company from the session, never from the caller (tests/security/test_audit_log.py).
+    exceptions = {"AuditChainHead", "AuditEvent"}
     unprotected = [
         mapper.class_.__name__
         for mapper in Base.registry.mappers
-        if "company_id" in mapper.columns and not issubclass(mapper.class_, CompanyOwned)
+        if "company_id" in mapper.columns
+        and not issubclass(mapper.class_, CompanyOwned)
+        and mapper.class_.__name__ not in exceptions
     ]
     assert unprotected == [], f"add CompanyOwned to: {', '.join(unprotected)}"
 

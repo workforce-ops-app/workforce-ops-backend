@@ -14,6 +14,9 @@ This follows the same rule as router discovery in app/main.py.
 import importlib
 import pkgutil
 
+# The shared layers' tables are always part of the app, so they are imported directly
+# (a feature's tables are found below instead).
+import app.audit.models  # noqa: F401  (imported for its tables)
 from app import modules
 
 

@@ -4,7 +4,7 @@
 
 Decision: [0018](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0018-audit-log-chains.md).
 
-> **Status:** design. Code references will be added when the audit module is built.
+> **Status:** writing is built (`app/audit/`, migration `0003`, slice L1). Verification and the viewer follow in Phase 4 (#58); insert-only database rights in T2 (#43).
 
 ## How an entry is written
 
@@ -25,6 +25,44 @@ sequenceDiagram
 - The entry is written **in the same transaction** as the action it records, so an action cannot succeed without its audit entry (and vice versa).
 - Each company has its own chain. Actions by platform personnel go to a separate platform chain.
 - Automatic actions use actor `system`.
+
+## Recording an action
+
+```python
+from app.audit import Actor, record
+
+record(
+    session,
+    actor=Actor.user(user_id),
+    action="shift.assigned",
+    target_type="shift",
+    target_id=shift.id,
+    details={"employee_id": str(employee_id)},
+)
+```
+
+| Rule | Why |
+|---|---|
+| Call it in the **same session** as the action, before the caller commits; `record()` never commits | the action and its entry are saved together or not at all |
+| The chain is the **session's company** (`app/tenancy/context.py`); there is no company or chain parameter | one company's actions can never be written into another company's log. A session with no company (platform code) writes to the platform chain; a person's action (`Actor.user`) is refused there |
+| `action` is a dotted lowercase name, such as `shift.assigned` | consistent names for the viewer and the detection study |
+| `details` holds text, whole numbers, true/false, null, lists, and objects. Keys containing `password`, `token`, `secret`, or `hash` are refused at any depth, and so are decimal numbers and whole numbers beyond 64 bits | the log is kept forever, so it must never hold credentials; MySQL may write such numbers back differently, which would change the signed bytes |
+| Without `AUDIT_SIGNING_KEY`, `record()` raises `AuditError` | no unsigned entries: the action fails with it |
+| A chain's first entry creates its head | companies need no setup step. If two first entries ever raced, the head's primary key lets only one create it; the other transaction fails and rolls back |
+
+Each feature page lists the audit events its actions write; every slice from L1 on records them.
+
+| Part | Where | What it does |
+|---|---|---|
+| Tables | `app/audit/models.py`, migration `0003` | `AuditChainHead` and `AuditEvent`, as on the [data model](data-model.md#audit_chain_heads) |
+| Signing | `app/audit/signing.py` | `canonical_json(event)` and `sign(key, event, prev_signature)`; verification (#58) reuses them |
+| Writing | `app/audit/record.py` | `record()` and `Actor`: checks, locks the head, numbers, signs, and adds the entry |
+| Settings | `app/core/config.py` | `AUDIT_SIGNING_KEY` (at least 32 characters) and `AUDIT_KEY_ID` |
+| Tests | `tests/unit/test_audit_record.py`, `tests/security/test_audit_log.py` | numbering, links, signatures, rollback; tampering, forgery without the key, secrets in details, and crossing companies |
+
+The audit tables are not `CompanyOwned` (the platform chain has no company), so the tenancy coverage test lists them as its one stated exception. Two consequences for later slices:
+- **Reading is not filtered by company.** A query on `AuditEvent` in a company's session would see every company's entries. Nothing reads the log yet; the viewer (#58) must limit every read to the session's chain itself.
+- **Details are checked by key name only.** `{"password": ...}` is refused, but a value that happens to contain a secret cannot be recognized, so callers never put credentials into details at all.
 
 ## What an entry contains
 
@@ -49,18 +87,22 @@ sequenceDiagram
 - **On demand:** owners (through a dedicated audit permission) can run verification for their company.
 - **Outside copy:** each night the latest head signature per chain is written to the application log, so a database rollback to an older state can also be detected.
 
-A verification failure names the first bad `seq` and raises a security event.
+- **The end of the chain:** after checking every entry, verification compares the last entry it found with the chain head: its `seq` must equal `last_seq` and its signature must equal `last_signature`. Each entry only vouches for the one before it, so deleting the newest entries leaves a chain that still checks out entry by entry; only the head shows that it used to be longer.
+
+A verification failure names the first bad `seq` (or, when the end is missing, the `seq` the head expected) and raises a security event.
 
 ## Protection in the database
 
 | Database user | Audit tables |
 |---|---|
-| application | `INSERT`, `SELECT` on `audit_events`; `SELECT`, `UPDATE` on `audit_chain_heads` |
+| application | `INSERT`, `SELECT` on `audit_events`; `INSERT`, `SELECT`, `UPDATE` on `audit_chain_heads` (a chain's first entry creates its head). Never `DELETE` on either |
 | migrations | schema changes only, not used by the running application |
+
+These rights arrive with T2 (#43). Until then the application's database user can change rows directly; the signatures make any such change detectable.
 
 ## The signing key
 
-- Provided through the environment or a secret store, **never** stored in the database or the repository.
+- Provided through the environment or a secret store (`AUDIT_SIGNING_KEY`, with its ID in `AUDIT_KEY_ID`), **never** stored in the database or the repository. Locally it goes in `.env`; generate one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
 - Has an ID; rotating the key starts using a new ID while old entries keep theirs. Old keys are kept (read-only) for verification.
 - Losing a key means entries signed with it can no longer be verified; leaking it reduces the protection to a plain hash chain. Its handling will be covered by an operations runbook.
 
