@@ -44,6 +44,15 @@ services:
       # would break the URL (the app combines the two safely, app/core/config.py).
       DATABASE_URL: mysql+pymysql://workforce_app@db:3306/workforce_ops
       DATABASE_PASSWORD: ${MYSQL_APP_PASSWORD:?set MYSQL_APP_PASSWORD in .env}
+      # The key that signs the audit log. Required: sign-in writes audit entries, and
+      # without a key every such action would fail.
+      AUDIT_SIGNING_KEY: ${AUDIT_SIGNING_KEY:?set AUDIT_SIGNING_KEY in .env}
+      AUDIT_KEY_ID: ${AUDIT_KEY_ID:-local-1}
+      # The key behind CSRF tokens; the API does not start without it.
+      CSRF_KEY: ${CSRF_KEY:?set CSRF_KEY in .env}
+      # The address browsers use: the frontend's nginx, which serves the pages and passes
+      # /api on (decision 0003). Changes must come from it (the Origin check).
+      APP_ORIGIN: ${APP_ORIGIN:-http://localhost:8080}
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
     # Start the API only once MySQL reports healthy, so its first requests do not fail.

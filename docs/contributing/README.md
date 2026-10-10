@@ -18,6 +18,7 @@ pre-commit install
 - **`-e` (editable)** means code changes take effect without reinstalling.
 - **Dependencies** are pinned to exact versions in `pyproject.toml`; Dependabot proposes updates. After pulling a change to `pyproject.toml`, run the install line again.
 - **Settings** come from environment variables; `.env` holds them for local use and is never committed. Every setting is listed in `.env.example`.
+- **The CSRF key:** set your own `CSRF_KEY` in `.env` (at least 32 characters, different from the audit key); the API does not start without it. Requests that change something must send an `Origin` header (browsers do this themselves; with `curl`, add `-H "Origin: http://localhost:8000"`) and, when signed in, the `X-CSRF-Token` from the sign-in answer.
 - **The audit signing key:** set your own `AUDIT_SIGNING_KEY` in `.env` (at least 32 characters; `.env.example` shows how to generate one). Without it, any action that writes an audit entry fails ([audit log](../architecture/audit-log.md#the-signing-key)).
 
 
@@ -82,7 +83,7 @@ SQLAlchemy sends `note_id` and `title` as bound parameters (`WHERE notes.id = %(
 
 ## Running with Docker
 
-`docker-compose.yml` runs the API and MySQL 8.4 together ([0034](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0034-database-driver-ids-and-local-layout.md)). Needs Docker Desktop running, and `MYSQL_ROOT_PASSWORD` and `MYSQL_APP_PASSWORD` set in `.env` (Compose refuses to start without them, so there is never a blank database password).
+`docker-compose.yml` runs the API and MySQL 8.4 together ([0034](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0034-database-driver-ids-and-local-layout.md)). Needs Docker Desktop running, and `MYSQL_ROOT_PASSWORD`, `MYSQL_APP_PASSWORD`, `AUDIT_SIGNING_KEY`, and `CSRF_KEY` set in `.env` (Compose refuses to start without them, so there is never a blank database password, an unsigned audit log, or unprotected changes).
 
 | Task | Command |
 |---|---|
@@ -128,7 +129,8 @@ python -m scripts.seed_demo
 - **All or nothing per company:** each company and everything in it are saved in one transaction. If a run stops part way (an error, a lost connection), nothing of that company is kept, so running the script again builds it from the start.
 - **Refuses to run when `APP_ENV=production`.**
 - **Built alike on purpose:** the same department and team names in both companies, so a leak from one company into the other is obvious in tests and demos.
-- **Demo password:** set `DEMO_PASSWORD` in `.env` (at least 15 characters, not a common password; a few words with spaces work) and every demo account without a password gets it, checked against the password rules and hashed like any other. A weak one is refused before anything changes. Without it, the accounts have no password. Roles (Z1) and shifts (SD1) are added to the script by those slices.
+- **Demo password:** set `DEMO_PASSWORD` in `.env` (at least 15 characters, not a common password; a few words with spaces work) and every demo account without a password gets it, checked against the password rules and hashed like any other. A weak one is refused before anything changes. Without it, the accounts have no password. Each company gets the four starting roles, and every person their roles: Employee of their home department for everyone, plus Owner or Administrator for the whole company, or Manager of their home department. Each company also gets two weeks of shifts, from the day you run the script, in its own time zone ([organization: demo data](../features/organization.md#demo-data)); a shift that has already ended that day is skipped, as the application would refuse it. They need `DEMO_PASSWORD`: like the application, the script only gives shifts to people who have set up their account, so without it the summary says `shifts wait for passwords`. They are added once: a company that already has shifts is left alone, and a database seeded before shifts existed, or without `DEMO_PASSWORD`, gets them on the next run with it. For a fresh pair of weeks later on (the dates are fixed when the shifts are added), reset the database and seed again. **Before a demo, seed a few days ahead** (for example the weekend before): on the day, the start of the week then shows shifts that were planned ahead and have since happened, and they can be used to show that an ended shift cannot be changed (409). Seeded on the day itself, the days before it have no shifts.
+- **Needs `AUDIT_SIGNING_KEY`:** creating roles, assignments, and shifts writes audit entries.
 - It runs on your computer, not in the API container (the image does not include `scripts/`).
 
 ## Conventions specific to this repository
