@@ -65,6 +65,7 @@ def main() -> int:
         "MYSQL_APP_PASSWORD": "p@ss:w/rd%41#x?y-" + secrets.token_hex(8),
         # A throwaway audit signing key for this run only.
         "AUDIT_SIGNING_KEY": secrets.token_urlsafe(32),
+        "CSRF_KEY": secrets.token_urlsafe(32),
         # Where this copy is published on this computer.
         "API_PORT": str(api_port),
         "DB_PORT": str(_free_port()),

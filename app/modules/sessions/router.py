@@ -13,6 +13,7 @@ from datetime import UTC
 from fastapi import APIRouter, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
+from app.auth.csrf import csrf_token
 from app.auth.dependencies import Database, SignedInPerson
 from app.auth.models import UserSession
 from app.auth.sessions import (
@@ -54,7 +55,7 @@ def _clear_cookie(response: Response) -> None:
     response.delete_cookie(COOKIE_NAME, path="/", secure=True, httponly=True, samesite="strict")
 
 
-def _info(db: Session, user: User, session: UserSession) -> SessionInfo:
+def _info(request: Request, db: Session, user: User, session: UserSession) -> SessionInfo:
     """The session's answer: the person, their company, their permissions, and the limit."""
     company = db.get(Company, user.company_id)
     if company is None:  # the session's own company is always visible to it
@@ -69,6 +70,8 @@ def _info(db: Session, user: User, session: UserSession) -> SessionInfo:
         company=SessionCompany(id=company.id, name=company.name, timezone=company.timezone),
         permissions=[],
         expires_at=session.expires_at.replace(tzinfo=UTC),
+        # The key create_app keeps on the app, the same one the CSRF check uses.
+        csrf_token=csrf_token(request.app.state.csrf_key, session.token_hash),
     )
 
 
@@ -83,13 +86,13 @@ def create_session(
     # The browser's previous session, if any, ends now: it gets only the new token.
     end_previous_session(db, request.cookies.get(COOKIE_NAME))
     _set_cookie(response, result.token, result.session)
-    return _info(db, result.user, result.session)
+    return _info(request, db, result.user, result.session)
 
 
 @router.get("/current")
-def current_session(current: SignedInPerson, db: Database) -> SessionInfo:
+def current_session(request: Request, current: SignedInPerson, db: Database) -> SessionInfo:
     """Who is signed in on this browser, and for which company."""
-    return _info(db, current.user, current.session)
+    return _info(request, db, current.user, current.session)
 
 
 @router.delete("/current", status_code=204)

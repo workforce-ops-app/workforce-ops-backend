@@ -29,8 +29,13 @@ from app.main import create_app
 from app.modules.org.models import Company, Department, User
 from app.tenancy.context import set_company
 from tests.audit_data import TEST_KEY, use_key
+from tests.conftest import TEST_CSRF_KEY
 
 PASSWORD = "correct horse battery staple"
+
+# The address of the test app. Clients send it as their Origin, as a browser on our own
+# pages would (app/auth/csrf.py).
+BASE_URL = "https://testserver"
 OTHER_PASSWORD = "a different long passphrase"
 
 TABLES = [
@@ -55,10 +60,15 @@ class SignInSetup:
 
     def new_client(self) -> TestClient:
         """Another browser: its own cookies, the same app."""
-        return TestClient(self.client.app, base_url="https://testserver")
+        return TestClient(self.client.app, base_url=BASE_URL, headers={"Origin": BASE_URL})
 
     def sign_in(self, client: TestClient, email: str, password: str = PASSWORD) -> int:
-        return client.post("/api/sessions", json={"email": email, "password": password}).status_code
+        """Sign in on a client; on success it sends the CSRF token from then on, as
+        js/api/client.js does."""
+        response = client.post("/api/sessions", json={"email": email, "password": password})
+        if response.status_code == 201:
+            client.headers["X-CSRF-Token"] = response.json()["csrf_token"]
+        return response.status_code
 
     def session_for(self, company_id: uuid.UUID | None) -> Session:
         session = Session(self.engine)
@@ -126,14 +136,16 @@ def signin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[SignInSe
             people.update({f"{prefix}_{name}": row.id for name, row in rows.items()})
 
     # The real app, with its database session coming from this engine.
-    app = create_app(Settings(app_env="test", database_url="sqlite://"))
+    app = create_app(
+        Settings(app_env="test", database_url="sqlite://", csrf_key=TEST_CSRF_KEY)  # type: ignore[arg-type]
+    )
 
     def test_session() -> Iterator[Session]:
         with Session(engine) as session:
             yield session
 
     app.dependency_overrides[get_session] = test_session
-    client = TestClient(app, base_url="https://testserver")
+    client = TestClient(app, base_url=BASE_URL, headers={"Origin": BASE_URL})
     yield SignInSetup(engine, client, *ids, people)
     engine.dispose()
 
