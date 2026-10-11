@@ -22,11 +22,12 @@ from app.audit.models import AuditChainHead, AuditEvent
 from app.auth import sessions
 from app.auth.models import UserSession
 from app.auth.passwords import hash_password
+from app.authz.models import Permission, Role, RoleAssignment, RolePermission
 from app.core.config import Settings
 from app.db.base import Base, utcnow
 from app.db.session import get_session
 from app.main import create_app
-from app.modules.org.models import Company, Department, User
+from app.modules.org.models import Company, Department, Team, TeamMember, User
 from app.tenancy.context import set_company
 from tests.audit_data import TEST_KEY, use_key
 from tests.conftest import TEST_CSRF_KEY
@@ -41,10 +42,16 @@ OTHER_PASSWORD = "a different long passphrase"
 TABLES = [
     Company.__table__,
     Department.__table__,
+    Team.__table__,
     User.__table__,
+    TeamMember.__table__,
     UserSession.__table__,
     AuditChainHead.__table__,
     AuditEvent.__table__,
+    Permission.__table__,
+    Role.__table__,
+    RolePermission.__table__,
+    RoleAssignment.__table__,
 ]
 
 

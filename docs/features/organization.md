@@ -1,6 +1,6 @@
 # Company structure, people, and access
 
-- **Status:** tables built (`app/modules/org/models.py`, migration `0002`); demo companies, structure, and people seeded by `scripts/seed_demo.py`; endpoints planned (core tier)
+- **Status:** tables built (`app/modules/org/models.py`, migration `0002`); demo companies, structure, people, and their roles seeded by `scripts/seed_demo.py`; this module's permissions declared (`app/modules/org/permissions.py`); endpoints planned (core tier)
 - **Related:** workforce-ops-app/workforce-ops-backend#8; frontend page: administration screens (workforce-ops-app/workforce-ops-frontend#3); design: [data model](../architecture/data-model.md), [authorization](../architecture/authorization.md), [authentication](../architecture/authentication.md)
 
 ## In short
@@ -16,7 +16,7 @@ Administrators set up their company in the application: its departments and team
 | Owner, Administrator | give and remove roles; a role at their own level needs approval from above | `role.assign` | people they are above |
 | Owner, Administrator | add and end reporting lines | `reporting_line.manage` | pairs of people they are above |
 | Owner | propose adding or removing an owner | `company.transfer_ownership` | company |
-| Manager | see the people in their scope and their roles | `user.view`, `role.view` | their assignment's scope |
+| Manager | see the people in their scope and the roles they hold | `user.view` | their assignment's scope |
 | Everyone | see their own name, department, teams, roles, and managers | none | own account |
 | Everyone | ask to change their own display name (core) or email (next tier); it takes effect once approved from above | `account.change_self` | own account |
 
@@ -92,9 +92,9 @@ stateDiagram-v2
 | `POST /users` | `user.manage` | create an account (name, email, home department) |
 | `PATCH /users/{id}` | `user.manage`, above the person | change name, email, or home department |
 | `POST /users/{id}/deactivate`, `POST /users/{id}/reactivate` | `user.manage`, above the person | change account state |
-| `GET /roles` | `role.view` | list roles and what they grant |
+| `GET /roles` | `role.view` (company) | list roles and everything each grants |
 | `POST /roles`, `PATCH /roles/{id}`, `POST /roles/{id}/archive` | `role.manage` (delegation limits) | create, change, archive |
-| `GET /role-assignments?user_id=` | `role.view` | a person's roles and scopes |
+| `GET /role-assignments?user_id=` | `user.view`, the person in scope | a person's roles and scopes |
 | `POST /role-assignments` | `role.assign`, above the person | give a role; answers **201** when it takes effect, **202** with an approval request when it needs approval from above |
 | `DELETE /role-assignments/{id}` | `role.assign`, above the person | remove a role |
 | `GET /reporting-lines?user_id=` | `user.view` | a person's managers and reports |
@@ -115,7 +115,7 @@ Setup links, reset links, unlocking, and signing someone out are on the [authent
 The seed script (`python -m scripts.seed_demo`) creates the same data on every run, for local use, CI, and the demos ([0031](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0031-demo-environment-and-data.md)):
 
 - **Two companies**, for example *Northwind Cafe* (America/Chicago) and *Summit Outfitters* (America/Denver), built alike on purpose: same department names and similar people, so a leak between companies is obvious in tests and demos.
-- In each company: two or three departments, a team or two in each, and people in every starting role.
+- In each company: two or three departments, a team or two in each, and people in every starting role. Each company gets the four starting roles; everyone holds Employee for their home department, owners and administrators their role for the whole company, and managers Manager for their home department (built, Z1).
 - **Reporting lines** that exercise the rules: a two-level chain, someone with two managers, an administrator over other administrators, and someone with no manager.
 - Two weeks of shifts, including open shifts, and a few time-off requests in each state.
 - Emails use the reserved `example.com` and `example.org` domains. Demo passwords come from an environment variable, never from the repository.

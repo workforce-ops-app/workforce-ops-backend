@@ -4,7 +4,7 @@
 
 Decisions: [0017 scoped role assignments](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0017-scoped-role-assignments.md) · [0024 authorization model](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md) · [0025 sensitive actions](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md) · [0029 approval routing](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md) · [0032 delegation limits](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md)
 
-> **Status:** design. Code references will be added when the `authz` layer is built (Phase 2).
+> **Status:** permissions, roles, assignments, `authorize()`, scope resolvers, and the list filter are built (`app/authz/`, migration `0005`, slice Z1). Until reporting lines exist (Z2), only the Owner counts as above anyone, so person permissions work for owners alone; the role endpoints and the delegation rules follow in Z3 to Z5.
 
 ## The two questions every check answers
 
@@ -17,7 +17,7 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 
 ## Permissions
 
-**Naming:** `resource.action`, lowercase. Self-service permissions end in `_self` and only ever apply to the user's own records. Each module declares its permissions in its `permissions.py`, and the registry collects them ([extension points](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0012-extensibility-patterns.md)).
+**Naming:** `resource.action`, lowercase. A permission's name and kind agree both ways ([0024](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md)): a name ending in `_self` is always a self permission and only ever applies to the user's own records, and every self permission ends in `_self` (for example `time_off.request_self`). The registry refuses a permission that breaks either rule, so the API does not start. Each module declares its permissions in its `permissions.py`, and the registry collects them ([extension points](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0012-extensibility-patterns.md)). `sync_permissions()` copies the registry into the `permissions` table. It runs when a company's starting roles are created, and the role-management service (Z4) calls it in the same transaction before it checks or adds a role's grants, so a permission added by a new module can be granted by existing companies without reseeding.
 
 **Kinds of permission**, which decide how a check works:
 
@@ -35,7 +35,7 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 | `schedule.view_self` | self | see your own shifts |
 | `schedule.view` | record | see shifts in scope, including open shifts |
 | `schedule.edit` | record | create, change, and cancel shifts in scope |
-| `time_off.request` | self | ask for time off for yourself |
+| `time_off.request_self` | self | ask for time off for yourself |
 | `time_off.cancel_self` | self | cancel your own pending or approved request |
 | `time_off.view` | record | see time-off requests of people in scope |
 | `time_off.review` | person | approve or deny the requests of people you are above ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)) |
@@ -63,13 +63,13 @@ Every new company gets four roles ([0024](https://github.com/workforce-ops-app/.
 | `schedule.view_self` | yes | yes | yes | yes |
 | `schedule.view` | yes | yes | yes | yes (see below) |
 | `schedule.edit` | yes | yes | yes | |
-| `time_off.request`, `time_off.cancel_self` | yes | yes | yes | yes |
+| `time_off.request_self`, `time_off.cancel_self` | yes | yes | yes | yes |
 | `time_off.view`, `time_off.review` | yes | yes | yes | |
 | `user.view` | yes | yes | yes | |
 | `account.change_self` | yes | yes | yes | yes |
 | `user.manage` | yes | yes | | |
 | `org.manage` | yes | yes | | |
-| `role.view` | yes | yes | yes | |
+| `role.view` | yes | yes | | |
 | `role.manage`, `role.assign` | yes | yes | | |
 | `reporting_line.manage` | yes | yes | | |
 | `settings.manage` | yes | yes | | |
@@ -77,7 +77,7 @@ Every new company gets four roles ([0024](https://github.com/workforce-ops-app/.
 | `company.transfer_ownership` | yes | | | |
 
 - **Typical scopes:** Owner and Administrator are assigned for the whole company; a Manager for their department or team; everyone gets the Employee role scoped to their **home department**, which is what lets employees see their department's schedule. An administrator can remove `schedule.view` from the Employee role to turn that off.
-- **Owner** is locked: its permissions cannot be changed, and it is always assigned for the whole company. A company has at least one owner and may have several true co-owners; leaders who are not co-owners (such as a board of directors) get their own role below the owner.
+- **Owner** is locked: its permissions cannot be changed, and it is always assigned for the whole company. An active, company-wide Owner assignment grants **every** registered permission, including ones a module adds after the company's roles were created, and for the whole company even when another of the owner's roles grants the same permission more narrowly; the Owner role's `role_permissions` rows are only a record of that. A company has at least one owner and may have several true co-owners; leaders who are not co-owners (such as a board of directors) get their own role below the owner.
 - Later features add to these roles; for example employees do not get `announcement.create` by default.
 
 ## How a check works
@@ -109,19 +109,31 @@ flowchart TD
 | Assignment scope | Covers |
 |---|---|
 | company | everything in the company |
-| department | the department, its teams, the people whose home department it is, and their records |
+| department | the department, its teams (as records), the people whose home department it is, and their records. Not a member of one of its teams whose home is another department: authority over that person needs a team-scoped assignment, so team membership never quietly widens a department manager's reach |
 | team | the team's members and their records |
 | employee | that one person and their records |
 
 Archived roles and deactivated users grant nothing. Permissions are read on every request, so a change to someone's roles takes effect immediately.
 
+**In the code** (`app/authz/check.py`): `authorize(db, user, permission, target)` returns when allowed and raises `Forbidden` (403) or `NotFound` (404, a target of another company). Without a target, a record or person check asks "anywhere at all?", which is what a list endpoint checks before applying the scope filter; company and self checks work the same with or without one. An unknown permission code is a bug and raises `LookupError` instead of answering yes or no. Until reporting lines exist (Z2), "above" means "is an owner".
+
 ### Scope resolvers
 
-`authorize()` does not know what a shift or a request is. Each module registers a **scope resolver** that answers, for one of its records: which department, which team(s), and which employee does it belong to? For a shift: its `department_id` and its `employee_id` (none while open). For a time-off request: its employee, and through them their home department and teams.
+`authorize()` does not know what a shift or a request is. Each module registers a **scope resolver** (`@scope_resolver(Shift)`, `app/authz/scope.py`) that answers, for one of its records: which department, which team(s), and which employee does it belong to? For a shift: its `department_id` and its `employee_id` (none while open). For a time-off request: its employee, and through them their home department and teams.
 
 ### Lists: the scope filter
 
 Checking each row one by one would be slow and easy to forget. For lists, the `authz` layer turns the user's assignments for a permission into a **database condition** that the repository adds to its query, for example "shifts whose department is Kitchen, or whose employee is on the Weekend Crew team". Rows outside scope are never loaded.
+
+```python
+query.where(
+    scope_filter(
+        db, user, "user.view", ScopeColumns(department=User.department_id, employee=User.id)
+    )
+)
+```
+
+The filter follows exactly the rules of `authorize()` for each kind: self permissions list the user's own rows; company permissions list everything, but only with a company-wide assignment; person permissions list only people the user is above, never the user. A department's people and a team's members are looked up first (in the company's session, so the company filter applies), and the condition names their IDs. Security tests check that the filter and `authorize()` agree for every pair of people, for a record permission and two person permissions.
 
 ## The reporting chain
 
@@ -226,7 +238,12 @@ The session endpoint returns the signed-in user's effective permissions, so the 
 
 | Part | Location |
 |---|---|
-| Permission registry, `authorize()`, scope filter, reporting chain queries | `app/authz/` |
-| A module's permissions | `app/modules/<feature>/permissions.py` |
-| A module's scope resolver | registered by the module at startup |
-| Escalation tests | `tests/security/` |
+| The tables (`permissions`, `roles`, `role_permissions`, `role_assignments`) | `app/authz/models.py`, migration `0005` |
+| Permission registry, kinds, and filling the `permissions` table | `app/authz/registry.py` (the shared layers' own permissions are declared there) |
+| `authorize()`, effective permissions, `scope_filter()` | `app/authz/check.py` |
+| Scopes, resolvers, and the list conditions | `app/authz/scope.py` |
+| Starting roles and giving someone a role (audited) | `app/authz/roles.py` |
+| A module's permissions | `app/modules/<feature>/permissions.py`, a list named `PERMISSIONS`; found automatically |
+| A module's scope resolver | `@scope_resolver(Model)` in the module (people: `app/authz/scope.py`) |
+| Reporting chain queries | `app/authz/` (Z2) |
+| Tests | `tests/unit/test_authz.py`, `tests/security/test_authorization.py`; escalation tests AZ1 to AZ15 arrive with the endpoints that make those changes (Z3 to Z5) |

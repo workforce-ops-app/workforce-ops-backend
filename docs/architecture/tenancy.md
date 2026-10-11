@@ -49,6 +49,7 @@ flowchart LR
 |---|---|---|
 | The table instead of the model, e.g. `select(Shift.__table__)` | the company condition is only added through models | the model: `select(Shift)` |
 | A query that names the model only in `select_from` (e.g. a count written as SQL text) | SQLAlchemy does not see the model there, so it would go unfiltered | name a model column: `select(func.count(Shift.id))` |
+| A join to a company model none of whose columns are selected, e.g. `select(Shift.id).join(Department, ...)` | SQLAlchemy only reports the selected models to the filter, so the joined one would go unfiltered | select at least one column of every joined model: `select(Shift.id, Department.id).join(Department, ...)` |
 | A bulk insert, `session.execute(insert(Shift)...)` | it skips the save check that fills in and checks `company_id` | `session.add()` or `session.add_all()` |
 | A bulk update or delete given a list of rows by ID | it runs without the company condition | load the rows and change them, or update with a `where` clause |
 | A bulk update that sets `company_id` | the condition only limits which rows change, not what they change to | never change `company_id` |
