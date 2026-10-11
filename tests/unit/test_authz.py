@@ -23,7 +23,7 @@ CORE = {
     "schedule.view_self": "self",
     "schedule.view": "record",
     "schedule.edit": "record",
-    "time_off.request": "self",
+    "time_off.request_self": "self",
     "time_off.cancel_self": "self",
     "time_off.view": "record",
     "time_off.review": "person",
@@ -52,6 +52,7 @@ def test_the_registry_has_every_core_permission_with_its_kind() -> None:
         PermissionDef("Schedule.Edit", Kind.RECORD, "uppercase"),
         PermissionDef("schedule", Kind.RECORD, "no action"),
         PermissionDef("shift.view_self", Kind.RECORD, "named _self but not a self permission"),
+        PermissionDef("shift.request", Kind.SELF, "a self permission without _self"),
     ],
 )
 def test_badly_named_permissions_are_refused(
@@ -103,18 +104,17 @@ def test_the_starting_roles_grant_what_the_authorization_page_says(org: Org) -> 
         "schedule.view_self",
         "schedule.view",
         "schedule.edit",
-        "time_off.request",
+        "time_off.request_self",
         "time_off.cancel_self",
         "time_off.view",
         "time_off.review",
         "user.view",
         "account.change_self",
-        "role.view",
     }
     assert granted["employee"] == {
         "schedule.view_self",
         "schedule.view",
-        "time_off.request",
+        "time_off.request_self",
         "time_off.cancel_self",
         "account.change_self",
     }
@@ -128,7 +128,7 @@ def test_effective_permissions_combine_every_active_role(org: Org) -> None:
             [
                 "schedule.view_self",
                 "schedule.view",
-                "time_off.request",
+                "time_off.request_self",
                 "time_off.cancel_self",
                 "account.change_self",
             ]

@@ -24,18 +24,19 @@ _MANAGER = [
     "schedule.view_self",
     "schedule.view",
     "schedule.edit",
-    "time_off.request",
+    "time_off.request_self",
     "time_off.cancel_self",
     "time_off.view",
     "time_off.review",
     "user.view",
     "account.change_self",
-    "role.view",
+    # No role.view: it is a company permission, so a department or team assignment could
+    # never use it. Managers see the roles of people in their scope through user.view.
 ]
 _EMPLOYEE = [
     "schedule.view_self",
     "schedule.view",  # their department's schedule; an administrator may remove it
-    "time_off.request",
+    "time_off.request_self",
     "time_off.cancel_self",
     "account.change_self",
 ]
