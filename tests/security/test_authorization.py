@@ -13,7 +13,7 @@ from sqlalchemy import select
 from app.authz import registry
 from app.authz.check import Forbidden, NotFound, authorize, effective_permissions, scope_filter
 from app.authz.models import Role, RoleAssignment, RolePermission
-from app.authz.registry import Kind, PermissionDef
+from app.authz.registry import Kind, PermissionDef, sync_permissions
 from app.authz.scope import ScopeColumns
 from app.modules.org.models import User
 from tests.authz_data import Note, Org, org
@@ -72,6 +72,36 @@ def test_the_owner_holds_permissions_added_after_the_roles_were_created(
     assert not allowed(org, "admin", "announcement.create")
     with org.a() as db:
         assert "announcement.create" in effective_permissions(db, org.user(db, "owner"))
+
+
+def test_a_narrower_role_does_not_narrow_the_owners_late_permission(
+    org: Org, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A later module adds a record permission. The locked Owner role has no row for it, but
+    # the Employee role is edited to grant it, and the owner is also an Employee of Front.
+    # That Front-only grant must not replace the Owner's company-wide one: the owner still
+    # acts in Kitchen, outside the narrower assignment.
+    added = PermissionDef("checklist.edit", Kind.RECORD, "Edit shift checklists", "tasks")
+    monkeypatch.setitem(registry.all_permissions(), added.code, added)
+    with org.a() as db:
+        sync_permissions(db)
+        db.add(RolePermission(role_id=org.ids["role_employee"], permission_code=added.code))
+        db.commit()
+    assert allowed(org, "owner", "checklist.edit", note(org, "front"))
+    assert allowed(org, "owner", "checklist.edit", note(org, "kitchen"))
+    assert allowed(org, "owner", "checklist.edit", note(org, "kitchen", "ana"))
+    # The same Employee grant still covers only an employee's own department.
+    assert allowed(org, "ben", "checklist.edit", note(org, "front"))
+    assert not allowed(org, "ben", "checklist.edit", note(org, "kitchen"))
+    # And the list filter agrees: the owner sees Kitchen's rows too.
+    with org.a() as db:
+        owner = org.user(db, "owner")
+        users = db.scalars(
+            select(User).where(
+                scope_filter(db, owner, added.code, ScopeColumns(User.department_id, User.id))
+            )
+        )
+        assert org.ids["ana"] in {u.id for u in users}
 
 
 def test_an_unknown_permission_is_a_bug_not_a_yes(org: Org) -> None:
