@@ -45,11 +45,16 @@ def test_api_docs_are_hidden_in_production() -> None:
     assert client.get("/api/openapi.json").status_code == 404
 
 
-def test_the_api_does_not_start_without_a_csrf_key() -> None:
+def test_the_api_does_not_start_without_a_csrf_key(monkeypatch: pytest.MonkeyPatch) -> None:
     # Every change to data depends on the key, so a missing one stops the API at startup
     # instead of leaving changes unprotected.
+    # A developer's .env file or shell may set CSRF_KEY, which Settings would pick up, so
+    # this test ignores both to make sure the key is really missing.
+    monkeypatch.delenv("CSRF_KEY", raising=False)
     settings = Settings(
-        app_env="test", database_url="mysql+pymysql://test:test@localhost:3307/test"
+        _env_file=None,  # type: ignore[call-arg]
+        app_env="test",
+        database_url="mysql+pymysql://test:test@localhost:3307/test",
     )
     with pytest.raises(RuntimeError, match="CSRF_KEY"):
         create_app(settings)
