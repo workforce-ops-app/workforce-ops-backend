@@ -116,7 +116,7 @@ Each row names the threat, who could carry it out, the protection (with the deci
 |---|---|---|---|---|
 | D1 | Flooding the sign-in form, or locking real users out on purpose | P1 | rate limits per address and per session; lockouts escalate but never exceed 1 hour, so they cannot lock someone out for good (0025, 0027) | rate-limit and lockout tests |
 | D2 | Expensive requests: huge lists or bodies, slow queries | P1, P2 | lists are paged (at most 200 items); request size limits; query timeouts (0026) | tests with oversized requests |
-| D3 | Destroying data from inside | P3, P4 | records are deactivated or archived, never deleted ([0020](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md)); the application's database user cannot drop or truncate; confirmation for changes to 10 or more shifts (0025); backups in the next tier ([0028](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0028-backup-and-recovery.md)) | database grant test; restore drills (next tier) |
+| D3 | Destroying data from inside | P3, P4 | records are deactivated or archived, never deleted ([0020](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md)); the application's database user cannot drop or truncate; confirmation for changes to 10 or more shifts (0025); backups in the next tier ([0028](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0028-backup-and-recovery.md)) | database grant test; batch confirmation tests (`tests/security/test_shift_batch.py`); restore drills (next tier) |
 
 ### Elevation of privilege: gaining more power than you were given
 

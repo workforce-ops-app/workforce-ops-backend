@@ -12,6 +12,12 @@ Rules:
   is checked, so two requests at the same moment cannot both pass.
 - A shift that has ended, or was cancelled, can no longer be changed (409).
 - Time off is checked here once time-off requests exist (time-off slices).
+- Several shifts at once (batch): every shift passes the same checks as one shift would,
+  all in one transaction, so either every change is saved or none is. At 10 or more shifts
+  the request must repeat the count (confirm_count), or nothing is saved (409).
+
+Each action is a step that does not commit (_create, _assign, _cancel) plus a public
+function that commits once. A batch runs many steps and commits once at the end.
 """
 
 import uuid
@@ -30,10 +36,17 @@ from app.modules.org.models import Team, TeamMember, User
 from app.modules.schedules import repository
 from app.modules.schedules import scope as _scope  # noqa: F401  (registers the resolver)
 from app.modules.schedules.models import Shift
-from app.modules.schedules.schemas import ShiftCreate, ShiftUpdate
+from app.modules.schedules.schemas import (
+    BatchAssign,
+    BatchCancel,
+    BatchCreate,
+    ShiftCreate,
+    ShiftUpdate,
+)
 
 MAX_LENGTH = timedelta(hours=12)
 MAX_DAYS = 31  # per list request (threat D2: no huge date ranges)
+CONFIRM_AT = 10  # a batch this large must repeat its count (decision 0025, threat D3)
 
 
 class Invalid(HTTPException):
@@ -110,6 +123,13 @@ def get_shift(db: Session, user: User, shift_id: uuid.UUID) -> Shift:
 
 
 def create_shift(db: Session, user: User, body: ShiftCreate) -> Shift:
+    item = _create(db, user, body)
+    db.commit()
+    return item
+
+
+def _create(db: Session, user: User, body: ShiftCreate) -> Shift:
+    """Check and add one new shift with its audit entry, without committing."""
     dept = repository.department(db, body.department_id)
     if dept is None:
         raise Invalid("Unknown department.")
@@ -149,7 +169,6 @@ def create_shift(db: Session, user: User, body: ShiftCreate) -> Shift:
             "ends_at": item.ends_at.isoformat(),
         },
     )
-    db.commit()
     return item
 
 
@@ -194,6 +213,13 @@ def assign_shift(
     db: Session, user: User, shift_id: uuid.UUID, employee_id: uuid.UUID | None
 ) -> Shift:
     """Give the shift to a person, or make it open (employee_id None)."""
+    item = _assign(db, user, shift_id, employee_id)
+    db.commit()
+    return item
+
+
+def _assign(db: Session, user: User, shift_id: uuid.UUID, employee_id: uuid.UUID | None) -> Shift:
+    """Check and make one assignment with its audit entry, without committing."""
     item = repository.shift(db, shift_id)
     if item is None:
         raise NotFound()
@@ -220,11 +246,17 @@ def assign_shift(
             "previous_employee_id": str(previous) if previous else None,
         },
     )
-    db.commit()
     return item
 
 
 def cancel_shift(db: Session, user: User, shift_id: uuid.UUID) -> Shift:
+    item = _cancel(db, user, shift_id)
+    db.commit()
+    return item
+
+
+def _cancel(db: Session, user: User, shift_id: uuid.UUID) -> Shift:
+    """Check and cancel one shift with its audit entry, without committing."""
     item = repository.shift(db, shift_id)
     if item is None:
         raise NotFound()
@@ -238,8 +270,69 @@ def cancel_shift(db: Session, user: User, shift_id: uuid.UUID) -> Shift:
         target_type="shift",
         target_id=item.id,
     )
-    db.commit()
     return item
+
+
+def batch(db: Session, user: User, body: BatchCreate | BatchCancel | BatchAssign) -> list[Shift]:
+    """Create, cancel, or reassign several shifts in one transaction: all or nothing.
+
+    Course topic: transactions. Every step below only adds to the open transaction; the
+    single commit at the end saves them together. If any step raises (403, 404, 409, 422),
+    the request ends without that commit and the session is closed, which rolls back every
+    shift and audit entry the earlier steps added. A half-applied batch is never saved.
+    """
+    # 1. May this person edit shifts anywhere? Checked first, so someone who cannot edit
+    #    shifts gets 403, never a hint about counts. Each shift is checked again below,
+    #    against its own department and person.
+    authorize(db, user, "schedule.edit")
+
+    # 2. How many shifts this changes, and no shift listed twice.
+    if isinstance(body, BatchCreate):
+        count = len(body.times)
+        moments = [(_utc(t.starts_at), _utc(t.ends_at)) for t in body.times]
+        if len(set(moments)) != count:
+            raise Invalid("The same start and end is listed twice.")
+    else:
+        count = len(body.shift_ids)
+        if len(set(body.shift_ids)) != count:
+            raise Invalid("A shift is listed twice.")
+
+    # 3. The count confirmation (decision 0025, threat D3). From 10 shifts on, the request
+    #    must say how many shifts it expects to change; a script or a slip that selects far
+    #    more than intended is stopped before anything is saved. A count that is sent must
+    #    always match, even below 10: a mismatch means the screen and the server disagree.
+    if body.confirm_count is None and count >= CONFIRM_AT:
+        raise Conflict(f"This changes {count} shifts. Send confirm_count: {count} to confirm.")
+    if body.confirm_count is not None and body.confirm_count != count:
+        raise Conflict(f"This changes {count} shifts, not {body.confirm_count}. Nothing was saved.")
+
+    # 4. Each shift goes through exactly the same checks as a single change, and writes its
+    #    own audit entry (shift.created, shift.cancelled, shift.assigned, or shift.opened).
+    if isinstance(body, BatchCreate):
+        common = body.model_dump(exclude={"action", "times", "confirm_count"})
+        items = [
+            _create(db, user, ShiftCreate(**common, starts_at=t.starts_at, ends_at=t.ends_at))
+            for t in body.times
+        ]
+    elif isinstance(body, BatchCancel):
+        items = [_cancel(db, user, shift_id) for shift_id in body.shift_ids]
+    else:
+        items = [_assign(db, user, shift_id, body.employee_id) for shift_id in body.shift_ids]
+
+    # 5. One entry for the batch as a whole, listing the shifts it touched, so the log shows
+    #    they were changed together (and by whom) rather than as unrelated single changes.
+    record(
+        db,
+        actor=Actor.user(user.id),
+        action="shift.batch_changed",
+        details={
+            "action": body.action,
+            "count": count,
+            "shift_ids": [str(item.id) for item in items],
+        },
+    )
+    db.commit()
+    return items
 
 
 def list_shifts(
