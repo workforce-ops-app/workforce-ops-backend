@@ -10,7 +10,7 @@ Employees ask for days off. The request goes to the people they report to direct
 
 | Role | Can | Permission | Scope |
 |---|---|---|---|
-| Everyone | ask for time off; cancel their own request | `time_off.request`, `time_off.cancel_self` | own requests |
+| Everyone | ask for time off; cancel their own request | `time_off.request_self`, `time_off.cancel_self` | own requests |
 | Manager | see requests of people in scope; approve or deny the requests of people they are above | `time_off.view`, `time_off.review` | their scope; reviews also need a position above the employee |
 | Owner, Administrator | the same, company-wide | `time_off.view`, `time_off.review` | company; reviews still need a position above (the Owner is above everyone) |
 
@@ -90,11 +90,11 @@ stateDiagram-v2
 
 | Method and path | Permission | Does |
 |---|---|---|
-| `GET /time-off-requests?mine=true` | `time_off.request` | your own requests |
+| `GET /time-off-requests?mine=true` | `time_off.request_self` | your own requests |
 | `GET /time-off-requests?status=&employee_id=&from=&to=` | `time_off.view` (scope filter) | requests of people in scope |
 | `GET /time-off-requests/waiting` | signed in | requests waiting for your review |
 | `GET /time-off-requests/{id}` | owner of the request, or `time_off.view` | one request, with its affected shifts and decisions so far |
-| `POST /time-off-requests` `{first_day, last_day, reason}` | `time_off.request` | ask for time off |
+| `POST /time-off-requests` `{first_day, last_day, reason}` | `time_off.request_self` | ask for time off |
 | `POST /time-off-requests/{id}/cancel` | `time_off.cancel_self` | cancel your own request |
 | `POST /time-off-requests/{id}/approve`, `POST /time-off-requests/{id}/deny` `{comment}` | `time_off.review`, above the employee | decide |
 

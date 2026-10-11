@@ -16,7 +16,7 @@ Administrators set up their company in the application: its departments and team
 | Owner, Administrator | give and remove roles; a role at their own level needs approval from above | `role.assign` | people they are above |
 | Owner, Administrator | add and end reporting lines | `reporting_line.manage` | pairs of people they are above |
 | Owner | propose adding or removing an owner | `company.transfer_ownership` | company |
-| Manager | see the people in their scope and their roles | `user.view`, `role.view` | their assignment's scope |
+| Manager | see the people in their scope and the roles they hold | `user.view` | their assignment's scope |
 | Everyone | see their own name, department, teams, roles, and managers | none | own account |
 | Everyone | ask to change their own display name (core) or email (next tier); it takes effect once approved from above | `account.change_self` | own account |
 
@@ -92,9 +92,9 @@ stateDiagram-v2
 | `POST /users` | `user.manage` | create an account (name, email, home department) |
 | `PATCH /users/{id}` | `user.manage`, above the person | change name, email, or home department |
 | `POST /users/{id}/deactivate`, `POST /users/{id}/reactivate` | `user.manage`, above the person | change account state |
-| `GET /roles` | `role.view` | list roles and what they grant |
+| `GET /roles` | `role.view` (company) | list roles and everything each grants |
 | `POST /roles`, `PATCH /roles/{id}`, `POST /roles/{id}/archive` | `role.manage` (delegation limits) | create, change, archive |
-| `GET /role-assignments?user_id=` | `role.view` | a person's roles and scopes |
+| `GET /role-assignments?user_id=` | `user.view`, the person in scope | a person's roles and scopes |
 | `POST /role-assignments` | `role.assign`, above the person | give a role; answers **201** when it takes effect, **202** with an approval request when it needs approval from above |
 | `DELETE /role-assignments/{id}` | `role.assign`, above the person | remove a role |
 | `GET /reporting-lines?user_id=` | `user.view` | a person's managers and reports |
