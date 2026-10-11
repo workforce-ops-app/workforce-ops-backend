@@ -3,7 +3,7 @@
 from app.authz.registry import Kind, PermissionDef
 
 PERMISSIONS = [
-    PermissionDef("time_off.request", Kind.SELF, "Ask for time off for yourself"),
+    PermissionDef("time_off.request_self", Kind.SELF, "Ask for time off for yourself"),
     PermissionDef("time_off.cancel_self", Kind.SELF, "Cancel your own time-off request"),
     PermissionDef("time_off.view", Kind.RECORD, "See time-off requests of people in scope"),
     PermissionDef(

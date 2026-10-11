@@ -166,7 +166,7 @@ def test_the_session_lists_the_persons_permissions(signin: SignInSetup) -> None:
         [
             "schedule.view_self",
             "schedule.view",
-            "time_off.request",
+            "time_off.request_self",
             "time_off.cancel_self",
             "account.change_self",
         ]

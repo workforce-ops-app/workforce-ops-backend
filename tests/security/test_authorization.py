@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from app.authz import registry
 from app.authz.check import Forbidden, NotFound, authorize, effective_permissions, scope_filter
-from app.authz.models import RoleAssignment
+from app.authz.models import Role, RoleAssignment, RolePermission
 from app.authz.registry import Kind, PermissionDef
 from app.authz.scope import ScopeColumns
 from app.modules.org.models import User
@@ -148,13 +148,32 @@ def test_self_permissions_cover_only_your_own_records(org: Org) -> None:
 # --- Company permissions: a company-wide assignment ------------------------------------
 
 
+def role_reader_for_kitchen(org: Org) -> None:
+    """Give the chef a custom role granting role.view, but only for Kitchen. (The starting
+    Manager role no longer includes role.view, since it could never take effect there.)"""
+    with org.a() as db:
+        reader = Role(name="Role Reader")
+        db.add(reader)
+        db.flush()
+        db.add(RolePermission(role_id=reader.id, permission_code="role.view"))
+        db.add(
+            RoleAssignment(
+                user_id=org.ids["chef"],
+                role_id=reader.id,
+                scope_type="department",
+                department_id=org.ids["kitchen"],
+            )
+        )
+        db.commit()
+
+
 def test_company_permissions_need_a_company_wide_assignment(org: Org) -> None:
     assert allowed(org, "admin", "settings.manage")
     assert allowed(org, "owner", "company.transfer_ownership")
     # Administrators hold everything except the owner-only permission.
     assert not allowed(org, "admin", "company.transfer_ownership")
-    # A manager holds role.view, but only for a department: not enough for a company
-    # permission.
+    # Holding role.view only for a department is not enough for a company permission.
+    role_reader_for_kitchen(org)
     assert not allowed(org, "chef", "role.view")
 
 
@@ -238,6 +257,7 @@ def test_the_list_filter_agrees_with_authorize_for_every_pair(org: Org, code: st
 def test_a_company_permission_lists_everything_or_nothing(org: Org) -> None:
     # role.view is a company permission: the admin (company-wide) sees every row; the chef
     # holds it only for Kitchen, which is not enough, so sees none (as authorize() says).
+    role_reader_for_kitchen(org)
     assert len(visible(org, "admin", "role.view")) == 9
     assert visible(org, "chef", "role.view") == set()
 

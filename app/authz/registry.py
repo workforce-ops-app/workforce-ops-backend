@@ -94,12 +94,15 @@ def all_permissions() -> dict[str, PermissionDef]:
         code = permission.code
         if not _CODE.match(code) or len(code) > 100:
             raise ValueError(f"permission {code!r} must be resource.action in lowercase")
-        # A name ending in "_self" promises "only your own records", so it must be a self
-        # permission: a name may never hide wider access than it suggests. (Some self
-        # permissions, such as time_off.request, have no suffix; that only makes their name
-        # less specific, never misleading.)
+        # The name and the kind must agree, both ways (decision 0024):
+        # - a name ending in "_self" promises "only your own records", so it must be a self
+        #   permission: a name may never hide wider access than it suggests;
+        # - a self permission must end in "_self", so anyone reading a role's list can tell
+        #   which permissions only ever reach the person's own records.
         if code.endswith("_self") and permission.kind is not Kind.SELF:
             raise ValueError(f"permission {code!r} ends in _self, so it must be a self permission")
+        if permission.kind is Kind.SELF and not code.endswith("_self"):
+            raise ValueError(f"permission {code!r} is a self permission, so it must end in _self")
         if code in registry:
             raise ValueError(f"permission {code!r} is declared twice")
         registry[code] = permission

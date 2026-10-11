@@ -17,7 +17,7 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 
 ## Permissions
 
-**Naming:** `resource.action`, lowercase. A permission whose name ends in `_self` is always a self permission and only ever applies to the user's own records (the registry refuses anything else). Some self permissions, such as `time_off.request`, have no suffix; their kind still makes them self-only. Each module declares its permissions in its `permissions.py`, and the registry collects them ([extension points](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0012-extensibility-patterns.md)).
+**Naming:** `resource.action`, lowercase. A permission's name and kind agree both ways ([0024](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md)): a name ending in `_self` is always a self permission and only ever applies to the user's own records, and every self permission ends in `_self` (for example `time_off.request_self`). The registry refuses a permission that breaks either rule, so the API does not start. Each module declares its permissions in its `permissions.py`, and the registry collects them ([extension points](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0012-extensibility-patterns.md)). `sync_permissions()` copies the registry into the `permissions` table. It runs when a company's starting roles are created, and the role-management service (Z4) calls it in the same transaction before it checks or adds a role's grants, so a permission added by a new module can be granted by existing companies without reseeding.
 
 **Kinds of permission**, which decide how a check works:
 
@@ -35,7 +35,7 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 | `schedule.view_self` | self | see your own shifts |
 | `schedule.view` | record | see shifts in scope, including open shifts |
 | `schedule.edit` | record | create, change, and cancel shifts in scope |
-| `time_off.request` | self | ask for time off for yourself |
+| `time_off.request_self` | self | ask for time off for yourself |
 | `time_off.cancel_self` | self | cancel your own pending or approved request |
 | `time_off.view` | record | see time-off requests of people in scope |
 | `time_off.review` | person | approve or deny the requests of people you are above ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)) |
@@ -63,13 +63,13 @@ Every new company gets four roles ([0024](https://github.com/workforce-ops-app/.
 | `schedule.view_self` | yes | yes | yes | yes |
 | `schedule.view` | yes | yes | yes | yes (see below) |
 | `schedule.edit` | yes | yes | yes | |
-| `time_off.request`, `time_off.cancel_self` | yes | yes | yes | yes |
+| `time_off.request_self`, `time_off.cancel_self` | yes | yes | yes | yes |
 | `time_off.view`, `time_off.review` | yes | yes | yes | |
 | `user.view` | yes | yes | yes | |
 | `account.change_self` | yes | yes | yes | yes |
 | `user.manage` | yes | yes | | |
 | `org.manage` | yes | yes | | |
-| `role.view` | yes | yes | yes | |
+| `role.view` | yes | yes | | |
 | `role.manage`, `role.assign` | yes | yes | | |
 | `reporting_line.manage` | yes | yes | | |
 | `settings.manage` | yes | yes | | |
@@ -109,7 +109,7 @@ flowchart TD
 | Assignment scope | Covers |
 |---|---|
 | company | everything in the company |
-| department | the department, its teams, the people whose home department it is, and their records |
+| department | the department, its teams (as records), the people whose home department it is, and their records. Not a member of one of its teams whose home is another department: authority over that person needs a team-scoped assignment, so team membership never quietly widens a department manager's reach |
 | team | the team's members and their records |
 | employee | that one person and their records |
 
