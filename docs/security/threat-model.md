@@ -109,6 +109,7 @@ Each row names the threat, who could carry it out, the protection (with the deci
 | I3 | Finding out which records, people, or email addresses exist | P1, P2, P3 | IDs are not guessable (UUIDv7); other companies' records answer 404; sign-in gives the same error for an unknown email and a wrong password | tests compare responses for existing and missing records and accounts |
 | I4 | Error messages that reveal internals (stack traces, SQL) | P1 | one error format that never includes internal details ([0026](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0026-api-conventions.md)) | tests with malformed input; ZAP |
 | I5 | Leaking password hashes, tokens, or secrets | P1, P4 | Argon2id; session and link tokens stored only as hashes; secrets never committed (secret scanning in CI and git hooks); logs contain no personal details ([0031](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0031-demo-environment-and-data.md)) | secret scan; log review in audits |
+| I6 | Personal data left in the browser's cache on a shared computer, readable after signing out | P1, P2 | every API answer says `Cache-Control: no-store` (`app/core/caching.py`); the frontend never keeps the session in browser storage | test that every kind of answer carries the header |
 
 ### Denial of service: making the application unusable
 
@@ -154,7 +155,7 @@ The audits follow the applicable areas of OWASP ASVS Level 2 (0030):
 | Cryptography | T4, I5 |
 | Error handling and logging | I4, R1, R2 |
 | API and web service | T2, D2 |
-| Configuration (headers, secrets) | S2, I5 |
+| Configuration (headers, secrets) | S2, I5, I6 |
 
 ## Known limits
 
