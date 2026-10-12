@@ -172,6 +172,20 @@ def test_times_must_make_sense(shifts: ShiftSetup) -> None:
     assert chef.post("/api/shifts", json=exactly_12).status_code == 201
 
 
+def test_a_future_shift_cannot_be_moved_into_the_past(shifts: ShiftSetup) -> None:
+    chef = shifts.browser("chef")
+    item = shifts.new_shift()
+    url = f"/api/shifts/{item['id']}"
+    # A valid 2-hour shift three days ago: refused the same way as creating it there (422).
+    into_past = {"starts_at": iso(soon(-3)), "ends_at": iso(soon(-3) + timedelta(hours=2))}
+    response = chef.patch(url, json=into_past)
+    assert response.status_code == 422
+    assert response.json()["detail"] == "A shift cannot end in the past."
+    # Nothing was saved: the shift still has its future times.
+    kept = chef.get(url).json()
+    assert (kept["starts_at"], kept["ends_at"]) == (item["starts_at"], item["ends_at"])
+
+
 def test_nobody_is_booked_twice_at_the_same_time(shifts: ShiftSetup) -> None:
     chef = shifts.browser("chef")
     first = shifts.new_shift(employee_id=shifts.ids["ana"])  # tomorrow 14:00 to 20:00
