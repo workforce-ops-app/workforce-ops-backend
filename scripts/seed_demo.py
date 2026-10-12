@@ -6,10 +6,15 @@ For local work, the tests, and the demos (decision 0031, docs/features/organizat
 The two companies are built alike on purpose (same department and team names, the same
 kinds of people), so a leak from one company into the other is obvious in tests and demos.
 
-- Gives the same result on every run: a company that already exists is left alone, so
-  running the script twice changes nothing.
-- Creates each company all or nothing (one transaction): if a step fails, nothing of that
-  company is kept, so the next run builds it again from the start.
+- Gives the same result on every run: it only adds what is missing. A company that already
+  exists keeps its structure; it only gains passwords for accounts without one and its
+  shifts, if an earlier run could not add them yet. After that, a run changes nothing.
+- Seeds each company in three steps, each all or nothing (its own transaction): the
+  structure (departments, teams, people, roles), the missing demo passwords, then all of
+  the shifts with their audit entries. If a step fails, nothing of that step is kept and
+  the steps before it stay: a failed first step leaves no company, so the next run builds
+  it from the start; a refused shift keeps no shifts, but the company and its passwords
+  stay. The steps are separate on purpose, so passwords and shifts can come on a later run.
 - Refuses to run against a production database (APP_ENV=production).
 - Uses the reserved example.com and example.org email domains.
 - Creates companies the only way the design allows: from a session with no company
@@ -21,16 +26,31 @@ without a password gets that one, checked against the password rules and hashed 
 Argon2id like any other (app/auth/passwords.py). Without it, the accounts have no password
 and cannot sign in. The password itself is never written in the repository.
 
-Each person gets the role recorded below (Z1), with the starting roles; SD1 adds two
-weeks of shifts. Reporting lines follow after the midterm (Z2).
+Each person gets the role recorded below (Z1), with the starting roles. Each company then
+gets two weeks of shifts (SD1), from the day the script runs (in the company's time zone)
+for 14 days, so the demo always has a schedule ahead.
+
+The shifts are created the way a manager creates them in the application: through the
+schedules service (create_shift), acting as the demo manager who plans each one. So every
+demo shift passes the same permission check (authorize()) and the same rules (times, who
+can be assigned, no double booking, not already ended), and is written to the audit log
+under that manager's name, exactly like one made on the website. If the rules change, the
+demo data follows without changes here; if a demo shift breaks a rule, the script stops
+and says which one. The shifts are added once: a company that already has shifts is left
+alone. They wait until everyone they need has a password, because the application never
+assigns a shift to someone who has not set up their account. Reporting lines follow after
+the midterm (Z2).
 """
 
 from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import Engine, create_engine, select
+from fastapi import HTTPException
+from sqlalchemy import Engine, create_engine, func, select
 from sqlalchemy.orm import Session
 
 from app.audit import Actor
@@ -39,6 +59,10 @@ from app.authz.roles import assign_role, create_starting_roles
 from app.core.config import get_settings
 from app.db.base import utcnow
 from app.modules.org.models import Company, Department, Team, TeamMember, User
+from app.modules.schedules import repository as shift_repository
+from app.modules.schedules.models import Shift
+from app.modules.schedules.schemas import ShiftCreate
+from app.modules.schedules.service import create_shift
 from app.tenancy.context import set_company
 
 
@@ -52,6 +76,9 @@ class Person:
     # The starting role this person gets once roles exist (Z1): owner, administrator,
     # manager, or employee.
     role: str
+    # For a manager of one team only: that team. None: a manager of their whole home
+    # department.
+    manages: str | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +114,8 @@ DEMO_COMPANIES = (
             Person("Diego Ruiz", "Front of House", ("Hosts",), "employee"),
             # On no team: only their home department.
             Person("Ella Novak", "Front of House", (), "employee"),
+            # Manages one team only: the Weekend Crew's shifts, nothing else in the Kitchen.
+            Person("Felix Grant", "Kitchen", ("Weekend Crew",), "manager", "Weekend Crew"),
         ),
     ),
     CompanyPlan(
@@ -102,9 +131,102 @@ DEMO_COMPANIES = (
             Person("Lena Fischer", "Kitchen", ("Weekend Crew",), "employee"),
             Person("Mateo Silva", "Front of House", ("Hosts",), "employee"),
             Person("Nora Quinn", "Front of House", (), "employee"),
+            Person("Owen Park", "Kitchen", ("Weekend Crew",), "manager", "Weekend Crew"),
         ),
     ),
 )
+
+
+# Who works the demo shifts, by their place in each company's list of people above. Both
+# companies list their people in the same order, so the same pattern gives both the same
+# schedule with different names (a leak between them stays obvious).
+KITCHEN_MANAGER = 2  # Ana Diaz / Isabel Cruz
+FRONT_MANAGER = 3  # Priya Shah / Jamal Brooks
+KITCHEN_A = 4  # Ben Okafor / Kai Tanaka
+KITCHEN_B = 5  # Cara Lund / Lena Fischer
+FRONT_A = 6  # Diego Ruiz / Mateo Silva
+FRONT_B = 7  # Ella Novak / Nora Quinn
+CREW_LEAD = 8  # Felix Grant / Owen Park: manager of the Weekend Crew only
+
+# Who plans a department's shifts, unless a shift names someone else.
+DEPARTMENT_MANAGER = {"Kitchen": KITCHEN_MANAGER, "Front of House": FRONT_MANAGER}
+
+
+@dataclass(frozen=True)
+class ShiftPlan:
+    """One demo shift in the weekly pattern, in the workplace's local time."""
+
+    weekday: int  # 0 is Monday
+    department: str
+    start: str  # "HH:MM", local time
+    end: str  # "HH:MM", local time, on the same day
+    worker: int | None  # an index into the company's people; None for an open shift
+    details: str
+    # Extra text, only in the first week, so the screens show notes and events.
+    notes: str | None = None
+    event_name: str | None = None
+    event_description: str | None = None
+    # Who creates the shift in the application: an index into the company's people. None:
+    # the department's manager (DEPARTMENT_MANAGER).
+    planner: int | None = None
+
+
+# One week of shifts, used for both demo weeks. It covers what the demo and the security
+# tests need: shifts in two departments, open shifts, a note, an event, and people with
+# several shifts. No person ever has two shifts at the same time, and none is longer than
+# 12 hours: the same rules the application enforces (and checks while seeding).
+#
+# Each shift is created by a manager whose scope covers it, as authorize() requires: the
+# department managers plan their departments, and the Weekend Crew lead plans the crew's
+# Saturday shifts. The lead could not create Sunday's open Kitchen shift: an open shift
+# belongs to its department alone, outside one team's scope (schedules/scope.py), so the
+# Kitchen manager plans that one.
+WEEK_PATTERN = (
+    # Kitchen
+    ShiftPlan(0, "Kitchen", "07:00", "15:00", KITCHEN_MANAGER, "Prep line"),
+    ShiftPlan(0, "Kitchen", "15:00", "23:00", KITCHEN_A, "Grill"),
+    ShiftPlan(1, "Kitchen", "07:00", "15:00", KITCHEN_B, "Prep line"),
+    ShiftPlan(1, "Kitchen", "15:00", "23:00", KITCHEN_A, "Grill"),
+    ShiftPlan(
+        2,
+        "Kitchen",
+        "07:00",
+        "15:00",
+        KITCHEN_MANAGER,
+        "Prep line",
+        notes="Deliveries arrive at 8; check the produce order against the invoice.",
+    ),
+    ShiftPlan(2, "Kitchen", "15:00", "23:00", KITCHEN_B, "Grill"),
+    ShiftPlan(3, "Kitchen", "07:00", "15:00", KITCHEN_B, "Prep line"),
+    ShiftPlan(3, "Kitchen", "15:00", "23:00", None, "Grill"),
+    ShiftPlan(4, "Kitchen", "07:00", "15:00", KITCHEN_MANAGER, "Prep line"),
+    ShiftPlan(
+        4,
+        "Kitchen",
+        "16:00",
+        "23:30",
+        KITCHEN_A,
+        "Grill",
+        event_name="Inventory night",
+        event_description="Count the walk-in and dry storage after close.",
+    ),
+    # Saturday: both workers are on the Weekend Crew, so its lead plans their shifts.
+    ShiftPlan(5, "Kitchen", "09:00", "17:00", KITCHEN_B, "Prep line", planner=CREW_LEAD),
+    ShiftPlan(5, "Kitchen", "15:00", "23:00", KITCHEN_A, "Grill", planner=CREW_LEAD),
+    ShiftPlan(6, "Kitchen", "10:00", "18:00", None, "Prep line"),
+    # Front of House
+    ShiftPlan(0, "Front of House", "10:00", "18:00", FRONT_MANAGER, "Host"),
+    ShiftPlan(1, "Front of House", "10:00", "18:00", FRONT_A, "Host"),
+    ShiftPlan(2, "Front of House", "16:00", "22:00", FRONT_B, "Host"),
+    ShiftPlan(3, "Front of House", "10:00", "18:00", FRONT_MANAGER, "Host"),
+    ShiftPlan(4, "Front of House", "16:00", "22:00", FRONT_A, "Host"),
+    ShiftPlan(5, "Front of House", "10:00", "18:00", FRONT_A, "Host"),
+    ShiftPlan(5, "Front of House", "16:00", "22:00", None, "Host"),
+    ShiftPlan(6, "Front of House", "10:00", "18:00", FRONT_B, "Host"),
+)
+
+# How many days of shifts each company gets, starting on the day the script runs.
+DEMO_DAYS = 14
 
 
 def email_for(person: Person, domain: str) -> str:
@@ -181,8 +303,9 @@ def _seed_inside_company(session: Session, plan: CompanyPlan) -> None:
 
     # The starting roles, and each person's roles (authorization.md, typical scopes):
     # everyone is an Employee of their home department; owners and administrators hold
-    # their role for the whole company; managers for their home department. Created by
-    # the system (platform code), and audited like any role change.
+    # their role for the whole company; managers for their home department, or for the one
+    # team they manage. Created by the system (platform code), and audited like any role
+    # change.
     roles = create_starting_roles(session, Actor.system())
     for person in plan.people:
         user = users[person.name]
@@ -202,6 +325,16 @@ def _seed_inside_company(session: Session, plan: CompanyPlan) -> None:
                 role=roles[person.role],
                 scope_type="company",
             )
+        elif person.role == "manager" and person.manages is not None:
+            # A manager of one team only.
+            assign_role(
+                session,
+                Actor.system(),
+                user_id=user.id,
+                role=roles["manager"],
+                scope_type="team",
+                scope_id=teams[person.manages].id,
+            )
         elif person.role == "manager":
             assign_role(
                 session,
@@ -215,6 +348,132 @@ def _seed_inside_company(session: Session, plan: CompanyPlan) -> None:
     # Send everything, inside the caller's transaction: closing a session drops anything
     # not yet flushed, and only the caller's transaction decides what is kept.
     session.flush()
+
+
+def local_to_utc(day: date, clock: str, timezone: str) -> datetime:
+    """A local wall-clock time on a day, as the UTC moment the database stores (without a
+    zone, like every stored moment). ZoneInfo applies that day's daylight-saving rule."""
+    hours, minutes = (int(part) for part in clock.split(":"))
+    local = datetime.combine(day, time(hours, minutes), tzinfo=ZoneInfo(timezone))
+    return local.astimezone(UTC).replace(tzinfo=None)
+
+
+class SeedRefused(RuntimeError):
+    """The application refused a demo shift: the demo data breaks a rule (a bug here)."""
+
+
+def seed_shifts(engine: Engine, plan: CompanyPlan, now: datetime | None = None) -> int | None:
+    """Give a company two weeks of shifts, unless it already has some. Returns how many
+    shifts were added: 0 if it had shifts already, None if they have to wait because
+    someone they need has no password yet or is deactivated.
+
+    The shifts run from today (in the company's time zone) for DEMO_DAYS days, following
+    WEEK_PATTERN by weekday. Each is created through the schedules service, as the manager
+    who plans it (see the top of this file). A shift that has already ended at this moment
+    is skipped (for example the 7:00 to 15:00 shift when the script runs at 16:00): the
+    service would refuse it, so that nobody can write the past in after the fact. Seeded a
+    few days before a demo, the start of the demo week then holds shifts that were planned
+    ahead and have since happened, as in real use.
+
+    now is the current moment (with a time zone); tests pass a fixed one. All or nothing,
+    like the company itself: every shift and its audit entry are saved in one transaction,
+    and if the service refuses any shift, none is kept (SeedRefused says which one).
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    # Find the company, as platform code (no company on the session).
+    with Session(engine) as platform:
+        company_id = platform.scalars(select(Company.id).where(Company.name == plan.name)).one()
+
+    # One transaction for all of this company's shifts. The service commits after each
+    # shift, as it does for a request; "rollback_only" keeps those commits inside this
+    # transaction, which engine.begin() commits only at the end (or rolls back entirely).
+    with (
+        engine.begin() as connection,
+        Session(connection, join_transaction_mode="rollback_only") as session,
+    ):
+        set_company(session, company_id)
+        # Already has shifts (an earlier run): leave them as they are. Counting a column of
+        # the model lets the company filter apply.
+        if session.scalar(select(func.count(Shift.company_id))):
+            return 0
+
+        departments = {d.name: d for d in session.scalars(select(Department))}
+        people = {u.display_name: u for u in session.scalars(select(User))}
+
+        # Everyone the pattern needs: the people who work the shifts and the managers who
+        # plan them. The application only assigns shifts to someone who has set up their
+        # account (has a password) and is not deactivated, and a deactivated manager holds
+        # no permissions. Until all of them are ready, add none.
+        needed = {
+            index
+            for item in WEEK_PATTERN
+            for index in (item.worker, _planner(item))
+            if index is not None
+        }
+        # A company seeded by an older version of this script may lack someone the pattern
+        # now needs; the script never changes an existing company, so say how to rebuild it.
+        missing = sorted(plan.people[i].name for i in needed if plan.people[i].name not in people)
+        if missing:
+            raise SeedRefused(
+                f"{plan.name} was seeded before {', '.join(missing)} joined the demo data; "
+                "reset the database and seed again"
+            )
+        for index in needed:
+            person = people[plan.people[index].name]
+            if person.password_hash is None or person.deactivated_at is not None:
+                return None
+
+        # Today in the company's time zone, and the moment the stored times compare with.
+        today = now.astimezone(ZoneInfo(plan.timezone)).date()
+        stored_now = now.astimezone(UTC).replace(tzinfo=None)
+
+        added = 0
+        for offset in range(DEMO_DAYS):
+            day = today + timedelta(days=offset)
+            for item in WEEK_PATTERN:
+                if item.weekday != day.weekday():
+                    continue
+                department = departments[item.department]
+                # The wall-clock times are in the workplace zone, worked out the way the
+                # service does it: the department's own, or else the company's.
+                zone = shift_repository.workplace_zone(session, department)
+                starts_at = local_to_utc(day, item.start, zone)
+                ends_at = local_to_utc(day, item.end, zone)
+                # Already over (earlier today): skip it, as the service would refuse it.
+                if ends_at <= stored_now:
+                    continue
+                worker = None if item.worker is None else people[plan.people[item.worker].name]
+                planner = people[plan.people[_planner(item)].name]
+                # Notes and events only the first time a weekday comes round.
+                first_week = offset < 7
+                # The same request body the website sends (times as moments with an offset).
+                body = ShiftCreate(
+                    department_id=department.id,
+                    employee_id=worker.id if worker else None,
+                    starts_at=starts_at.replace(tzinfo=UTC),
+                    ends_at=ends_at.replace(tzinfo=UTC),
+                    details=item.details,
+                    notes=item.notes if first_week else None,
+                    event_name=item.event_name if first_week else None,
+                    event_description=item.event_description if first_week else None,
+                )
+                try:
+                    create_shift(session, planner, body)
+                except HTTPException as refused:
+                    # Name the shift, so a broken pattern is easy to find and fix.
+                    raise SeedRefused(
+                        f"{plan.name}: {item.department} {day} {item.start}-{item.end}, "
+                        f"planned by {planner.display_name}: "
+                        f"{refused.status_code} {refused.detail}"
+                    ) from refused
+                added += 1
+        return added
+
+
+def _planner(item: ShiftPlan) -> int:
+    """Who creates a shift: its own planner, or else its department's manager."""
+    return item.planner if item.planner is not None else DEPARTMENT_MANAGER[item.department]
 
 
 def check_demo_password(password: str) -> None:
@@ -253,9 +512,12 @@ def set_demo_passwords(engine: Engine, plan: CompanyPlan, password: str) -> int:
         return len(users)
 
 
-def seed(engine: Engine, demo_password: str | None = None) -> list[str]:
-    """Create every demo company that does not exist yet, and give accounts without a
-    password the demo password if one is given; one line per company."""
+def seed(
+    engine: Engine, demo_password: str | None = None, now: datetime | None = None
+) -> list[str]:
+    """Create every demo company that does not exist yet, give accounts without a password
+    the demo password if one is given, then add the shifts from now on; one line per
+    company. now is the current moment; tests pass a fixed one."""
     # Check the demo password first, so a weak one changes nothing at all.
     if demo_password is not None:
         check_demo_password(demo_password)
@@ -264,11 +526,19 @@ def seed(engine: Engine, demo_password: str | None = None) -> list[str]:
     for plan in DEMO_COMPANIES:
         created = seed_company(engine, plan)
         state = "created" if created else "already there"
+
+        # Passwords before shifts: shifts only go to people who have one.
         if demo_password is None:
-            lines.append(f"{plan.name}: {state}; no DEMO_PASSWORD, so no one can sign in")
-            continue
-        given = set_demo_passwords(engine, plan, demo_password)
-        lines.append(f"{plan.name}: {state}; demo password set for {given} accounts")
+            passwords = "no DEMO_PASSWORD, so no one can sign in"
+        else:
+            given = set_demo_passwords(engine, plan, demo_password)
+            passwords = f"demo password set for {given} accounts"
+
+        # Shifts last, so a company seeded before shifts existed, or before it had
+        # passwords, gets them on the next run.
+        added = seed_shifts(engine, plan, now)
+        shifts = "shifts wait for passwords" if added is None else f"{added} shifts added"
+        lines.append(f"{plan.name}: {state}; {passwords}; {shifts}")
     return lines
 
 
@@ -294,6 +564,10 @@ def main() -> int:
     try:
         for line in seed(engine, demo_password):
             print(line)
+    except SeedRefused as refused:
+        # None of that company's shifts were kept; the lines before it were printed.
+        print(f"demo shift refused: {refused}")
+        return 1
     finally:
         engine.dispose()
     return 0

@@ -1,11 +1,14 @@
-"""The demo seed script (scripts/seed_demo.py): two alike companies, same result every run.
+"""The demo seed script (scripts/seed_demo.py): two alike companies with two weeks of
+shifts, same result every run.
 
-Runs on SQLite in memory with the org tables, the way the script runs on MySQL.
+Runs on SQLite in memory with the org and shift tables, the way the script runs on MySQL.
 """
 
 import uuid
 from collections.abc import Iterator
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from argon2 import PasswordHasher
@@ -19,12 +22,14 @@ from app.authz.models import Permission, Role, RoleAssignment, RolePermission
 from app.core.config import get_settings
 from app.db.base import Base
 from app.modules.org.models import Company, Department, Team, TeamMember, User
+from app.modules.schedules import service as shift_service
+from app.modules.schedules.models import Shift
 from app.tenancy.context import set_company
 from scripts import seed_demo
 from tests.audit_data import TEST_KEY, use_key
 
-# The tables the seed fills: the company's structure and people, its roles, and the audit
-# log their creation is written to.
+# The tables the seed fills: the company's structure and people, its roles, its shifts, and
+# the audit log their creation is written to.
 ORG_TABLES = [
     model.__table__
     for model in (
@@ -39,15 +44,41 @@ ORG_TABLES = [
         RoleAssignment,
         AuditChainHead,
         AuditEvent,
+        Shift,
     )
 ]
 
+# The moment the tests seed at: Monday, October 5, 2026, before any shift starts in either
+# company (1:00 in Chicago, midnight in Denver), so every shift of the two weeks is ahead.
+NOW = datetime(2026, 10, 5, 6, 0, tzinfo=UTC)
+# Fourteen days from a Monday: the weekly pattern twice.
+SHIFTS_PER_COMPANY = 2 * len(seed_demo.WEEK_PATTERN)
+# Parts of the summary line the script prints for each company.
+ADDED = f"{SHIFTS_PER_COMPANY} shifts added"
+NO_PASSWORD = "no DEMO_PASSWORD, so no one can sign in"
+WAITING = "shifts wait for passwords"
+
 DEMO_PASSWORD = "a calm river bends at dusk"
+# People in each demo company.
+PEOPLE = 9
+
+
+def stored(moment: datetime) -> datetime:
+    """A moment as the database stores it: UTC without a zone."""
+    return moment.astimezone(UTC).replace(tzinfo=None)
+
+
+@pytest.fixture(autouse=True)
+def service_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The schedules service checks "has this shift already ended?" against the real
+    clock. The tests seed at a fixed moment (NOW), so the service's clock is set to it too;
+    a test that seeds at another moment sets both."""
+    monkeypatch.setattr(shift_service, "utcnow", lambda: stored(NOW))
 
 
 @pytest.fixture(autouse=True)
 def quick_hashing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Cheap Argon2 settings for these tests, so hashing 16 accounts takes no time. The
+    """Cheap Argon2 settings for these tests, so hashing 18 accounts takes no time. The
     real settings are tested in tests/unit/test_passwords.py."""
     monkeypatch.setattr(
         passwords, "_hasher", PasswordHasher(time_cost=1, memory_cost=8, parallelism=1)
@@ -90,11 +121,11 @@ def count(engine: Engine, company_id: uuid.UUID, model: type) -> int:
 
 
 def test_it_creates_two_alike_companies(engine: Engine) -> None:
-    lines = seed_demo.seed(engine)
+    lines = seed_demo.seed(engine, now=NOW)
 
     assert lines == [
-        "Northwind Cafe: created; no DEMO_PASSWORD, so no one can sign in",
-        "Summit Outfitters: created; no DEMO_PASSWORD, so no one can sign in",
+        f"Northwind Cafe: created; {NO_PASSWORD}; {WAITING}",
+        f"Summit Outfitters: created; {NO_PASSWORD}; {WAITING}",
     ]
     ids = company_ids(engine)
     assert set(ids) == {"Northwind Cafe", "Summit Outfitters"}
@@ -103,8 +134,8 @@ def test_it_creates_two_alike_companies(engine: Engine) -> None:
     for company_id in ids.values():
         assert count(engine, company_id, Department) == 3
         assert count(engine, company_id, Team) == 4
-        assert count(engine, company_id, User) == 8
-        assert count(engine, company_id, TeamMember) == 8
+        assert count(engine, company_id, User) == PEOPLE
+        assert count(engine, company_id, TeamMember) == PEOPLE
 
     # And the same department names, so a leak between the two is obvious.
     names = []
@@ -116,16 +147,17 @@ def test_it_creates_two_alike_companies(engine: Engine) -> None:
 
 
 def test_running_it_twice_changes_nothing(engine: Engine) -> None:
-    seed_demo.seed(engine)
-    lines = seed_demo.seed(engine)
+    seed_demo.seed(engine, DEMO_PASSWORD, NOW)
+    lines = seed_demo.seed(engine, DEMO_PASSWORD, NOW)
 
     assert lines == [
-        "Northwind Cafe: already there; no DEMO_PASSWORD, so no one can sign in",
-        "Summit Outfitters: already there; no DEMO_PASSWORD, so no one can sign in",
+        "Northwind Cafe: already there; demo password set for 0 accounts; 0 shifts added",
+        "Summit Outfitters: already there; demo password set for 0 accounts; 0 shifts added",
     ]
     assert len(company_ids(engine)) == 2
     for company_id in company_ids(engine).values():
-        assert count(engine, company_id, User) == 8
+        assert count(engine, company_id, User) == PEOPLE
+        assert count(engine, company_id, Shift) == SHIFTS_PER_COMPANY
 
 
 def test_a_failure_part_way_leaves_nothing_behind_and_a_rerun_completes(
@@ -139,7 +171,7 @@ def test_a_failure_part_way_leaves_nothing_behind_and_a_rerun_completes(
     real_email_for = seed_demo.email_for
     monkeypatch.setattr(seed_demo, "email_for", broken_email)
     with pytest.raises(RuntimeError, match="simulated"):
-        seed_demo.seed(engine)
+        seed_demo.seed(engine, now=NOW)
 
     # Nothing was saved, not even the company row: otherwise the next run would find the
     # name, report "already there", and never finish the company.
@@ -148,18 +180,18 @@ def test_a_failure_part_way_leaves_nothing_behind_and_a_rerun_completes(
     # Once the cause is gone, the next run creates both companies completely.
     # (Only this one patch is undone: the signing key from the fixture stays set.)
     monkeypatch.setattr(seed_demo, "email_for", real_email_for)
-    lines = seed_demo.seed(engine)
+    lines = seed_demo.seed(engine, now=NOW)
     assert [line.split(";")[0] for line in lines] == [
         "Northwind Cafe: created",
         "Summit Outfitters: created",
     ]
     for company_id in company_ids(engine).values():
         assert count(engine, company_id, Department) == 3
-        assert count(engine, company_id, User) == 8
+        assert count(engine, company_id, User) == PEOPLE
 
 
 def test_emails_use_the_reserved_domains(engine: Engine) -> None:
-    seed_demo.seed(engine)
+    seed_demo.seed(engine, now=NOW)
     ids = company_ids(engine)
 
     with Session(engine) as session:
@@ -187,11 +219,11 @@ def all_users(engine: Engine) -> list[User]:
 
 
 def test_a_demo_password_is_hashed_for_every_account(engine: Engine) -> None:
-    lines = seed_demo.seed(engine, DEMO_PASSWORD)
+    lines = seed_demo.seed(engine, DEMO_PASSWORD, NOW)
 
     assert lines == [
-        "Northwind Cafe: created; demo password set for 8 accounts",
-        "Summit Outfitters: created; demo password set for 8 accounts",
+        f"Northwind Cafe: created; demo password set for {PEOPLE} accounts; {ADDED}",
+        f"Summit Outfitters: created; demo password set for {PEOPLE} accounts; {ADDED}",
     ]
     users = all_users(engine)
     # Stored as hashes that verify, each with its own salt, never as the password itself.
@@ -202,13 +234,17 @@ def test_a_demo_password_is_hashed_for_every_account(engine: Engine) -> None:
 
 def test_a_rerun_only_fills_in_missing_passwords(engine: Engine) -> None:
     # Seeded before passwords existed, then again with DEMO_PASSWORD: the accounts get it.
-    seed_demo.seed(engine)
-    lines = seed_demo.seed(engine, DEMO_PASSWORD)
+    seed_demo.seed(engine, now=NOW)
+    lines = seed_demo.seed(engine, DEMO_PASSWORD, NOW)
     hashes = {u.id: u.password_hash for u in all_users(engine)}
 
-    assert lines[0] == "Northwind Cafe: already there; demo password set for 8 accounts"
-    # A third run changes nothing: everyone already has a password.
-    assert seed_demo.seed(engine, DEMO_PASSWORD)[0].endswith("demo password set for 0 accounts")
+    assert lines[0] == (
+        f"Northwind Cafe: already there; demo password set for {PEOPLE} accounts; {ADDED}"
+    )
+    # A third run changes nothing: everyone already has a password, and the shifts exist.
+    assert seed_demo.seed(engine, DEMO_PASSWORD, NOW)[0] == (
+        "Northwind Cafe: already there; demo password set for 0 accounts; 0 shifts added"
+    )
     assert {u.id: u.password_hash for u in all_users(engine)} == hashes
 
 
@@ -230,6 +266,31 @@ def test_the_people_cover_the_cases_later_slices_need() -> None:
         # Someone on two teams, and someone on none.
         assert any(len(t) == 2 for t in teams)
         assert any(len(t) == 0 for t in teams)
+        # A manager of a whole department, and a manager of one team only.
+        managers = [person for person in plan.people if person.role == "manager"]
+        assert any(person.manages is None for person in managers)
+        assert any(person.manages is not None for person in managers)
+
+
+def test_the_crew_lead_manages_only_their_team(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    for plan in seed_demo.DEMO_COMPANIES:
+        lead_name = plan.people[seed_demo.CREW_LEAD].name
+        with Session(engine) as session:
+            set_company(session, company_ids(engine)[plan.name])
+            lead = session.scalars(select(User).where(User.display_name == lead_name)).one()
+            crew = session.scalars(select(Team).where(Team.name == "Weekend Crew")).one()
+            manager = session.scalars(select(Role).where(Role.built_in == "manager")).one()
+            managing = [
+                (a.scope_type, a.team_id, a.department_id)
+                for a in session.scalars(
+                    select(RoleAssignment).where(
+                        RoleAssignment.user_id == lead.id, RoleAssignment.role_id == manager.id
+                    )
+                )
+            ]
+        # Manager of the Weekend Crew, and not of the Kitchen as a whole.
+        assert managing == [("team", crew.id, None)]
 
 
 def test_main_refuses_to_run_in_production(
@@ -269,6 +330,29 @@ def test_main_seeds_the_configured_database(
     assert "Northwind Cafe: created" in capsys.readouterr().out
 
 
+def test_main_reports_a_refused_demo_shift(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def refuse(*args: object, **kwargs: object) -> int:
+        raise seed_demo.SeedRefused("Northwind Cafe: Kitchen 2026-10-05 07:00-15:00: 409")
+
+    monkeypatch.chdir(tmp_path)
+    url = f"sqlite:///{(tmp_path / 'demo.db').as_posix()}"
+    setup = create_engine(url)
+    Base.metadata.create_all(setup, tables=ORG_TABLES)
+    setup.dispose()
+    monkeypatch.setattr(seed_demo, "seed_shifts", refuse)
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("DATABASE_URL", url)
+    monkeypatch.delenv("DATABASE_PASSWORD", raising=False)
+    get_settings.cache_clear()
+    try:
+        assert seed_demo.main() == 1
+    finally:
+        get_settings.cache_clear()
+    assert "demo shift refused: Northwind Cafe: Kitchen" in capsys.readouterr().out
+
+
 def test_main_refuses_a_weak_demo_password(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -282,3 +366,262 @@ def test_main_refuses_a_weak_demo_password(
     finally:
         get_settings.cache_clear()
     assert "refusing DEMO_PASSWORD" in capsys.readouterr().out
+
+
+# Shifts (SD1)
+
+
+def shifts_of(engine: Engine, company_id: uuid.UUID) -> list[Shift]:
+    """A company's shifts, in time order, read in a session working for that company."""
+    with Session(engine) as session:
+        set_company(session, company_id)
+        return list(session.scalars(select(Shift).order_by(Shift.starts_at)))
+
+
+def test_each_company_gets_two_alike_weeks_of_shifts(engine: Engine) -> None:
+    seed_demo.seed(engine, DEMO_PASSWORD, NOW)
+
+    summaries = []
+    for _name, company_id in sorted(company_ids(engine).items()):
+        shifts = shifts_of(engine, company_id)
+        with Session(engine) as session:
+            set_company(session, company_id)
+            departments = {d.id: d.name for d in session.scalars(select(Department))}
+        summaries.append(
+            (
+                len(shifts),
+                sum(s.status == "open" for s in shifts),
+                sorted({departments[s.department_id] for s in shifts}),
+            )
+        )
+        # From today, in the company's own time zone (stored moments are UTC without a
+        # zone), for 14 days.
+        zone = ZoneInfo(shifts[0].timezone)
+        first_local = shifts[0].starts_at.replace(tzinfo=UTC).astimezone(zone)
+        last_local = shifts[-1].starts_at.replace(tzinfo=UTC).astimezone(zone)
+        assert first_local.date() == NOW.astimezone(zone).date() == date(2026, 10, 5)
+        assert last_local.date() == date(2026, 10, 18)
+
+    # Built alike: the same number of shifts and open shifts, in the same two departments.
+    assert summaries[0] == summaries[1]
+    assert summaries[0] == (SHIFTS_PER_COMPANY, 6, ["Front of House", "Kitchen"])
+
+
+def test_shifts_start_at_local_times_in_each_company_zone(engine: Engine) -> None:
+    # A Monday in October (daylight-saving time in both zones).
+    for plan in seed_demo.DEMO_COMPANIES:
+        seed_demo.seed_company(engine, plan)
+        seed_demo.set_demo_passwords(engine, plan, DEMO_PASSWORD)
+        seed_demo.seed_shifts(engine, plan, NOW)
+    ids = company_ids(engine)
+
+    northwind = shifts_of(engine, ids["Northwind Cafe"])[0]
+    summit = shifts_of(engine, ids["Summit Outfitters"])[0]
+    # 7:00 in Chicago (UTC-5) and 7:00 in Denver (UTC-6), stored in UTC.
+    assert northwind.starts_at == datetime(2026, 10, 5, 12, 0)
+    assert northwind.timezone == "America/Chicago"
+    assert summit.starts_at == datetime(2026, 10, 5, 13, 0)
+    assert summit.timezone == "America/Denver"
+
+
+def test_local_times_follow_daylight_saving() -> None:
+    # Clocks in Chicago fall back on November 1, 2026: 7:00 is 12:00 UTC before, 13:00 after.
+    assert seed_demo.local_to_utc(date(2026, 10, 30), "07:00", "America/Chicago") == datetime(
+        2026, 10, 30, 12, 0
+    )
+    assert seed_demo.local_to_utc(date(2026, 11, 2), "07:00", "America/Chicago") == datetime(
+        2026, 11, 2, 13, 0
+    )
+
+
+def test_shifts_that_already_ended_are_never_created(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Seeded on Wednesday, October 7 at 16:00 in Chicago: Wednesday's 7:00 to 15:00 shift
+    # is over, so it is skipped, as the API would refuse it. The 15:00 shift has started
+    # but not ended, so it is kept.
+    wednesday_afternoon = datetime(2026, 10, 7, 21, 0, tzinfo=UTC)
+    monkeypatch.setattr(shift_service, "utcnow", lambda: stored(wednesday_afternoon))
+    plan = seed_demo.DEMO_COMPANIES[0]
+    seed_demo.seed_company(engine, plan)
+    seed_demo.set_demo_passwords(engine, plan, DEMO_PASSWORD)
+
+    added = seed_demo.seed_shifts(engine, plan, wednesday_afternoon)
+
+    shifts = shifts_of(engine, company_ids(engine)[plan.name])
+    assert added == len(shifts) == SHIFTS_PER_COMPANY - 1
+    stored_now = wednesday_afternoon.replace(tzinfo=None)
+    assert all(s.ends_at > stored_now for s in shifts)
+    # The first one kept is Wednesday's 15:00 shift (20:00 UTC).
+    assert shifts[0].starts_at == datetime(2026, 10, 7, 20, 0)
+
+
+def test_demo_shifts_follow_the_rules_the_api_enforces(engine: Engine) -> None:
+    seed_demo.seed(engine, DEMO_PASSWORD, NOW)
+
+    for company_id in company_ids(engine).values():
+        shifts = shifts_of(engine, company_id)
+        with Session(engine) as session:
+            set_company(session, company_id)
+            users = {u.id: u for u in session.scalars(select(User))}
+            homes = {u.id: u.department_id for u in users.values()}
+            team_departments: dict[uuid.UUID, set[uuid.UUID]] = {}
+            for member, department_id in session.execute(
+                select(TeamMember.user_id, Team.department_id).join(
+                    Team, Team.id == TeamMember.team_id
+                )
+            ):
+                team_departments.setdefault(member, set()).add(department_id)
+
+        for shift in shifts:
+            # At most 12 hours, ending after it starts.
+            assert timedelta(0) < shift.ends_at - shift.starts_at <= timedelta(hours=12)
+            # Open shifts have nobody; scheduled ones have someone.
+            assert (shift.status == "open") == (shift.employee_id is None)
+            # Only someone whose home department it is, or who is on a team in it, who has
+            # set up their account and is not deactivated.
+            if shift.employee_id is not None:
+                worker = users[shift.employee_id]
+                assert worker.password_hash is not None
+                assert worker.deactivated_at is None
+                allowed = {homes[shift.employee_id], *team_departments.get(shift.employee_id, ())}
+                assert shift.department_id in allowed
+
+        # Nobody is booked on two shifts at the same time.
+        by_person: dict[uuid.UUID, list[Shift]] = {}
+        for shift in shifts:
+            if shift.employee_id is not None:
+                by_person.setdefault(shift.employee_id, []).append(shift)
+        for own in by_person.values():
+            for earlier, later in zip(own, own[1:], strict=False):
+                assert earlier.ends_at <= later.starts_at
+
+
+def test_notes_and_events_appear_in_the_first_week_only(engine: Engine) -> None:
+    seed_demo.seed(engine, DEMO_PASSWORD, NOW)
+    shifts = shifts_of(engine, company_ids(engine)["Northwind Cafe"])
+    first_week_end = min(s.starts_at for s in shifts) + timedelta(days=7)
+
+    with_text = [s for s in shifts if s.notes or s.event_name]
+    assert len(with_text) == 2
+    assert all(s.starts_at < first_week_end for s in with_text)
+
+
+def test_every_demo_shift_is_in_the_audit_log_under_its_planner(engine: Engine) -> None:
+    seed_demo.seed(engine, DEMO_PASSWORD, NOW)
+
+    for plan in seed_demo.DEMO_COMPANIES:
+        company_id = company_ids(engine)[plan.name]
+        with Session(engine) as session:
+            set_company(session, company_id)
+            created = session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action == "shift.created", AuditEvent.company_id == company_id
+                )
+            ).all()
+            names = {u.id: u.display_name for u in session.scalars(select(User))}
+            departments = {d.id: d.name for d in session.scalars(select(Department))}
+        shifts = {s.id: s for s in shifts_of(engine, company_id)}
+        # Each company's entries are in that company's own chain, one per shift.
+        assert {event.target_id for event in created} == set(shifts)
+
+        # Created by a person, as on the website: the Weekend Crew lead for the crew's
+        # Saturday Kitchen shifts, the department's manager for every other shift.
+        lead = plan.people[seed_demo.CREW_LEAD].name
+        for event in created:
+            assert event.actor_type == "user"
+            shift = shifts[event.target_id]
+            local = shift.starts_at.replace(tzinfo=UTC).astimezone(ZoneInfo(shift.timezone))
+            department = departments[shift.department_id]
+            if department == "Kitchen" and local.weekday() == 5:
+                expected = lead
+            else:
+                expected = plan.people[seed_demo.DEPARTMENT_MANAGER[department]].name
+            assert names[event.actor_id] == expected  # type: ignore[index]
+
+
+def test_a_shift_the_application_refuses_stops_the_seed_and_keeps_none(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The Weekend Crew lead tries to plan an open Kitchen shift. An open shift belongs to
+    # its department alone, outside the lead's one team, so authorize() refuses it (403),
+    # as it would on the website.
+    open_by_lead = seed_demo.ShiftPlan(
+        6, "Kitchen", "10:00", "18:00", None, "Prep line", planner=seed_demo.CREW_LEAD
+    )
+    monkeypatch.setattr(seed_demo, "WEEK_PATTERN", (*seed_demo.WEEK_PATTERN, open_by_lead))
+    plan = seed_demo.DEMO_COMPANIES[0]
+    seed_demo.seed_company(engine, plan)
+    seed_demo.set_demo_passwords(engine, plan, DEMO_PASSWORD)
+
+    with pytest.raises(seed_demo.SeedRefused) as refused:
+        seed_demo.seed_shifts(engine, plan, NOW)
+
+    # The message names the shift, its planner, and the reason.
+    assert "Kitchen 2026-10-11 10:00-18:00, planned by Felix Grant: 403" in str(refused.value)
+    # All or nothing: none of the shifts before it were kept, nor their audit entries.
+    company_id = company_ids(engine)[plan.name]
+    assert count(engine, company_id, Shift) == 0
+    with Session(engine) as session:
+        set_company(session, company_id)
+        assert not session.scalars(
+            select(AuditEvent).where(AuditEvent.action == "shift.created")
+        ).first()
+
+
+def test_a_company_seeded_before_shifts_gets_them_on_the_next_run(engine: Engine) -> None:
+    # As if seeded by the script before SD1: companies and people, no shifts.
+    for plan in seed_demo.DEMO_COMPANIES:
+        seed_demo.seed_company(engine, plan)
+
+    lines = seed_demo.seed(engine, DEMO_PASSWORD, NOW)
+
+    assert lines[0] == (
+        f"Northwind Cafe: already there; demo password set for {PEOPLE} accounts; {ADDED}"
+    )
+    for company_id in company_ids(engine).values():
+        assert count(engine, company_id, Shift) == SHIFTS_PER_COMPANY
+
+
+def test_shifts_wait_until_everyone_on_them_has_a_password(engine: Engine) -> None:
+    # The API never gives a shift to someone who has not set up their account (an invited
+    # person, without a password), so the seed does not either.
+    seed_demo.seed(engine, now=NOW)
+    for company_id in company_ids(engine).values():
+        assert count(engine, company_id, Shift) == 0
+
+    # Once DEMO_PASSWORD is set, the next run adds them.
+    lines = seed_demo.seed(engine, DEMO_PASSWORD, NOW)
+    assert all(line.endswith(ADDED) for line in lines)
+
+
+@pytest.mark.parametrize("who", [seed_demo.KITCHEN_A, seed_demo.CREW_LEAD])
+def test_a_deactivated_worker_or_planner_holds_back_the_shifts(engine: Engine, who: int) -> None:
+    # A deactivated worker cannot be assigned, and a deactivated manager holds no
+    # permissions: the shifts wait instead of failing part way.
+    plan = seed_demo.DEMO_COMPANIES[0]
+    seed_demo.seed_company(engine, plan)
+    seed_demo.set_demo_passwords(engine, plan, DEMO_PASSWORD)
+    with Session(engine) as session:
+        set_company(session, company_ids(engine)[plan.name])
+        name = plan.people[who].name
+        user = session.scalars(select(User).where(User.display_name == name)).one()
+        user.deactivated_at = datetime(2026, 1, 1)
+        session.commit()
+
+    assert seed_demo.seed_shifts(engine, plan, NOW) is None
+
+
+def test_a_company_from_an_older_seed_is_told_to_reset(engine: Engine) -> None:
+    # Seeded before the Weekend Crew lead joined the demo data: the script never changes an
+    # existing company, so instead of failing part way it says how to rebuild.
+    plan = seed_demo.DEMO_COMPANIES[0]
+    older = seed_demo.CompanyPlan(
+        plan.name, plan.timezone, plan.email_domain, plan.people[: seed_demo.CREW_LEAD]
+    )
+    seed_demo.seed_company(engine, older)
+    seed_demo.set_demo_passwords(engine, older, DEMO_PASSWORD)
+
+    with pytest.raises(seed_demo.SeedRefused, match="before Felix Grant joined.*reset"):
+        seed_demo.seed_shifts(engine, plan, NOW)
+    assert count(engine, company_ids(engine)[plan.name], Shift) == 0
