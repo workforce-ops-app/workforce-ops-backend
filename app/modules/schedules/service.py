@@ -5,7 +5,8 @@ transaction as the change, and commits once at the end.
 Rules:
 - Times arrive as moments with an offset and are stored in UTC; the workplace zone (the
   department's, or the company's) is copied onto the shift and never recalculated.
-- The end is after the start, and a shift is at most 12 hours long (422).
+- The end is after the start, a shift is at most 12 hours long, and it has not ended yet,
+  whether it is created or its times are changed (422).
 - Only an active person who has set up their account, whose home department is the
   shift's department or who is on a team in it, can be assigned (422).
 - Nobody is booked on two overlapping shifts (409). The person's row is locked while this
@@ -64,10 +65,15 @@ def _utc(moment: datetime) -> datetime:
 
 
 def _check_times(starts_at: datetime, ends_at: datetime) -> None:
+    """Checked on create and on every change of times, so both refuse the same things."""
     if ends_at <= starts_at:
         raise Invalid("A shift must end after it starts.")
     if ends_at - starts_at > MAX_LENGTH:
         raise Invalid("A shift can be at most 12 hours long.")
+    # The past cannot be written in after the fact: not by creating a shift that has
+    # already ended, and not by moving a future shift back into the past.
+    if ends_at <= utcnow():
+        raise Invalid("A shift cannot end in the past.")
 
 
 def _check_changeable(shift: Shift) -> None:
@@ -129,8 +135,6 @@ def create_shift(db: Session, user: User, body: ShiftCreate) -> Shift:
     # May the user edit shifts here (this department, and this person if any)?
     authorize(db, user, "schedule.edit", item)
     _check_times(item.starts_at, item.ends_at)
-    if item.ends_at <= utcnow():
-        raise Invalid("A shift that has already ended cannot be created.")
     if body.employee_id is not None:
         _check_assignable(db, item, body.employee_id)
 

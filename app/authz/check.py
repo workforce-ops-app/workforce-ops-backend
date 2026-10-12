@@ -66,6 +66,14 @@ def grants(db: Session, user: User, code: str) -> list[Grant]:
     """The user's active assignments whose role grants this permission: where each applies."""
     if user.deactivated_at is not None:
         return []
+    # The Owner holds every permission, including ones a module adds after the company's
+    # roles were created (the Owner role is locked, so its rows are never edited to catch
+    # up). An active, company-wide Owner assignment therefore grants any registered code,
+    # everywhere. This is checked first, not only when nothing else was found: another of
+    # the owner's roles may grant the same code for one department, team, or person, and
+    # that narrower grant must not take the place of the company-wide one.
+    if is_owner(db, user):
+        return [Grant("company", None, None, None)]
     # Every joined model has a column in the select list, so the company filter sees it and
     # limits it to the session's company too (tenancy.md: joins).
     rows = db.execute(
@@ -81,13 +89,7 @@ def grants(db: Session, user: User, code: str) -> list[Grant]:
         .join(RolePermission, RolePermission.role_id == Role.id)
         .where(*_active_assignments(user), RolePermission.permission_code == code)
     )
-    found = [Grant(*row[:4]) for row in rows]
-    # The Owner holds every permission, including ones a module adds after the company's
-    # roles were created (the Owner role is locked, so its rows are never edited to catch
-    # up). An active, company-wide Owner assignment therefore grants any registered code.
-    if not found and is_owner(db, user):
-        found = [Grant("company", None, None, None)]
-    return found
+    return [Grant(*row[:4]) for row in rows]
 
 
 def effective_permissions(db: Session, user: User) -> list[str]:
