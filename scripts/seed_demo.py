@@ -6,10 +6,15 @@ For local work, the tests, and the demos (decision 0031, docs/features/organizat
 The two companies are built alike on purpose (same department and team names, the same
 kinds of people), so a leak from one company into the other is obvious in tests and demos.
 
-- Gives the same result on every run: a company that already exists is left alone, so
-  running the script twice changes nothing.
-- Creates each company all or nothing (one transaction): if a step fails, nothing of that
-  company is kept, so the next run builds it again from the start.
+- Gives the same result on every run: it only adds what is missing. A company that already
+  exists keeps its structure; it only gains passwords for accounts without one and its
+  shifts, if an earlier run could not add them yet. After that, a run changes nothing.
+- Seeds each company in three steps, each all or nothing (its own transaction): the
+  structure (departments, teams, people, roles), the missing demo passwords, then all of
+  the shifts with their audit entries. If a step fails, nothing of that step is kept and
+  the steps before it stay: a failed first step leaves no company, so the next run builds
+  it from the start; a refused shift keeps no shifts, but the company and its passwords
+  stay. The steps are separate on purpose, so passwords and shifts can come on a later run.
 - Refuses to run against a production database (APP_ENV=production).
 - Uses the reserved example.com and example.org email domains.
 - Creates companies the only way the design allows: from a session with no company
