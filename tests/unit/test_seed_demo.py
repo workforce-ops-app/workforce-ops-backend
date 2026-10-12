@@ -22,6 +22,7 @@ from app.authz.models import Permission, Role, RoleAssignment, RolePermission
 from app.core.config import get_settings
 from app.db.base import Base
 from app.modules.org.models import Company, Department, Team, TeamMember, User
+from app.modules.schedules import service as shift_service
 from app.modules.schedules.models import Shift
 from app.tenancy.context import set_company
 from scripts import seed_demo
@@ -58,11 +59,26 @@ NO_PASSWORD = "no DEMO_PASSWORD, so no one can sign in"
 WAITING = "shifts wait for passwords"
 
 DEMO_PASSWORD = "a calm river bends at dusk"
+# People in each demo company.
+PEOPLE = 9
+
+
+def stored(moment: datetime) -> datetime:
+    """A moment as the database stores it: UTC without a zone."""
+    return moment.astimezone(UTC).replace(tzinfo=None)
+
+
+@pytest.fixture(autouse=True)
+def service_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The schedules service checks "has this shift already ended?" against the real
+    clock. The tests seed at a fixed moment (NOW), so the service's clock is set to it too;
+    a test that seeds at another moment sets both."""
+    monkeypatch.setattr(shift_service, "utcnow", lambda: stored(NOW))
 
 
 @pytest.fixture(autouse=True)
 def quick_hashing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Cheap Argon2 settings for these tests, so hashing 16 accounts takes no time. The
+    """Cheap Argon2 settings for these tests, so hashing 18 accounts takes no time. The
     real settings are tested in tests/unit/test_passwords.py."""
     monkeypatch.setattr(
         passwords, "_hasher", PasswordHasher(time_cost=1, memory_cost=8, parallelism=1)
@@ -118,8 +134,8 @@ def test_it_creates_two_alike_companies(engine: Engine) -> None:
     for company_id in ids.values():
         assert count(engine, company_id, Department) == 3
         assert count(engine, company_id, Team) == 4
-        assert count(engine, company_id, User) == 8
-        assert count(engine, company_id, TeamMember) == 8
+        assert count(engine, company_id, User) == PEOPLE
+        assert count(engine, company_id, TeamMember) == PEOPLE
 
     # And the same department names, so a leak between the two is obvious.
     names = []
@@ -140,7 +156,7 @@ def test_running_it_twice_changes_nothing(engine: Engine) -> None:
     ]
     assert len(company_ids(engine)) == 2
     for company_id in company_ids(engine).values():
-        assert count(engine, company_id, User) == 8
+        assert count(engine, company_id, User) == PEOPLE
         assert count(engine, company_id, Shift) == SHIFTS_PER_COMPANY
 
 
@@ -171,7 +187,7 @@ def test_a_failure_part_way_leaves_nothing_behind_and_a_rerun_completes(
     ]
     for company_id in company_ids(engine).values():
         assert count(engine, company_id, Department) == 3
-        assert count(engine, company_id, User) == 8
+        assert count(engine, company_id, User) == PEOPLE
 
 
 def test_emails_use_the_reserved_domains(engine: Engine) -> None:
@@ -206,8 +222,8 @@ def test_a_demo_password_is_hashed_for_every_account(engine: Engine) -> None:
     lines = seed_demo.seed(engine, DEMO_PASSWORD, NOW)
 
     assert lines == [
-        f"Northwind Cafe: created; demo password set for 8 accounts; {ADDED}",
-        f"Summit Outfitters: created; demo password set for 8 accounts; {ADDED}",
+        f"Northwind Cafe: created; demo password set for {PEOPLE} accounts; {ADDED}",
+        f"Summit Outfitters: created; demo password set for {PEOPLE} accounts; {ADDED}",
     ]
     users = all_users(engine)
     # Stored as hashes that verify, each with its own salt, never as the password itself.
@@ -222,7 +238,9 @@ def test_a_rerun_only_fills_in_missing_passwords(engine: Engine) -> None:
     lines = seed_demo.seed(engine, DEMO_PASSWORD, NOW)
     hashes = {u.id: u.password_hash for u in all_users(engine)}
 
-    assert lines[0] == f"Northwind Cafe: already there; demo password set for 8 accounts; {ADDED}"
+    assert lines[0] == (
+        f"Northwind Cafe: already there; demo password set for {PEOPLE} accounts; {ADDED}"
+    )
     # A third run changes nothing: everyone already has a password, and the shifts exist.
     assert seed_demo.seed(engine, DEMO_PASSWORD, NOW)[0] == (
         "Northwind Cafe: already there; demo password set for 0 accounts; 0 shifts added"
@@ -248,6 +266,31 @@ def test_the_people_cover_the_cases_later_slices_need() -> None:
         # Someone on two teams, and someone on none.
         assert any(len(t) == 2 for t in teams)
         assert any(len(t) == 0 for t in teams)
+        # A manager of a whole department, and a manager of one team only.
+        managers = [person for person in plan.people if person.role == "manager"]
+        assert any(person.manages is None for person in managers)
+        assert any(person.manages is not None for person in managers)
+
+
+def test_the_crew_lead_manages_only_their_team(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    for plan in seed_demo.DEMO_COMPANIES:
+        lead_name = plan.people[seed_demo.CREW_LEAD].name
+        with Session(engine) as session:
+            set_company(session, company_ids(engine)[plan.name])
+            lead = session.scalars(select(User).where(User.display_name == lead_name)).one()
+            crew = session.scalars(select(Team).where(Team.name == "Weekend Crew")).one()
+            manager = session.scalars(select(Role).where(Role.built_in == "manager")).one()
+            managing = [
+                (a.scope_type, a.team_id, a.department_id)
+                for a in session.scalars(
+                    select(RoleAssignment).where(
+                        RoleAssignment.user_id == lead.id, RoleAssignment.role_id == manager.id
+                    )
+                )
+            ]
+        # Manager of the Weekend Crew, and not of the Kitchen as a whole.
+        assert managing == [("team", crew.id, None)]
 
 
 def test_main_refuses_to_run_in_production(
@@ -285,6 +328,29 @@ def test_main_seeds_the_configured_database(
     finally:
         get_settings.cache_clear()
     assert "Northwind Cafe: created" in capsys.readouterr().out
+
+
+def test_main_reports_a_refused_demo_shift(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def refuse(*args: object, **kwargs: object) -> int:
+        raise seed_demo.SeedRefused("Northwind Cafe: Kitchen 2026-10-05 07:00-15:00: 409")
+
+    monkeypatch.chdir(tmp_path)
+    url = f"sqlite:///{(tmp_path / 'demo.db').as_posix()}"
+    setup = create_engine(url)
+    Base.metadata.create_all(setup, tables=ORG_TABLES)
+    setup.dispose()
+    monkeypatch.setattr(seed_demo, "seed_shifts", refuse)
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("DATABASE_URL", url)
+    monkeypatch.delenv("DATABASE_PASSWORD", raising=False)
+    get_settings.cache_clear()
+    try:
+        assert seed_demo.main() == 1
+    finally:
+        get_settings.cache_clear()
+    assert "demo shift refused: Northwind Cafe: Kitchen" in capsys.readouterr().out
 
 
 def test_main_refuses_a_weak_demo_password(
@@ -368,11 +434,14 @@ def test_local_times_follow_daylight_saving() -> None:
     )
 
 
-def test_shifts_that_already_ended_are_never_created(engine: Engine) -> None:
+def test_shifts_that_already_ended_are_never_created(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # Seeded on Wednesday, October 7 at 16:00 in Chicago: Wednesday's 7:00 to 15:00 shift
     # is over, so it is skipped, as the API would refuse it. The 15:00 shift has started
     # but not ended, so it is kept.
     wednesday_afternoon = datetime(2026, 10, 7, 21, 0, tzinfo=UTC)
+    monkeypatch.setattr(shift_service, "utcnow", lambda: stored(wednesday_afternoon))
     plan = seed_demo.DEMO_COMPANIES[0]
     seed_demo.seed_company(engine, plan)
     seed_demo.set_demo_passwords(engine, plan, DEMO_PASSWORD)
@@ -438,10 +507,11 @@ def test_notes_and_events_appear_in_the_first_week_only(engine: Engine) -> None:
     assert all(s.starts_at < first_week_end for s in with_text)
 
 
-def test_every_demo_shift_is_in_the_audit_log(engine: Engine) -> None:
+def test_every_demo_shift_is_in_the_audit_log_under_its_planner(engine: Engine) -> None:
     seed_demo.seed(engine, DEMO_PASSWORD, NOW)
 
-    for company_id in company_ids(engine).values():
+    for plan in seed_demo.DEMO_COMPANIES:
+        company_id = company_ids(engine)[plan.name]
         with Session(engine) as session:
             set_company(session, company_id)
             created = session.scalars(
@@ -449,11 +519,54 @@ def test_every_demo_shift_is_in_the_audit_log(engine: Engine) -> None:
                     AuditEvent.action == "shift.created", AuditEvent.company_id == company_id
                 )
             ).all()
-        shift_ids = {s.id for s in shifts_of(engine, company_id)}
+            names = {u.id: u.display_name for u in session.scalars(select(User))}
+            departments = {d.id: d.name for d in session.scalars(select(Department))}
+        shifts = {s.id: s for s in shifts_of(engine, company_id)}
         # Each company's entries are in that company's own chain, one per shift.
-        assert {event.target_id for event in created} == shift_ids
-        # Added by the system, not by a person.
-        assert all(event.actor_type == "system" for event in created)
+        assert {event.target_id for event in created} == set(shifts)
+
+        # Created by a person, as on the website: the Weekend Crew lead for the crew's
+        # Saturday Kitchen shifts, the department's manager for every other shift.
+        lead = plan.people[seed_demo.CREW_LEAD].name
+        for event in created:
+            assert event.actor_type == "user"
+            shift = shifts[event.target_id]
+            local = shift.starts_at.replace(tzinfo=UTC).astimezone(ZoneInfo(shift.timezone))
+            department = departments[shift.department_id]
+            if department == "Kitchen" and local.weekday() == 5:
+                expected = lead
+            else:
+                expected = plan.people[seed_demo.DEPARTMENT_MANAGER[department]].name
+            assert names[event.actor_id] == expected  # type: ignore[index]
+
+
+def test_a_shift_the_application_refuses_stops_the_seed_and_keeps_none(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The Weekend Crew lead tries to plan an open Kitchen shift. An open shift belongs to
+    # its department alone, outside the lead's one team, so authorize() refuses it (403),
+    # as it would on the website.
+    open_by_lead = seed_demo.ShiftPlan(
+        6, "Kitchen", "10:00", "18:00", None, "Prep line", planner=seed_demo.CREW_LEAD
+    )
+    monkeypatch.setattr(seed_demo, "WEEK_PATTERN", (*seed_demo.WEEK_PATTERN, open_by_lead))
+    plan = seed_demo.DEMO_COMPANIES[0]
+    seed_demo.seed_company(engine, plan)
+    seed_demo.set_demo_passwords(engine, plan, DEMO_PASSWORD)
+
+    with pytest.raises(seed_demo.SeedRefused) as refused:
+        seed_demo.seed_shifts(engine, plan, NOW)
+
+    # The message names the shift, its planner, and the reason.
+    assert "Kitchen 2026-10-11 10:00-18:00, planned by Felix Grant: 403" in str(refused.value)
+    # All or nothing: none of the shifts before it were kept, nor their audit entries.
+    company_id = company_ids(engine)[plan.name]
+    assert count(engine, company_id, Shift) == 0
+    with Session(engine) as session:
+        set_company(session, company_id)
+        assert not session.scalars(
+            select(AuditEvent).where(AuditEvent.action == "shift.created")
+        ).first()
 
 
 def test_a_company_seeded_before_shifts_gets_them_on_the_next_run(engine: Engine) -> None:
@@ -463,7 +576,9 @@ def test_a_company_seeded_before_shifts_gets_them_on_the_next_run(engine: Engine
 
     lines = seed_demo.seed(engine, DEMO_PASSWORD, NOW)
 
-    assert lines[0] == f"Northwind Cafe: already there; demo password set for 8 accounts; {ADDED}"
+    assert lines[0] == (
+        f"Northwind Cafe: already there; demo password set for {PEOPLE} accounts; {ADDED}"
+    )
     for company_id in company_ids(engine).values():
         assert count(engine, company_id, Shift) == SHIFTS_PER_COMPANY
 
@@ -480,15 +595,33 @@ def test_shifts_wait_until_everyone_on_them_has_a_password(engine: Engine) -> No
     assert all(line.endswith(ADDED) for line in lines)
 
 
-def test_a_deactivated_worker_holds_back_the_shifts(engine: Engine) -> None:
+@pytest.mark.parametrize("who", [seed_demo.KITCHEN_A, seed_demo.CREW_LEAD])
+def test_a_deactivated_worker_or_planner_holds_back_the_shifts(engine: Engine, who: int) -> None:
+    # A deactivated worker cannot be assigned, and a deactivated manager holds no
+    # permissions: the shifts wait instead of failing part way.
     plan = seed_demo.DEMO_COMPANIES[0]
     seed_demo.seed_company(engine, plan)
     seed_demo.set_demo_passwords(engine, plan, DEMO_PASSWORD)
     with Session(engine) as session:
         set_company(session, company_ids(engine)[plan.name])
-        worker = plan.people[seed_demo.KITCHEN_A].name
-        user = session.scalars(select(User).where(User.display_name == worker)).one()
+        name = plan.people[who].name
+        user = session.scalars(select(User).where(User.display_name == name)).one()
         user.deactivated_at = datetime(2026, 1, 1)
         session.commit()
 
     assert seed_demo.seed_shifts(engine, plan, NOW) is None
+
+
+def test_a_company_from_an_older_seed_is_told_to_reset(engine: Engine) -> None:
+    # Seeded before the Weekend Crew lead joined the demo data: the script never changes an
+    # existing company, so instead of failing part way it says how to rebuild.
+    plan = seed_demo.DEMO_COMPANIES[0]
+    older = seed_demo.CompanyPlan(
+        plan.name, plan.timezone, plan.email_domain, plan.people[: seed_demo.CREW_LEAD]
+    )
+    seed_demo.seed_company(engine, older)
+    seed_demo.set_demo_passwords(engine, older, DEMO_PASSWORD)
+
+    with pytest.raises(seed_demo.SeedRefused, match="before Felix Grant joined.*reset"):
+        seed_demo.seed_shifts(engine, plan, NOW)
+    assert count(engine, company_ids(engine)[plan.name], Shift) == 0
