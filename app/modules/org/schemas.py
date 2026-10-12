@@ -10,3 +10,10 @@ class DepartmentOut(BaseModel):
 
     id: uuid.UUID
     name: str
+
+
+class DepartmentPage(BaseModel):
+    """A page of departments; next_cursor is null after the last page."""
+
+    items: list[DepartmentOut]
+    next_cursor: str | None

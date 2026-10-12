@@ -84,7 +84,7 @@ stateDiagram-v2
 
 | Method and path | Permission | Does |
 |---|---|---|
-| `GET /departments` | signed in | list active departments by name (built early in #88) |
+| `GET /departments?cursor=&limit=` | signed in | page through active departments by name (built early in #88) |
 | `GET /teams` | signed in | list teams (planned in #54) |
 | `POST /departments`, `PATCH /departments/{id}`, `POST /departments/{id}/archive` | `org.manage` | create, rename or set the time zone, archive |
 | `POST /teams`, `PATCH /teams/{id}`, `POST /teams/{id}/archive` | `org.manage` | create, rename, archive |
