@@ -415,7 +415,7 @@ Creating a new link cancels the person's earlier unused links. Used and expired 
 | `employee_id` | `BINARY(16)` | company-aware foreign key to `users`; null while the shift is open |
 | `starts_at`, `ends_at` | `DATETIME(6)` | UTC; `CHECK (ends_at > starts_at)` |
 | `timezone` | `VARCHAR(64)` | the workplace zone at creation, copied and never recalculated |
-| `status` | `VARCHAR(12)` | `scheduled`, `open`, or `cancelled`; `CHECK`: `employee_id` is null exactly when the status is `open` |
+| `status` | `VARCHAR(12)` | `scheduled`, `open`, or `cancelled`; `CHECK`: an `open` shift has no `employee_id`, a `scheduled` one has one, and a `cancelled` shift keeps whatever it had |
 | `details` | `VARCHAR(200)` | optional; what the shift is, e.g. "Register 2" |
 | `notes` | `TEXT` | optional; instructions for whoever works it |
 | `event_name` | `VARCHAR(120)` | optional; a special event during the shift, e.g. "Inventory night" |
