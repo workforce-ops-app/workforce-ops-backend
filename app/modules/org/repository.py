@@ -11,22 +11,19 @@ from sqlalchemy.orm import Session
 from app.modules.org.models import Department
 
 
-def encode_cursor(item: Department) -> str:
-    """Encode the last department's name and ID as the next-page bookmark."""
+def encode_cursor(department_id: uuid.UUID) -> str:
+    """Encode the last department's ID as the next-page bookmark."""
 
-    raw = json.dumps({"n": item.name, "i": str(item.id)}).encode()
+    raw = json.dumps({"i": str(department_id)}).encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
-def decode_cursor(cursor: str) -> tuple[str, uuid.UUID] | None:
+def decode_cursor(cursor: str) -> uuid.UUID | None:
     """Decode one of this list's bookmarks, or return None when it is invalid."""
 
     try:
         raw = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
-        name = raw["n"]
-        if not isinstance(name, str):
-            return None
-        return name, uuid.UUID(raw["i"])
+        return uuid.UUID(raw["i"])
     except (
         binascii.Error,
         UnicodeDecodeError,
@@ -36,6 +33,17 @@ def decode_cursor(cursor: str) -> tuple[str, uuid.UUID] | None:
         json.JSONDecodeError,
     ):
         return None
+
+
+def active_department(db: Session, department_id: uuid.UUID) -> Department | None:
+    """Find an active department in the current tenant."""
+
+    return db.scalar(
+        select(Department).where(
+            Department.id == department_id,
+            Department.archived_at.is_(None),
+        )
+    )
 
 
 def list_active_departments(
