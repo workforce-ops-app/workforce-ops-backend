@@ -23,6 +23,9 @@ dependencies = [
     "uuid6==2025.0.1",
     # Argon2id password hashing (decision 0027).
     "argon2-cffi==25.1.0",
+    # The IANA time zone database for zoneinfo: Windows and slim Linux images do not ship
+    # one, and shifts are stored and listed in each workplace's zone (decision 0021).
+    "tzdata==2026.5",
 ]
 
 [project.optional-dependencies]
