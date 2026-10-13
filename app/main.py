@@ -18,6 +18,7 @@ from app.core.caching import NoStoreMiddleware
 from app.core.config import Settings, get_settings
 from app.core.errors import register_error_handlers
 from app.core.logging import configure_logging
+from app.core.swagger import add_development_swagger
 
 
 def discover_routers() -> list[APIRouter]:
@@ -49,6 +50,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if settings.is_production:
         docs_url = None
         openapi_url = None
+    elif settings.is_development:
+        # Added below with browser-only CSRF support.
+        docs_url = None
+        openapi_url = "/api/openapi.json"
     else:
         docs_url = "/api/docs"
         openapi_url = "/api/openapi.json"
@@ -84,4 +89,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(NoStoreMiddleware)
     for router in discover_routers():
         app.include_router(router)
+    if settings.is_development:
+        add_development_swagger(app)
     return app

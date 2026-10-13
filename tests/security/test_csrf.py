@@ -72,6 +72,15 @@ def test_the_right_token_from_our_own_origin_is_accepted(signin: SignInSetup) ->
     assert browser.delete("/api/sessions/current").status_code == 204
 
 
+def test_development_swagger_does_not_bypass_csrf(signin: SignInSetup) -> None:
+    browser = signed_in_browser(signin)
+
+    response = browser.delete("/api/sessions/current")
+
+    assert response.status_code == 403
+    assert still_signed_in(signin, browser)
+
+
 def test_another_sessions_token_does_not_work(signin: SignInSetup) -> None:
     # The token belongs to one session: an attacker's own token (from their own sign-in)
     # is useless in the victim's browser.
