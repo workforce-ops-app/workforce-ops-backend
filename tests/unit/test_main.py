@@ -24,12 +24,34 @@ def test_app_loads_settings_when_none_are_supplied(monkeypatch: pytest.MonkeyPat
 
     app = create_app()
 
-    assert app.docs_url == "/api/docs"
+    assert app.docs_url is None
+    assert any(getattr(route, "path", None) == "/api/docs" for route in app.routes)
 
 
-def test_api_docs_are_available_in_development(client: TestClient) -> None:
-    assert client.get("/api/docs").status_code == 200
+def test_api_docs_handle_csrf_tokens_only_in_development() -> None:
+    settings = Settings(
+        app_env="development",
+        database_url="mysql+pymysql://test:test@localhost:3307/test",
+        csrf_key=TEST_CSRF_KEY,  # type: ignore[arg-type]
+    )
+    client = TestClient(create_app(settings))
+
+    docs = client.get("/api/docs")
+    script = client.get("/api/docs/swagger-csrf.js")
+
+    assert docs.status_code == 200
     assert client.get("/api/openapi.json").status_code == 200
+    assert 'src="/api/docs/swagger-csrf.js"' in docs.text
+    assert "requestInterceptor: window.swaggerCsrf.request" in docs.text
+    assert "responseInterceptor: window.swaggerCsrf.response" in docs.text
+    assert script.status_code == 200
+    assert 'request.headers["X-CSRF-Token"] = csrfToken' in script.text
+    assert "url.origin === ownOrigin" in script.text
+    assert 'typeof body.csrf_token === "string"' in script.text
+    assert "status === 401" in script.text
+    assert "pendingSignOuts.delete(url.href)" in script.text
+    assert "localStorage" not in script.text
+    assert "sessionStorage" not in script.text
 
 
 def test_api_docs_are_hidden_in_production() -> None:
@@ -42,6 +64,7 @@ def test_api_docs_are_hidden_in_production() -> None:
     client = TestClient(create_app(settings))
 
     assert client.get("/api/docs").status_code == 404
+    assert client.get("/api/docs/swagger-csrf.js").status_code == 404
     assert client.get("/api/openapi.json").status_code == 404
 
 

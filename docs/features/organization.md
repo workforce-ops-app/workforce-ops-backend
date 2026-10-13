@@ -1,6 +1,6 @@
 # Company structure, people, and access
 
-- **Status:** tables built (`app/modules/org/models.py`, migration `0002`); demo companies, structure, people, and their roles seeded by `scripts/seed_demo.py`; this module's permissions declared (`app/modules/org/permissions.py`); endpoints planned (core tier)
+- **Status:** tables built (`app/modules/org/models.py`, migration `0002`); demo companies, structure, people, and their roles seeded by `scripts/seed_demo.py`; this module's permissions declared (`app/modules/org/permissions.py`); department listing built; remaining endpoints planned (core tier)
 - **Related:** workforce-ops-app/workforce-ops-backend#8; frontend page: administration screens (workforce-ops-app/workforce-ops-frontend#3); design: [data model](../architecture/data-model.md), [authorization](../architecture/authorization.md), [authentication](../architecture/authentication.md)
 
 ## In short
@@ -84,7 +84,8 @@ stateDiagram-v2
 
 | Method and path | Permission | Does |
 |---|---|---|
-| `GET /departments`, `GET /teams` | signed in | list (everyone can see the company's structure) |
+| `GET /departments?cursor=&limit=` | signed in | page through active departments by name (built early in #88) |
+| `GET /teams` | signed in | list teams (planned in #54) |
 | `POST /departments`, `PATCH /departments/{id}`, `POST /departments/{id}/archive` | `org.manage` | create, rename or set the time zone, archive |
 | `POST /teams`, `PATCH /teams/{id}`, `POST /teams/{id}/archive` | `org.manage` | create, rename, archive |
 | `POST /teams/{id}/members`, `DELETE /teams/{id}/members/{user_id}` | `org.manage` | add or remove a team member |
