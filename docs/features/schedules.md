@@ -1,6 +1,6 @@
 # Schedules and shifts
 
-- **Status:** creating, viewing, changing, assigning, and cancelling single shifts is built (`app/modules/schedules/`, migration `0006`, slice SC1); the demo companies get two weeks of shifts from the seed script, created through the same service as the website, by their managers (SD1, [demo data](organization.md#demo-data)); changes to several shifts at once follow in SC2, and the time-off check with the time-off slices
+- **Status:** creating, viewing, changing, assigning, and cancelling shifts is built (`app/modules/schedules/`, migration `0006`, slice SC1), and so are changes to several shifts at once with the count confirmation (slice SC2); the time-off check follows with the time-off slices
 - **Related:** workforce-ops-app/workforce-ops-backend#9; frontend page: schedule screens (workforce-ops-app/workforce-ops-frontend#3); design: [data model](../architecture/data-model.md#shifts), [authorization](../architecture/authorization.md)
 
 ## In short
@@ -48,7 +48,7 @@ stateDiagram-v2
 - **Time off:** a person cannot be assigned during their approved time off (409). Checked once time-off requests exist.
 - **Past shifts:** once a shift has ended it cannot be changed or cancelled (409); its notes are history. A shift that has already ended cannot be created either, and a future shift cannot be moved into the past by changing its times (both 422), so the past cannot be written in after the fact.
 - **Cancelling** keeps the shift with status `cancelled` ([0020](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md)); it disappears from normal views.
-- **Several shifts at once:** a manager can create the same shift on several chosen days, or cancel or reassign several selected shifts. When the change affects 10 or more shifts, the request must repeat the count it expects (`confirm_count`); a wrong or missing count is refused (409) and nothing is saved.
+- **Several shifts at once:** a manager can create the same shift on several chosen days, or cancel or reassign several selected shifts, at most **100** per request. Every shift goes through the same checks as a single change (permission and scope, times, who can be assigned, double booking, ended or cancelled), and the whole batch is **all or nothing**: if any shift fails, nothing is saved. When the change affects 10 or more shifts, the request must repeat the count it expects (`confirm_count`); a wrong or missing count is refused (409) and nothing is saved. A count that is sent must match even below 10. Listing the same shift, or the same start and end, twice is refused (422).
 - **Text fields** (details, notes, event) are shown as plain text only ([threat model](../security/threat-model.md) T5).
 
 ### Backend
@@ -63,7 +63,7 @@ stateDiagram-v2
 | `PATCH /shifts/{id}` | `schedule.edit` | change times, details, notes, event |
 | `POST /shifts/{id}/assign` `{employee_id}` | `schedule.edit` | give the shift to a person, or `null` to make it open |
 | `POST /shifts/{id}/cancel` | `schedule.edit` | cancel |
-| `POST /shifts/batch` | `schedule.edit` for every shift involved | create on several days, or cancel or reassign several; needs `confirm_count` at 10 or more |
+| `POST /shifts/batch` | `schedule.edit` for every shift involved | create on several days, or cancel or reassign several (all or nothing, at most 100); needs `confirm_count` at 10 or more |
 
 Times are sent and returned as ISO 8601 moments with an offset, plus the shift's `timezone`, so the interface shows them in the workplace's zone.
 
@@ -71,17 +71,27 @@ Times are sent and returned as ISO 8601 moments with an offset, plus the shift's
 
 **The list** (agreed with the frontend, #61): `from` and `to` are calendar days, both included; a shift belongs to the day it starts **in its workplace zone**, so each zone's midnight is turned into UTC separately. Pages of up to 50 items by default (`limit`, at most 200), ordered by start, with `next_cursor` (a bookmark to the last item, `null` on the last page). The answer: `{"items": [Shift, ...], "next_cursor": ...}`, each `Shift` with `id`, `department` (`id`, `name`), `employee` (`id`, `display_name`, or `null` for an open shift), `starts_at` and `ends_at` (UTC), `timezone`, `status`, `details`, `notes`, `event_name`, `event_description`. One query joins each shift to its department (inner join) and its person (left outer join, so open shifts stay in the list); the scope condition from `scope_filter()` limits it to the shifts the user may see.
 
-**Errors:** 401 not signed in, 403 not allowed, 404 not found (including another company's shift), 409 not allowed in the current state (ended or cancelled, double booking), 422 invalid input (times, 12-hour limit, more than 31 days, a person who cannot work the shift, an unknown department, or any field the request may not set, such as `company_id` or `status`).
+**Several at once** (`POST /shifts/batch`, 200 for every action). The body's `action` picks one of three shapes; fields of another action are refused (422):
 
-**Where the code lives:** `app/modules/schedules/`: `models.py` (the table), `schemas.py` (requests and the agreed answer), `repository.py` (every query, including the list), `service.py` (the rules; `authorize()` before anything is revealed or changed), `scope.py` (the scope resolver), `router.py` (HTTP), `permissions.py`. Tests: `tests/unit/test_shifts_api.py`, `tests/security/test_shifts.py`.
+| `action` | Fields | Does |
+|---|---|---|
+| `create` | `department_id`, `employee_id` (optional), `times`: a list of `{starts_at, ends_at}`, `details`, `notes`, `event_name`, `event_description` | the same shift once per entry in `times`; the interface turns each chosen day's wall-clock times into moments, as for one shift |
+| `cancel` | `shift_ids` | cancels each |
+| `assign` | `shift_ids`, `employee_id` (required; `null` makes them open) | gives each to the person, or opens it |
 
-**Explain in the presentation** (course topics: REST and SQL JOINs): the endpoints in `router.py` (one URL per thing, the method says what to do, the status code how it went), and the list query in `repository.py`.
+Every action also takes `confirm_count`. The answer is `{"action": ..., "count": N, "items": [Shift, ...]}`, in the order sent. A missing or wrong count answers 409 with a message that names the number of shifts, so the screen can ask the manager to confirm it.
+
+**Errors:** 401 not signed in, 403 not allowed, 404 not found (including another company's shift), 409 not allowed in the current state (ended or cancelled, double booking, a batch without the right `confirm_count`), 422 invalid input (times, 12-hour limit, more than 31 days, a person who cannot work the shift, an unknown department, or any field the request may not set, such as `company_id` or `status`).
+
+**Where the code lives:** `app/modules/schedules/`: `models.py` (the table), `schemas.py` (requests and the agreed answer), `repository.py` (every query, including the list), `service.py` (the rules; `authorize()` before anything is revealed or changed; each action is a step that does not commit, so a batch can run many steps and commit once), `scope.py` (the scope resolver), `router.py` (HTTP), `permissions.py`. Tests: `tests/unit/test_shifts_api.py`, `tests/unit/test_shift_batch_api.py`, `tests/security/test_shifts.py`, `tests/security/test_shift_batch.py`.
+
+**Explain in the presentation** (course topics: REST, SQL JOINs, and transactions): the endpoints in `router.py` (one URL per thing, the method says what to do, the status code how it went), the list query in `repository.py`, and `batch()` in `service.py` (one transaction and one commit, so a failure on any shift rolls back every shift and audit entry before it).
 
 **Scope resolver:** a shift belongs to its department and, when assigned, to its person (and through them their teams). A manager of the Weekend Crew team therefore covers the shifts of the team's members.
 
 ### Audit and security
 
-**Audit events:** `shift.created` (details: department, person, times), `shift.updated` (details: the names of the fields changed, never their text), `shift.assigned` and `shift.opened` (details: the new and previous person), `shift.cancelled`, `shift.batch_changed` (SC2; details: action and count; one entry per batch plus one per shift).
+**Audit events:** `shift.created` (details: department, person, times), `shift.updated` (details: the names of the fields changed, never their text), `shift.assigned` and `shift.opened` (details: the new and previous person), `shift.cancelled`, `shift.batch_changed` (details: the action, the count, and the IDs of the shifts changed; written after the usual entry for each shift, in the same transaction).
 
 **Threats** ([threat model](../security/threat-model.md)): I1 and T3 (other companies' shifts), I2 (shifts outside scope), T2 (setting the company or status directly), T5 (text fields), D2 (huge date ranges), D3 (mass cancelling).
 
@@ -90,7 +100,9 @@ Times are sent and returned as ISO 8601 moments with an offset, plus the shift's
 - A manager cannot view or change shifts outside their department or team (403); an employee without `schedule.view` sees only their own.
 - An employee cannot create or change shifts, even by calling the API directly (E8).
 - Assigning someone from another company, a deactivated person, or someone on approved time off is refused.
-- A batch of 10 or more without the right `confirm_count` changes nothing.
+- A batch of 10 or more without the right `confirm_count` changes nothing: no shift and no audit entry (D3).
+- One shift of another company (404), outside the manager's scope (403), or given to someone who cannot work it (422) stops the whole batch, and nothing changes.
+- An employee gets 403 for every batch action, even with the right count.
 
 ### Known limitations
 - No draft-and-publish yet (next tier): shifts are visible once saved.

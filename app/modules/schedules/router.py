@@ -10,9 +10,11 @@ HTTP method says what to do with it, and the status code says how it went:
     PATCH  /api/shifts/{id}                                                200  change some fields
     POST   /api/shifts/{id}/assign  {employee_id | null}                   200  give or open
     POST   /api/shifts/{id}/cancel                                         200  cancel
+    POST   /api/shifts/batch  {action: create | cancel | assign, ...}      200  several at once
 
 Errors: 401 not signed in, 403 not allowed, 404 not found (or another company's), 409 not
-allowed in the shift's current state, 422 invalid input.
+allowed in the shift's current state (or a batch without the right confirm_count), 422
+invalid input.
 """
 
 import uuid
@@ -28,6 +30,8 @@ from app.modules.schedules.schemas import (
     DepartmentRef,
     EmployeeRef,
     ShiftAssign,
+    ShiftBatch,
+    ShiftBatchOut,
     ShiftCreate,
     ShiftOut,
     ShiftPage,
@@ -87,6 +91,16 @@ def list_shifts(
     )
     items = [_out(row[0], row[2], row[4]) for row in rows]
     return ShiftPage(items=items, next_cursor=next_cursor)
+
+
+@router.post("/batch")
+def batch(body: ShiftBatch, current: SignedInPerson, db: Database) -> ShiftBatchOut:
+    """Several shifts at once, all or nothing. 200 for every action (a create batch too),
+    since the answer is the batch's result rather than one new resource."""
+    items = service.batch(db, current.user, body)
+    return ShiftBatchOut(
+        action=body.action, count=len(items), items=[_one(db, item) for item in items]
+    )
 
 
 @router.get("/{shift_id}")
