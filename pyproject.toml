@@ -12,9 +12,9 @@ description = "API for the Workforce Operations Application"
 readme = "README.md"
 requires-python = "==3.13.*"
 dependencies = [
-    "fastapi==0.143.0",
+    "fastapi==0.143.3",
     "uvicorn==0.54.0",
-    "pydantic-settings==2.15.0",
+    "pydantic-settings==2.16.0",
     "sqlalchemy==2.1.4",
     "alembic==1.20.0",
     "pymysql==1.2.3",
@@ -30,7 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "ruff==0.17.0",
+    "ruff==0.17.1",
     "mypy==2.4.0",
     "pytest==9.1.1",
     "pytest-cov==7.1.0",
