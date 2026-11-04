@@ -144,7 +144,7 @@ Each row names the threat, who could carry it out, the protection (with the deci
 | Cryptography | S1 (Argon2id), S5 and I5 (hashed tokens), T4 (HMAC chain) |
 | Secure coding and defense in depth | T3, I1 to I3, E1 to E9 |
 
-The audits follow the applicable areas of OWASP ASVS Level 2 (0030):
+The audits follow the applicable areas of OWASP ASVS Level 2 (0030); the first one is the [midterm audit](audit-midterm.md):
 
 | ASVS area | Threats |
 |---|---|
