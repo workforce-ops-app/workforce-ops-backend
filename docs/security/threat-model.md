@@ -92,6 +92,7 @@ Each row names the threat, who could carry it out, the protection (with the deci
 | T3 | Changing another company's records by guessing or reusing IDs | P1, P2, P3 | automatic company filter, company-aware foreign keys, 404 for other companies' records (0016) | cross-company suite on every endpoint |
 | T4 | Editing, removing, or inserting audit entries directly in the database | P3, P4 | HMAC-signed chain with the key outside the database; the application's database user may only add entries; nightly verification; latest signatures copied to the application log ([0018](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0018-audit-log-chains.md)) | verification test with a tampered, a removed, and an inserted entry |
 | T5 | Stored XSS: script hidden in names, shift notes, or request comments | P2, P3 | text is always shown with `textContent`, never `innerHTML` (enforced by lint); strict Content Security Policy with no inline scripts ([0005](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0005-frontend-multi-page-vanilla-js.md)) | XSS payloads in every text field; ZAP |
+| T6 | Numbers outside what the database or the browser can hold (the web form of integer overflow): a value past a MySQL column's limit makes the request fail with an internal error, and JavaScript rounds anything past 2^53 | P1, P2 | every numeric request field has a minimum and maximum that fit its column (lists already allow at most 200 items); MySQL's default strict mode refuses out-of-range values instead of clipping them; IDs are UUID strings, so the browser never rounds them (0019, 0026) | boundary tests: maximum, maximum + 1, negative, and huge values answer 422, never 500 (planned, #105) |
 
 ### Repudiation: denying having done something
 
@@ -99,6 +100,7 @@ Each row names the threat, who could carry it out, the protection (with the deci
 |---|---|---|---|---|
 | R1 | Denying an approval, a role change, or a schedule change | P2, P3 | every such action writes an audit entry in the same database transaction, naming the actor (0018); sensitive actions need the password re-entered ([0025](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md)) | tests assert the audit entry for each action |
 | R2 | Covering one's tracks by removing audit entries | P3, P4 | the application cannot remove entries; any removal breaks the chain (T4) | as T4 |
+| R3 | Forging application log lines: text with line breaks written into the log looks like separate entries, for example a fake copy of the latest audit signatures | P1, P2 | log messages are fixed text; user input only goes in as extra fields, which the JSON log format escapes (`app/core/logging.py`); logs contain no personal details (0031) | test that a value with line breaks stays one log line; ruff's logging-format rules (planned, #106) |
 
 ### Information disclosure: seeing what you should not
 
@@ -110,6 +112,7 @@ Each row names the threat, who could carry it out, the protection (with the deci
 | I4 | Error messages that reveal internals (stack traces, SQL) | P1 | one error format that never includes internal details ([0026](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0026-api-conventions.md)) | tests with malformed input; ZAP |
 | I5 | Leaking password hashes, tokens, or secrets | P1, P4 | Argon2id; session and link tokens stored only as hashes; secrets never committed (secret scanning in CI and git hooks); logs contain no personal details ([0031](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0031-demo-environment-and-data.md)) | secret scan; log review in audits |
 | I6 | Personal data left in the browser's cache on a shared computer, readable after signing out | P1, P2 | every API answer says `Cache-Control: no-store` (`app/core/caching.py`); the frontend never keeps the session in browser storage | test that every kind of answer carries the header |
+| I7 | Format string attacks: user text used as a format template, such as `user_text.format(obj)`, can read the program's internals, for example `{0.__class__.__init__.__globals__}` reaching secrets | P1, P2 | user text is only ever a value, never the template for `str.format`, `%`, or a log message | test that text such as `{0.__class__}` and `%s%n` is stored and returned exactly as typed; ruff's logging-format rules (planned, #106) |
 
 ### Denial of service: making the application unusable
 
@@ -132,6 +135,7 @@ Each row names the threat, who could carry it out, the protection (with the deci
 | E7 | Weakening company security settings | P3 | companies can only make settings stricter, within platform limits (0025) | tests for values below the limits |
 | E8 | Calling the API directly for actions whose buttons are hidden | P2 | the interface only hides buttons for convenience; the API checks every action | every endpoint's permission test runs without the interface |
 | E9 | Changing a role held by peers or superiors, for example an administrator weakening or reshaping the Administrator role | P3 | a role can be changed only by someone above every current holder, or the Owner; the Owner role is locked (0032) | role-editing tests with holders above, beside, and below the editor |
+| E10 | Memory corruption in compiled code (buffer or heap overflow, return-oriented programming) letting an attacker run their own code on the server | P1 | our own code is written in memory-safe languages (Python, JavaScript), so these bugs cannot come from it; the compiled parts underneath (the Python interpreter, nginx, the native parts of `cryptography` and `argon2-cffi`) are pinned and checked for known vulnerabilities, and rely on the operating system's defenses: ASLR, stack canaries, and non-executable memory | pip-audit and npm audit in CI; Dependabot; `checksec` on the compiled programs in each image (planned, #107) |
 
 ## Course topics and audit checklist
 
@@ -143,6 +147,11 @@ Each row names the threat, who could carry it out, the protection (with the deci
 | Cross-site scripting | T5 |
 | Cryptography | S1 (Argon2id), S5 and I5 (hashed tokens), T4 (HMAC chain) |
 | Secure coding and defense in depth | T3, I1 to I3, E1 to E9 |
+| Type safety | T2 (request schemas checked by Pydantic at run time and by mypy in CI) |
+| Code injection | T1, I7 (ruff's security rules forbid `eval`, `exec`, and `pickle` on untrusted data) |
+| Integer overflow | T6 |
+| Format string vulnerabilities | I7, R3 |
+| Memory safety, buffer overflow, return-oriented programming, ASLR, stack canaries | E10 |
 
 The audits follow the applicable areas of OWASP ASVS Level 2 (0030):
 
@@ -151,11 +160,12 @@ The audits follow the applicable areas of OWASP ASVS Level 2 (0030):
 | Authentication | S1, S5 |
 | Session management | S2, S3, S4 |
 | Access control | T3, I1, I2, E1 to E9 |
-| Validation, sanitization, and encoding | T1, T2, T5 |
+| Validation, sanitization, and encoding | T1, T2, T5, T6, I7 |
 | Cryptography | T4, I5 |
-| Error handling and logging | I4, R1, R2 |
+| Error handling and logging | I4, R1, R2, R3 |
 | API and web service | T2, D2 |
 | Configuration (headers, secrets) | S2, I5, I6 |
+| Secure build and dependencies | E10 |
 
 ## Known limits
 
@@ -164,6 +174,7 @@ The audits follow the applicable areas of OWASP ASVS Level 2 (0030):
 - **Platform staff with both the database and the signing key could forge the audit log.** Keeping the key out of the database, and copying the latest signatures to the application log, makes this harder and detectable after the fact, not impossible (0018).
 - **Email addresses are unique across the platform.** When an administrator adds an email that another company already uses, the answer is only "this email can't be used", but that still reveals that the address is taken somewhere (I3).
 - **Network-level flooding is out of scope.** It is the hosting provider's job; the report states this under threats to validity (0030).
+- **Compiled code underneath the application is trusted, not audited.** Memory-safety bugs in the Python interpreter, nginx, or native libraries are outside what our tests can find; we keep them updated and check that their built-in defenses are on (E10), but do not fuzz or review them.
 - **The audits run on local and test copies only**, not a production deployment.
 
 ## Keeping it current
