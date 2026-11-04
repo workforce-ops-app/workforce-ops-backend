@@ -12,11 +12,11 @@ description = "API for the Workforce Operations Application"
 readme = "README.md"
 requires-python = "==3.13.*"
 dependencies = [
-    "fastapi==0.143.3",
+    "fastapi==0.162.0",
     "uvicorn==0.54.0",
-    "pydantic-settings==2.16.0",
-    "sqlalchemy==2.1.4",
-    "alembic==1.20.0",
+    "pydantic-settings==2.16.2",
+    "sqlalchemy==2.1.6",
+    "alembic==1.20.1",
     "pymysql==1.2.3",
     # PyMySQL needs this for MySQL 8's default sign-in method (caching_sha2_password).
     "cryptography==50.0.2",
@@ -25,16 +25,16 @@ dependencies = [
     "argon2-cffi==25.1.0",
     # The IANA time zone database for zoneinfo: Windows and slim Linux images do not ship
     # one, and shifts are stored and listed in each workplace's zone (decision 0021).
-    "tzdata==2026.5",
+    "tzdata==2026.6",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "ruff==0.17.1",
-    "mypy==2.4.0",
-    "pytest==9.1.1",
+    "ruff==0.17.3",
+    "mypy==2.4.1",
+    "pytest==9.2.0",
     "pytest-cov==7.1.0",
-    "httpx2==2.13.1",
+    "httpx2==2.16.0",
     "pip-audit==2.10.1",
 ]
 
