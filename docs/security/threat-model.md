@@ -153,7 +153,7 @@ Each row names the threat, who could carry it out, the protection (with the deci
 | Format string vulnerabilities | I7, R3 |
 | Memory safety, buffer overflow, return-oriented programming, ASLR, stack canaries | E10 |
 
-The audits follow the applicable areas of OWASP ASVS Level 2 (0030):
+The audits follow the applicable areas of OWASP ASVS Level 2 (0030); the first one is the [midterm audit](audit-midterm.md):
 
 | ASVS area | Threats |
 |---|---|
