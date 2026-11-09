@@ -15,7 +15,7 @@ dependencies = [
     "fastapi==0.162.0",
     "uvicorn==0.54.0",
     "pydantic-settings==2.16.2",
-    "sqlalchemy==2.1.6",
+    "sqlalchemy==2.1.8",
     "alembic==1.20.1",
     "pymysql==1.2.3",
     # PyMySQL needs this for MySQL 8's default sign-in method (caching_sha2_password).
@@ -30,7 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "ruff==0.17.3",
+    "ruff==0.17.4",
     "mypy==2.4.1",
     "pytest==9.2.0",
     "pytest-cov==7.1.0",
