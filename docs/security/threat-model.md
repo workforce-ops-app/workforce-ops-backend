@@ -82,6 +82,7 @@ Each row names the threat, who could carry it out, the protection (with the deci
 | S3 | Session fixation: planting a known session ID before the victim signs in | P1 | a new session ID at sign-in and on password change | test that the session ID changes at sign-in |
 | S4 | Forged requests (CSRF): another site makes the victim's browser send a request | P1 | CSRF token in the `X-CSRF-Token` header, `SameSite=Strict`, Origin check | requests with a missing or wrong token or Origin are rejected |
 | S5 | Stealing or guessing a setup or reset link | P1, P2 | long random token stored only as a hash, single use, 48 hours by default, token kept in the link's `#` part so it is never sent to servers or logs; using it signs out other sessions | tests for reuse, expiry, and wrong tokens |
+| S6 | Blaming another address in the security events by sending a forged `X-Forwarded-For` header | P1, P2 | the client address is taken from nginx's header only when the request came through nginx (DE8 in [detection](../features/detection.md)) | test that a forged header from outside does not change the recorded address (planned, DT4) |
 
 ### Tampering: changing data without permission
 
@@ -93,6 +94,7 @@ Each row names the threat, who could carry it out, the protection (with the deci
 | T4 | Editing, removing, or inserting audit entries directly in the database | P3, P4 | HMAC-signed chain with the key outside the database; the application's database user may only add entries; nightly verification; latest signatures copied to the application log ([0018](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0018-audit-log-chains.md)) | verification test with a tampered, a removed, and an inserted entry |
 | T5 | Stored XSS: script hidden in names, shift notes, or request comments | P2, P3 | text is always shown with `textContent`, never `innerHTML` (enforced by lint); strict Content Security Policy with no inline scripts ([0005](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0005-frontend-multi-page-vanilla-js.md)) | XSS payloads in every text field; ZAP |
 | T6 | Numbers outside what the database or the browser can hold (the web form of integer overflow): a value past a MySQL column's limit makes the request fail with an internal error, and JavaScript rounds anything past 2^53 | P1, P2 | every numeric request field has a minimum and maximum that fit its column (lists already allow at most 200 items); MySQL's default strict mode refuses out-of-range values instead of clipping them; IDs are UUID strings, so the browser never rounds them (0019, 0026) | boundary tests: maximum, maximum + 1, negative, and huge values answer 422, never 500 (planned, #105) |
+| T7 | Stored XSS through the security page: the excerpt of a detected attack is attacker text, shown to owners and administrators | P1, P2 | excerpts are stored as plain text, at most 200 characters, and always shown with `textContent`; strict Content Security Policy (DE7 in [detection](../features/detection.md)) | XSS payloads as excerpts on the security page (planned, DT7) |
 
 ### Repudiation: denying having done something
 
@@ -101,6 +103,7 @@ Each row names the threat, who could carry it out, the protection (with the deci
 | R1 | Denying an approval, a role change, or a schedule change | P2, P3 | every such action writes an audit entry in the same database transaction, naming the actor (0018); sensitive actions need the password re-entered ([0025](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md)) | tests assert the audit entry for each action |
 | R2 | Covering one's tracks by removing audit entries | P3, P4 | the application cannot remove entries; any removal breaks the chain (T4) | as T4 |
 | R3 | Forging application log lines: text with line breaks written into the log looks like separate entries, for example a fake copy of the latest audit signatures | P1, P2 | log messages are fixed text; user input only goes in as extra fields, which the JSON log format escapes (`app/core/logging.py`); logs contain no personal details (0031) | test that a value with line breaks stays one log line; ruff's logging-format rules (planned, #106) |
+| R4 | Evading detection with an unusual form of an attack, so it never appears on the security page | P1, P2 | none needed for safety: detection only records, and the real protections are T1, T5, and the course-topic rows; input is normalized before matching, and the study measures how much slips through ([detection](../features/detection.md)) | detection study: recall per attack type on the test set and the field set |
 
 ### Information disclosure: seeing what you should not
 
@@ -113,6 +116,7 @@ Each row names the threat, who could carry it out, the protection (with the deci
 | I5 | Leaking password hashes, tokens, or secrets | P1, P4 | Argon2id; session and link tokens stored only as hashes; secrets never committed (secret scanning in CI and git hooks); logs contain no personal details ([0031](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0031-demo-environment-and-data.md)) | secret scan; log review in audits |
 | I6 | Personal data left in the browser's cache on a shared computer, readable after signing out | P1, P2 | every API answer says `Cache-Control: no-store` (`app/core/caching.py`); the frontend never keeps the session in browser storage | test that every kind of answer carries the header |
 | I7 | Format string attacks: user text used as a format template, such as `user_text.format(obj)`, can read the program's internals, for example `{0.__class__.__init__.__globals__}` reaching secrets | P1, P2 | user text is only ever a value, never the template for `str.format`, `%`, or a log message | test that text such as `{0.__class__}` and `%s%n` is stored and returned exactly as typed; ruff's logging-format rules (planned, #106) |
+| I8 | Detection storing secrets: a password, token, or cookie copied into a security event | P4 | passwords, tokens, the CSRF header, cookies, and the `Authorization` header are never inspected or stored (DE3 in [detection](../features/detection.md)) | test that attack strings in those fields leave no event and no stored text (planned, DT4) |
 
 ### Denial of service: making the application unusable
 
@@ -121,6 +125,8 @@ Each row names the threat, who could carry it out, the protection (with the deci
 | D1 | Flooding the sign-in form, or locking real users out on purpose | P1 | rate limits per address and per session; lockouts escalate but never exceed 1 hour, so they cannot lock someone out for good (0025, 0027) | rate-limit and lockout tests |
 | D2 | Expensive requests: huge lists or bodies, slow queries | P1, P2 | lists are paged (at most 200 items); request size limits; query timeouts (0026) | tests with oversized requests |
 | D3 | Destroying data from inside | P3, P4 | records are deactivated or archived, never deleted ([0020](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md)); the application's database user cannot drop or truncate; confirmation for changes to 10 or more shifts (0025); backups in the next tier ([0028](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0028-backup-and-recovery.md)) | database grant test; batch confirmation tests (`tests/security/test_shift_batch.py`); restore drills (next tier) |
+| D4 | Slow patterns: crafted input that makes a regular expression take a very long time (ReDoS), freezing a worker | P1 | inspection runs after the answer is sent, values are capped at 2,000 characters and 200 per request, and patterns without nested repetition must pass a worst-case timing test (DE2, DE4, DE5 in [detection](../features/detection.md)) | worst-case timing test in CI (planned, DT3) |
+| D5 | Flooding the security events to fill the table or bury a real attack among noise | P1, P2 | at most 20 events per minute per source, then one summary row; events kept 1 year (DE6 in [detection](../features/detection.md)) | rate-cap test (planned, DT2) |
 
 ### Elevation of privilege: gaining more power than you were given
 
@@ -146,7 +152,7 @@ Each row names the threat, who could carry it out, the protection (with the deci
 | Cross-site request forgery | S4 |
 | Cross-site scripting | T5 |
 | Cryptography | S1 (Argon2id), S5 and I5 (hashed tokens), T4 (HMAC chain) |
-| Secure coding and defense in depth | T3, I1 to I3, E1 to E9 |
+| Secure coding and defense in depth | T3, I1 to I3, E1 to E9; detection (R4, D4) |
 | Type safety | T2 (request schemas checked by Pydantic at run time and by mypy in CI) |
 | Code injection | T1, I7 (ruff's security rules forbid `eval`, `exec`, and `pickle` on untrusted data) |
 | Integer overflow | T6 |
@@ -160,9 +166,9 @@ The audits follow the applicable areas of OWASP ASVS Level 2 (0030); the first o
 | Authentication | S1, S5 |
 | Session management | S2, S3, S4 |
 | Access control | T3, I1, I2, E1 to E9 |
-| Validation, sanitization, and encoding | T1, T2, T5, T6, I7 |
+| Validation, sanitization, and encoding | T1, T2, T5 to T7, I7, D4 |
 | Cryptography | T4, I5 |
-| Error handling and logging | I4, R1, R2, R3 |
+| Error handling and logging | I4, R1 to R4, I8, D5, S6 |
 | API and web service | T2, D2 |
 | Configuration (headers, secrets) | S2, I5, I6 |
 | Secure build and dependencies | E10 |
@@ -180,5 +186,5 @@ The audits follow the applicable areas of OWASP ASVS Level 2 (0030); the first o
 ## Keeping it current
 
 - Each feature page lists the threats (by ID) that apply to it; a new kind of threat gets a new row here in the same pull request.
-- Next-tier features add rows when they are designed: file uploads, coverage and swaps, announcements, notifications, detection, backups.
+- Next-tier features add rows when they are designed: file uploads, coverage and swaps, announcements, notifications, backups. Detection added S6, T7, R4, I8, D4, and D5.
 - Audit findings name the threat ID they fall under, or add one.

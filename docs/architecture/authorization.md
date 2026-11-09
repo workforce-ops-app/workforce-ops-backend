@@ -50,6 +50,7 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 | `settings.manage` | company | change company settings, including security settings |
 | `audit.view` | company | read the company's audit log |
 | `audit.verify` | company | run verification of the company's audit chain |
+| `security.view` | company | see the company's security events on the security page (next tier, [detection](../features/detection.md)) |
 | `company.transfer_ownership` | company | propose adding or removing an owner (Owner role only; other owners must agree) |
 
 Changing your own password and signing yourself out need no permission; every signed-in user can do both.
@@ -74,6 +75,7 @@ Every new company gets four roles ([0024](https://github.com/workforce-ops-app/.
 | `reporting_line.manage` | yes | yes | | |
 | `settings.manage` | yes | yes | | |
 | `audit.view`, `audit.verify` | yes | yes | | |
+| `security.view` | yes | yes | | |
 | `company.transfer_ownership` | yes | | | |
 
 - **Typical scopes:** Owner and Administrator are assigned for the whole company; a Manager for their department or team; everyone gets the Employee role scoped to their **home department**, which is what lets employees see their department's schedule. An administrator can remove `schedule.view` from the Employee role to turn that off.
