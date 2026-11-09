@@ -22,12 +22,15 @@ from sqlalchemy import Engine, create_engine, delete, event, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.authz.models import ReportingLine
 from app.db.base import Base
 from app.modules.org.models import Company, Department, Team, TeamMember, User
 from app.tenancy.context import set_company
 from app.tenancy.filter import UnsafeQueryError, WrongCompanyError
 
-ORG_TABLES = [model.__table__ for model in (Company, Department, Team, User, TeamMember)]
+ORG_TABLES = [
+    model.__table__ for model in (Company, Department, Team, User, TeamMember, ReportingLine)
+]
 
 
 @dataclass
@@ -121,6 +124,17 @@ def test_team_membership_cannot_cross_companies(org: Org, acting_as: str) -> Non
     company = org.company_a if acting_as == "a" else org.company_b
     with org.session_for(company) as session:
         session.add(TeamMember(team_id=org.team_a, user_id=org.user_b))
+        with pytest.raises(IntegrityError):
+            session.commit()
+
+
+@pytest.mark.parametrize("acting_as", ["a", "b"])
+def test_a_reporting_line_cannot_join_people_of_two_companies(org: Org, acting_as: str) -> None:
+    # Make company A's person report to company B's, acting as either company: one of the
+    # two people is always in the other company, so the database refuses the line (E4).
+    company = org.company_a if acting_as == "a" else org.company_b
+    with org.session_for(company) as session:
+        session.add(ReportingLine(manager_id=org.user_b, employee_id=org.user_a))
         with pytest.raises(IntegrityError):
             session.commit()
 

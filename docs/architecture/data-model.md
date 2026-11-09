@@ -4,7 +4,7 @@
 
 Decisions behind this page: [0016 tenancy](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0016-tenant-isolation.md) · [0017 scoped roles](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0017-scoped-role-assignments.md) · [0018 audit](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0018-audit-log-chains.md) · [0019 IDs](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0019-uuidv7-ids.md) · [0020 deletion](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md) · [0021 time](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md) · [0022 SQLAlchemy](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0022-sqlalchemy-and-alembic.md)
 
-> **Status:** partly built. `companies`, `departments`, `teams`, `users`, and `team_members` exist (`app/modules/org/models.py`, migration `0002`); the other tables are created when the features that need them are built. Feature tables (time off, coverage and swaps, tasks, announcements, notifications) are documented on their feature pages.
+> **Status:** partly built. `companies`, `departments`, `teams`, `users`, and `team_members` exist (`app/modules/org/models.py`, migration `0002`), and so do the audit log (`0003`), sessions (`0004`), permissions, roles, and role assignments (`0005`), shifts (`0006`), and `reporting_lines` (`app/authz/models.py`, migration `0007`); the other tables are created when the features that need them are built. Feature tables (time off, coverage and swaps, tasks, announcements, notifications) are documented on their feature pages.
 
 **How to read this page:** the [diagram](#overview-diagram) is a summary. The [entities](#entities) and [relationships](#relationships) sections are the detailed, authoritative version. A change to a table updates all three (see [adding a table](#adding-a-table)).
 
@@ -332,6 +332,8 @@ A `CHECK (manager_id <> employee_id)` constraint stops anyone reporting to thems
 - rejects a line that would create a loop (A reports to B, who reports, directly or indirectly, to A);
 - rejects changes to a person's own reporting lines;
 - writes every added or ended line to the audit log.
+
+Built (slice Z2): the table, the constraint, and adding a line with the first two rules and the audit entry (`add_reporting_line()` in `app/authz/chain.py`). Ending a line, and the rule against changing your own lines, come with the endpoints in Z5.
 
 Loops and "not your own lines" cannot be checked by a single-row constraint, so they are enforced in the service and covered by security tests. What reporting lines allow (being above someone decides *whom* you may act on; permissions decide *what*), and who may add or end them (someone above both people, with `reporting_line.manage`), are set out in [0024](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md).
 

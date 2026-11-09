@@ -198,6 +198,34 @@ def _database_rule_problems(url: str) -> list[str]:
             if _refused(connection, add_user, user("josé@example.com")):
                 problems.append("two different emails (jose, josé) were treated as one")
 
+            # 4 and 5. Reporting lines (Z2): nobody reports to themselves (the CHECK, which
+            # MySQL only enforces from 8.0.16), and a line never joins two companies' people
+            # (the company-aware keys). Two people of company A to try them on.
+            ana, ben = user("ana@example.com"), user("ben@example.com")
+            connection.execute(text(add_user), ana)
+            connection.execute(text(add_user), ben)
+            line_sql = (
+                "INSERT INTO reporting_lines (id, company_id, manager_id, employee_id, "
+                "created_at, updated_at) VALUES (:id, :company, :manager, :employee, NOW(6), "
+                "NOW(6))"
+            )
+
+            def line(company: bytes, manager: object, employee: object) -> dict[str, object]:
+                return {
+                    "id": secrets.token_bytes(16),
+                    "company": company,
+                    "manager": manager,
+                    "employee": employee,
+                }
+
+            if not _refused(connection, line_sql, line(company_a, ana["id"], ana["id"])):
+                problems.append("a person could report to themselves")
+            if not _refused(connection, line_sql, line(company_b, ana["id"], ben["id"])):
+                problems.append("a reporting line could join people of another company")
+            # And the rule check itself works: a proper line in company A is accepted.
+            if _refused(connection, line_sql, line(company_a, ana["id"], ben["id"])):
+                problems.append("a valid reporting line was refused")
+
             transaction.rollback()
     finally:
         engine.dispose()

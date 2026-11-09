@@ -22,7 +22,7 @@ from app.audit.models import AuditChainHead, AuditEvent
 from app.auth import sessions
 from app.auth.models import UserSession
 from app.auth.passwords import hash_password
-from app.authz.models import Permission, Role, RoleAssignment, RolePermission
+from app.authz.models import Permission, ReportingLine, Role, RoleAssignment, RolePermission
 from app.core.config import Settings
 from app.db.base import Base, utcnow
 from app.db.session import get_session
@@ -52,6 +52,7 @@ TABLES = [
     Role.__table__,
     RolePermission.__table__,
     RoleAssignment.__table__,
+    ReportingLine.__table__,
 ]
 
 

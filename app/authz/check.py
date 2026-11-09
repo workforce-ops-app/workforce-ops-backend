@@ -16,8 +16,8 @@ It follows the flowchart on the authorization page, top to bottom:
    - company: one of the assignments must be for the whole company.
    - record:  one of the assignments' scopes must cover the target.
    - person:  the target must be someone else, an assignment's scope must cover them, AND
-              the user must be above them. Until reporting lines exist (Z2), only an
-              owner counts as above anyone (the Owner is above everyone).
+              the user must be above them: the Owner is above everyone; anyone else
+              through reporting lines (app/authz/chain.py).
 
 Without a target, record and person checks ask "anywhere at all?": used before listing,
 where scope_filter() (below) then limits the rows. Company and self checks work the same
@@ -33,6 +33,7 @@ from fastapi import HTTPException
 from sqlalchemy import ColumnElement, and_, false, or_, select, true
 from sqlalchemy.orm import Session
 
+from app.authz.chain import is_above_in_chain, people_below
 from app.authz.models import Role, RoleAssignment, RolePermission
 from app.authz.registry import Kind, all_permissions, get_permission
 from app.authz.scope import Grant, ScopeColumns, condition_for, covers, resolve
@@ -127,10 +128,12 @@ def is_owner(db: Session, user: User) -> bool:
 def is_above(db: Session, user: User, person: User) -> bool:
     """Whether the user is above the person in the reporting chain.
 
-    Until reporting lines exist (Z2), only the Owner counts: the Owner is above everyone.
-    Nobody is above themselves.
+    The Owner is above everyone; anyone else only through reporting lines. Nobody is above
+    themselves, and a deactivated user is above nobody.
     """
-    return user.id != person.id and is_owner(db, user)
+    if user.id == person.id or user.deactivated_at is not None:
+        return False
+    return is_owner(db, user) or is_above_in_chain(db, user.id, person.id)
 
 
 def _owner_of(db: Session, target: object) -> uuid.UUID | None:
@@ -208,8 +211,14 @@ def scope_filter(db: Session, user: User, code: str, columns: ScopeColumns) -> C
     if permission.kind is Kind.RECORD:
         return in_scope
 
-    # Person: only people the user is above (until Z2: an owner is above everyone else),
-    # and never the user themselves.
-    if columns.employee is None or not is_owner(db, user):
+    # Person: only people the user is above, and never the user themselves. The Owner is
+    # above everyone; anyone else only above the people below them in the chain, which
+    # are looked up first and then matched by ID (chain.people_below explains why).
+    if columns.employee is None:
         return false()
-    return and_(in_scope, columns.employee != user.id)
+    if is_owner(db, user):
+        return and_(in_scope, columns.employee != user.id)
+    below = people_below(db, user.id)
+    if not below:
+        return false()
+    return and_(in_scope, columns.employee.in_(below))
