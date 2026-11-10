@@ -179,8 +179,10 @@ class ReportingLine(IdAndTimestamps, CompanyOwned, Base):
     employee_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary)
     # Null while the line is current. Ending a line keeps it as history (decision 0020).
     ended_at: Mapped[datetime | None] = mapped_column(UTC_DATETIME)
-    # Worked out by MySQL from ended_at, never written by the application: 1 while the line
-    # is current, NULL once it has ended. Exists only for the unique key above.
+    # Worked out by the database from ended_at, never written by the application: 1 while
+    # the line is current, NULL once it has ended (a CASE without ELSE gives NULL). Exists
+    # only for the unique key above. CASE rather than MySQL's IF(), so the SQLite the tests
+    # use understands it too.
     current_line: Mapped[bool | None] = mapped_column(
-        Boolean, Computed("IF(ended_at IS NULL, 1, NULL)", persisted=True)
+        Boolean, Computed("CASE WHEN ended_at IS NULL THEN 1 END", persisted=True)
     )

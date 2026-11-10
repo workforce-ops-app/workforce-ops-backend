@@ -45,7 +45,7 @@ def upgrade() -> None:
         sa.Column(
             "current_line",
             sa.Boolean(),
-            sa.Computed("IF(ended_at IS NULL, 1, NULL)", persisted=True),
+            sa.Computed("CASE WHEN ended_at IS NULL THEN 1 END", persisted=True),
             nullable=True,
         ),
         _moment("created_at", False),
