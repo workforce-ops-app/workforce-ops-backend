@@ -19,7 +19,9 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
+    Computed,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -158,6 +160,17 @@ class ReportingLine(IdAndTimestamps, CompanyOwned, Base):
         # Nobody reports to themselves. Loops through other people need the chain, so the
         # service checks those (app/authz/chain.py, add_reporting_line).
         CheckConstraint("manager_id <> employee_id", name="reporting_lines_not_self"),
+        # One current line per pair, enforced by the database too (the service checks it
+        # first, under a lock). current_line is 1 while the line is current and NULL once
+        # it has ended; a unique key allows any number of NULLs, so ended lines (history)
+        # never block adding the same line again later.
+        UniqueConstraint(
+            "company_id",
+            "manager_id",
+            "employee_id",
+            "current_line",
+            name="uq_reporting_lines_current",
+        ),
     )
 
     # The person reported to.
@@ -166,3 +179,8 @@ class ReportingLine(IdAndTimestamps, CompanyOwned, Base):
     employee_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary)
     # Null while the line is current. Ending a line keeps it as history (decision 0020).
     ended_at: Mapped[datetime | None] = mapped_column(UTC_DATETIME)
+    # Worked out by MySQL from ended_at, never written by the application: 1 while the line
+    # is current, NULL once it has ended. Exists only for the unique key above.
+    current_line: Mapped[bool | None] = mapped_column(
+        Boolean, Computed("IF(ended_at IS NULL, 1, NULL)", persisted=True)
+    )

@@ -173,6 +173,42 @@ def test_adding_a_line_writes_an_audit_entry(org: Org) -> None:
         }
 
 
+def test_an_ended_line_can_be_added_again(org: Org) -> None:
+    # Regression: chef manages Ana, the line ends, and later the same line is added again.
+    # The ended line stays as history and must not count as a duplicate, and the new line
+    # must put chef above Ana again.
+    lines(org, ("chef", "ana"))
+    with org.a() as db:
+        db.scalars(select(ReportingLine)).one().ended_at = utcnow()
+        db.commit()
+    assert not above(org, "chef", "ana")
+
+    lines(org, ("chef", "ana"))  # would raise ReportingLineError if history counted
+    assert above(org, "chef", "ana")
+    with org.a() as db:
+        rows = db.scalars(select(ReportingLine)).all()
+        # Two rows for the pair: the ended one (history) and the current one.
+        assert sorted(row.ended_at is None for row in rows) == [False, True]
+        # Both additions were audited.
+        added = db.scalars(select(AuditEvent).where(AuditEvent.action == "reporting_line.added"))
+        assert len(added.all()) == 2
+
+
+def test_the_database_also_refuses_a_second_current_line(org: Org) -> None:
+    # Even past the service: the unique key on (company, manager, employee, current_line).
+    lines(org, ("chef", "ana"))
+    with org.a() as db:
+        db.add(ReportingLine(manager_id=org.ids["chef"], employee_id=org.ids["ana"]))
+        with pytest.raises(IntegrityError):
+            db.flush()
+
+
+# Two requests adding lines at the same moment (the company lock and the fresh reads in
+# add_reporting_line) can only be tried on MySQL: these tests run on SQLite, which has no
+# row locks and only one connection here. scripts/check_migrations.py tries them on a
+# fresh MySQL 8.4 in CI (_race_problems).
+
+
 def test_a_loop_that_slipped_in_still_ends_the_walk(org: Org) -> None:
     # Two lines added straight to the database, past the loop check: chef <-> ana. The walk
     # must still end (UNION drops people already found) and never count you above yourself.
@@ -182,6 +218,10 @@ def test_a_loop_that_slipped_in_still_ends_the_walk(org: Org) -> None:
         db.commit()
         assert people_below(db, org.ids["chef"]) == {org.ids["ana"]}
     assert not allowed(org, "chef", "user.manage", "chef")
+    # The step-by-step loop check in add_reporting_line() must end too: checking chef ->
+    # ben walks up from chef to ana and back to chef, then stops.
+    lines(org, ("chef", "ben"))
+    assert above(org, "chef", "ben")
 
 
 # --- Companies ---------------------------------------------------------------------------

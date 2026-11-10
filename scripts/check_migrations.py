@@ -13,6 +13,9 @@
 4. The database's own rules hold in MySQL itself (_database_rule_problems): tests run on
    SQLite, which compares text differently, so the rules that depend on MySQL are tried
    here on the real thing.
+5. Changes that must take turns do so in MySQL (_race_problems): two requests adding
+   reporting lines at the same moment cannot add a duplicate or a loop. SQLite has no row
+   locks, so this too can only be tried on MySQL.
 
 The database is a throwaway Docker container (removed afterwards), unless
 MIGRATION_CHECK_DATABASE_URL points at an empty database to use instead.
@@ -223,10 +226,147 @@ def _database_rule_problems(url: str) -> list[str]:
             if not _refused(connection, line_sql, line(company_b, ana["id"], ben["id"])):
                 problems.append("a reporting line could join people of another company")
             # And the rule check itself works: a proper line in company A is accepted.
-            if _refused(connection, line_sql, line(company_a, ana["id"], ben["id"])):
+            current = line(company_a, ana["id"], ben["id"])
+            if _refused(connection, line_sql, current):
                 problems.append("a valid reporting line was refused")
 
+            # 6. One current line per pair (the current_line unique key): a second current
+            # line is refused, but once the first has ended the same line may be added
+            # again. This depends on MySQL's generated column and on a unique key allowing
+            # many NULLs, so it is tried here on the real thing.
+            connection.execute(text(line_sql), current)
+            if not _refused(connection, line_sql, line(company_a, ana["id"], ben["id"])):
+                problems.append("a second current reporting line for the same pair was stored")
+            connection.execute(
+                text("UPDATE reporting_lines SET ended_at = NOW(6) WHERE id = :id"),
+                {"id": current["id"]},
+            )
+            if _refused(connection, line_sql, line(company_a, ana["id"], ben["id"])):
+                problems.append("an ended reporting line blocked adding the same line again")
+
             transaction.rollback()
+    finally:
+        engine.dispose()
+    return problems
+
+
+def _race_problems(url: str) -> list[str]:
+    """Try two requests changing reporting lines at the same moment; return what failed.
+
+    add_reporting_line() locks the company first and then checks with fresh, locking
+    reads (app/authz/chain.py). Both only mean something in MySQL: the tests run on
+    SQLite, which has no row locks. So the races are tried here, through the app's own
+    code and sessions, on the migrated MySQL. These checks commit (two transactions must
+    see each other's work), so main() runs them before the downgrade, which drops
+    everything again.
+    """
+    import threading
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    from app.audit import Actor
+    from app.authz.chain import ReportingLineError, add_reporting_line, lock_reporting_lines
+    from app.authz.models import ReportingLine
+    from app.core.config import get_settings
+    from app.modules.org.models import Company, Department, User
+    from app.tenancy.context import set_company
+
+    # Adding a line writes a signed audit entry, so the settings need a signing key; a
+    # throwaway one is enough for a throwaway database.
+    os.environ.setdefault("AUDIT_SIGNING_KEY", secrets.token_urlsafe(32))
+    get_settings.cache_clear()
+
+    problems = []
+    engine = create_engine(url)
+    try:
+        # A company, made by platform code (a session with no company).
+        with Session(engine) as platform:
+            company = Company(name="race probe", timezone="UTC")
+            platform.add(company)
+            platform.commit()
+            company_id = company.id
+
+        def session() -> Session:
+            """A new session for the company: one per simulated request."""
+            db = Session(engine)
+            set_company(db, company_id)
+            return db
+
+        # Four people in one department.
+        with session() as db:
+            department = Department(name="Kitchen")
+            db.add(department)
+            db.flush()
+            people = {
+                name: User(
+                    email=f"{name}@race.example.com",
+                    display_name=name,
+                    department_id=department.id,
+                )
+                for name in ("a", "b", "c", "d")
+            }
+            db.add_all(people.values())
+            db.commit()
+            ids = {name: person.id for name, person in people.items()}
+
+        def add(db: Session, manager: str, employee: str) -> None:
+            add_reporting_line(
+                db, Actor.system(), manager_id=ids[manager], employee_id=ids[employee]
+            )
+
+        def refused_after_late_commit(first: tuple[str, str], second: tuple[str, str]) -> bool:
+            """Request 2 has already read something (as its permission check would), which
+            fixes what its ordinary SELECTs see under MySQL's REPEATABLE READ. Request 1
+            then adds `first` and commits. Is request 2's `second` still refused?"""
+            with session() as request_2:
+                request_2.scalars(select(ReportingLine)).all()  # its view is now fixed
+                with session() as request_1:
+                    add(request_1, *first)
+                    request_1.commit()
+                try:
+                    add(request_2, *second)
+                except ReportingLineError:
+                    return True
+                except DBAPIError:
+                    # Refused by the database's unique key instead: still safe, but it
+                    # means the service's own check read an old view.
+                    return False
+                return False
+
+        # 1. The same line, added by two requests: the second must be refused.
+        if not refused_after_late_commit(("a", "b"), ("a", "b")):
+            problems.append("a duplicate reporting line committed meanwhile was not seen")
+        # 2. b -> c by one request, c -> b by another: fine alone, a loop together.
+        if not refused_after_late_commit(("b", "c"), ("c", "b")):
+            problems.append("a reporting line loop committed meanwhile was not seen")
+
+        # 3. Two changes in one company take turns: while request 1 holds the company lock,
+        # request 2 (in another thread) must wait, and go ahead once request 1 commits.
+        # Request 1 only takes the lock and writes nothing: adding a line also locks the
+        # audit log's chain head, which would make request 2 wait even without the
+        # company lock, so this tries the company lock on its own.
+        errors: list[BaseException] = []
+
+        def second_request() -> None:
+            try:
+                with session() as request_2:
+                    add(request_2, "c", "d")
+                    request_2.commit()
+            except BaseException as error:  # reported below
+                errors.append(error)
+
+        with session() as request_1:
+            lock_reporting_lines(request_1)
+            waiting = threading.Thread(target=second_request)
+            waiting.start()
+            waiting.join(timeout=2)
+            if not waiting.is_alive():
+                problems.append("a second reporting line change did not wait for the first")
+            request_1.commit()
+        waiting.join(timeout=30)
+        if waiting.is_alive() or errors:
+            problems.append(f"the waiting reporting line change did not finish: {errors}")
     finally:
         engine.dispose()
     return problems
@@ -255,10 +395,12 @@ def main() -> int:
 
         get_settings.cache_clear()
         command.upgrade(config, "head")
+        # The race checks commit rows, so they run before the downgrade removes everything.
+        race_problems = _race_problems(url)
         command.downgrade(config, "base")
         command.upgrade(config, "head")
         differences = _differences_from_models(url)
-        rule_problems = _database_rule_problems(url)
+        rule_problems = _database_rule_problems(url) + race_problems
     finally:
         if container:
             subprocess.run([_docker(), "stop", container], capture_output=True)  # noqa: S603
