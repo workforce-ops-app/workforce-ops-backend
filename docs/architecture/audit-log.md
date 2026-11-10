@@ -60,7 +60,7 @@ Each feature page lists the audit events its actions write; every slice from L1 
 | Settings | `app/core/config.py` | `AUDIT_SIGNING_KEY` (at least 32 characters) and `AUDIT_KEY_ID` |
 | Tests | `tests/unit/test_audit_record.py`, `tests/security/test_audit_log.py` | numbering, links, signatures, rollback; tampering, forgery without the key, secrets in details, and crossing companies |
 
-The audit tables are not `CompanyOwned` (the platform chain has no company), so the tenancy coverage test lists them as its one stated exception. Two consequences for later slices:
+The audit tables are not `CompanyOwned` (the platform chain has no company), so the tenancy coverage test lists them as a stated exception (the detection design adds `platform_security_events` as the second, [detection](../features/detection.md#data-two-tables)). Two consequences for later slices:
 - **Reading is not filtered by company.** A query on `AuditEvent` in a company's session would see every company's entries. Nothing reads the log yet; the viewer (#58) must limit every read to the session's chain itself.
 - **Details are checked by key name only.** `{"password": ...}` is refused, but a value that happens to contain a secret cannot be recognized, so callers never put credentials into details at all.
 
