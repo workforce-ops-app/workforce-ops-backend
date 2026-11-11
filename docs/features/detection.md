@@ -1,6 +1,6 @@
 # Detection and the security page
 
-- **Status:** design (next tier)
+- **Status:** the detector is built (DT3, #129: `app/detection/`); storing events, the detection layer, the endpoints, and the page follow in the other slices
 - **Related:** design workforce-ops-app/workforce-ops-backend#115, detection workforce-ops-app/workforce-ops-backend#116, security page workforce-ops-app/workforce-ops-frontend#61, tracker workforce-ops-app/.github#91; refused requests workforce-ops-app/workforce-ops-backend#92; method [decision 0030](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0030-security-study-method.md); results go to the [research repository](https://github.com/workforce-ops-app/workforce-ops-research)
 
 ## In short
@@ -56,7 +56,7 @@ The types agreed at the design review (#17, topic 7), plus format strings from t
 | Command injection | `command_injection` | shell separators (`;`, `&&`, `\|`, backticks, `$(`) followed by a command name | code injection |
 | Format string and template injection | `format_string` | `{0.__class__}`, `%n`, `%x` runs, `{{ ... }}`, `${...}` | format string vulnerabilities |
 
-Each pattern has a stable ID (for example `SQLI-03`) so events, tests, and the study's results can refer to it.
+Each pattern has a stable ID (for example `SQLI-03`) so events, tests, and the study's results can refer to it. The patterns, each with a one-line description, are in `app/detection/patterns.py`. An ID is never reused: a pattern changed in a way that changes what it matches gets a new ID.
 
 ### Rules
 
@@ -84,7 +84,9 @@ Attackers disguise input, so each value is simplified before matching, in this o
 4. Lowercase.
 5. Collapse runs of whitespace and remove SQL inline comments (`/**/`), which attackers use in place of spaces.
 
-The normalized text is used only for matching. The stored excerpt is the original text, so the security page shows what was really sent.
+Each value is matched twice: in this normalized form, and in the same form **without step 1**. URL-decoding can destroy an attack as well as reveal one: in the printf attack `%08x`, `%08` reads as an encoded byte, so the decoded text no longer contains it. A pattern counts as matched if either form matches.
+
+The normalized text is used only for matching. The stored excerpt is the original text, so the security page shows what was really sent. A match position in the normalized text does not line up with the original once anything was decoded, so the excerpt is the original value when it is 200 characters or fewer, and otherwise a 200 character window at the same relative position.
 
 ### What is collected, and what never is
 
