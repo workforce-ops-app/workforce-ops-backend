@@ -8,7 +8,7 @@
 | [Security controls](security-controls.md) (every protection, where it lives in the code, and its test; keys, algorithms, and logs) | current for the midterm backend |
 | [Midterm audit](audit-midterm.md) (the backend checked against OWASP ASVS 5.0 Level 2, with its findings) | done 2026-10-12; batch shift changes checked when they merge |
 | [Findings log](findings-log.md) (fixed findings only; entries are added after a finding's fix merges, [security policy](https://github.com/workforce-ops-app/.github/blob/main/SECURITY.md)) | started; no fixes merged yet |
-| Detection study (pattern-based detection results) | to do: next tier ([0030](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0030-security-study-method.md)) |
+| Detection study (pattern-based detection results) | designed in [detection](../features/detection.md#detection-study-rq1); results will be in the [research repository](https://github.com/workforce-ops-app/workforce-ops-research) |
 
 ## Scope (from the project proposal)
 

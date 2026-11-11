@@ -18,6 +18,6 @@ The backend is organized by feature module ([decision 0004](https://github.com/w
 | [Authorization](authorization.md) (permissions, starting roles, scopes, reporting chain, escalation rules) | design |
 | [Authentication and sessions](authentication.md) (passwords, sessions, CSRF, lockouts, one-time links, password re-entry) | design |
 | [Audit log](audit-log.md) (signed per-company chains) | design |
-| Detection (pattern-based detection of attack attempts) | to do: next tier ([0030](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0030-security-study-method.md)) |
+| Detection (pattern-based detection of attack attempts) | design: [detection](../features/detection.md) ([0030](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0030-security-study-method.md)) |
 | Background jobs (time-off review deadline, nightly audit verification, session and link cleanup) | to do: written with the first job (Phase 2) |
 | [Glossary](glossary.md) | kept current with each page |
