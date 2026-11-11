@@ -232,6 +232,12 @@ def update_shift(db: Session, user: User, shift_id: uuid.UUID, body: ShiftUpdate
     # Lock the person and the shift before changing anything (see _lock_for_change); this
     # also reloads the shift, so the checks below see it as it is now.
     _lock_for_change(db, [item.id])
+    # Check permission AGAIN, on the shift as it is now. The check above used the copy this
+    # request first read; while it waited for the locks, someone may have reassigned the
+    # shift or made it open, which can take it out of this user's scope (a team manager
+    # covers their members' shifts, not open ones). The first check stays, so a user who
+    # may not edit the shift never waits for, or holds, its locks.
+    authorize(db, user, "schedule.edit", item)
     _check_changeable(item)
 
     changed = sorted(body.model_fields_set)
@@ -279,10 +285,16 @@ def _assign(db: Session, user: User, shift_id: uuid.UUID, employee_id: uuid.UUID
     item = repository.shift(db, shift_id)
     if item is None:
         raise NotFound()
-    authorize(db, user, "schedule.edit", item)  # the shift as it is now...
+    authorize(db, user, "schedule.edit", item)  # the shift as it was first read...
     # Lock the previous person, the new one, and the shift before changing anything (see
     # _lock_for_change); this also reloads the shift, so the checks see it as it is now.
     _lock_for_change(db, [item.id], also=employee_id)
+    # Check permission AGAIN, on the shift as it is now. The check above used the copy this
+    # request first read; while it waited for the locks, someone may have reassigned the
+    # shift or made it open, which can take it out of this user's scope (a team manager
+    # covers their members' shifts, not open ones). The first check stays, so a user who
+    # may not edit the shift never waits for, or holds, its locks.
+    authorize(db, user, "schedule.edit", item)
     _check_changeable(item)
     previous = item.employee_id
 
@@ -325,6 +337,12 @@ def _cancel(db: Session, user: User, shift_id: uuid.UUID) -> Shift:
     authorize(db, user, "schedule.edit", item)
     # Lock the person and the shift before changing it (see _lock_for_change).
     _lock_for_change(db, [item.id])
+    # Check permission AGAIN, on the shift as it is now. The check above used the copy this
+    # request first read; while it waited for the locks, someone may have reassigned the
+    # shift or made it open, which can take it out of this user's scope (a team manager
+    # covers their members' shifts, not open ones). The first check stays, so a user who
+    # may not edit the shift never waits for, or holds, its locks.
+    authorize(db, user, "schedule.edit", item)
     _check_changeable(item)
     item.status = "cancelled"
     record(
