@@ -37,10 +37,11 @@ def workplace_zone(db: Session, dept: Department) -> str:
 
 def person(db: Session, user_id: uuid.UUID, *, lock: bool = False) -> User | None:
     """A person of the session's company. lock=True locks their row until the transaction
-    ends (SELECT ... FOR UPDATE): two managers giving the same person overlapping shifts at
-    the same moment then take turns. Together with the fresh read in has_overlap(), the
-    double-booking check cannot be raced."""
-    return db.get(User, user_id, with_for_update=lock)
+    ends (SELECT ... FOR UPDATE) and reads its newest committed version: two managers giving
+    the same person overlapping shifts at the same moment then take turns, and a person
+    deactivated meanwhile is seen as deactivated. Together with the fresh read in
+    has_overlap(), the double-booking check cannot be raced."""
+    return db.get(User, user_id, with_for_update=lock, populate_existing=lock)
 
 
 def has_overlap(
@@ -82,9 +83,15 @@ def has_overlap(
     return db.scalar(found) is not None
 
 
-def shift(db: Session, shift_id: uuid.UUID) -> Shift | None:
-    """One shift of the session's company (another company's looks like none: 404)."""
-    return db.get(Shift, shift_id)
+def shift(db: Session, shift_id: uuid.UUID, *, lock: bool = False) -> Shift | None:
+    """One shift of the session's company (another company's looks like none: 404).
+
+    lock=True locks the shift's row until the transaction ends (SELECT ... FOR UPDATE) and
+    reads its newest committed version, replacing the copy this session already loaded
+    (populate_existing). A locking read is never served from the old view, so this is how
+    a change learns what the shift looks like now, not when the request started.
+    """
+    return db.get(Shift, shift_id, with_for_update=lock, populate_existing=lock)
 
 
 def names(db: Session, item: Shift) -> tuple[str, str | None]:

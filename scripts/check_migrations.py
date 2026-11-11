@@ -31,6 +31,7 @@ import socket
 import subprocess
 import sys
 import time
+from typing import TYPE_CHECKING
 
 from alembic import command
 from alembic.autogenerate import compare_metadata
@@ -39,6 +40,13 @@ from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from sqlalchemy import Connection, Engine, create_engine, make_url, text
 from sqlalchemy.exc import DBAPIError, OperationalError
+
+if TYPE_CHECKING:  # names used only in type hints
+    import uuid
+    from collections.abc import Callable
+    from datetime import datetime
+
+    from sqlalchemy.orm import Session
 
 MYSQL_IMAGE = "mysql:8.4"
 READY_TIMEOUT_SECONDS = 180
@@ -441,6 +449,7 @@ def _shift_race_problems(engine: Engine) -> list[str]:
         db.add_all(shifts)
         db.commit()
         person_id = person.id
+        department_id = department.id
         first_id, second_id = (item.id for item in shifts)
 
     # Request 2 reads its shift first, as the endpoint does before checking permission.
@@ -465,6 +474,99 @@ def _shift_race_problems(engine: Engine) -> list[str]:
             pass  # refused: the overlap committed meanwhile was seen
         else:
             problems.append("an overlapping shift committed meanwhile was not seen")
+
+    # 2. Two assignments truly at the same moment, through the service as an endpoint calls
+    #    it (assign_shift, with its permission checks and audit entry). Both requests have a
+    #    shift change to make while they compete for the same person's lock. Exactly one
+    #    must succeed and the other be refused (409); a deadlock, or any other error, means
+    #    the locks are taken in different orders (_lock_for_change). A deadlock only happens
+    #    when the timing is unlucky, so this is tried several times.
+    problems += _concurrent_assignment_problems(session, department_id, person_id, tomorrow)
+    return problems
+
+
+def _concurrent_assignment_problems(
+    session: Callable[[], Session],
+    department_id: uuid.UUID,
+    person_id: uuid.UUID,
+    first_day: datetime,
+) -> list[str]:
+    """Rounds of two threads assigning overlapping shifts to one person at the same moment."""
+    import threading
+    from datetime import timedelta
+
+    from app.audit import Actor
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.modules.org.models import User
+    from app.modules.schedules import service
+    from app.modules.schedules.models import Shift
+
+    rounds = 10
+    problems = []
+
+    # Someone allowed to assign shifts: an owner, given the starting Owner role.
+    with session() as db:
+        roles = create_starting_roles(db, Actor.system())
+        owner = User(
+            email="owner@race.example.com", display_name="owner", department_id=department_id
+        )
+        db.add(owner)
+        db.flush()
+        assign_role(db, Actor.system(), user_id=owner.id, role=roles["owner"], scope_type="company")
+        db.commit()
+        owner_id = owner.id
+
+    for number in range(rounds):
+        # Two open shifts that overlap (09:00 to 17:00 and 12:00 to 20:00), on a day of
+        # their own, so earlier rounds' bookings never get in the way.
+        day = first_day + timedelta(days=number + 1)
+        with session() as db:
+            pair = [
+                Shift(
+                    department_id=department_id,
+                    starts_at=day + timedelta(hours=start),
+                    ends_at=day + timedelta(hours=end),
+                    timezone="UTC",
+                    status="open",
+                )
+                for start, end in ((9, 17), (12, 20))
+            ]
+            db.add_all(pair)
+            db.commit()
+            shift_ids = [item.id for item in pair]
+
+        # Both threads wait at the barrier, then assign at the same moment.
+        start_together = threading.Barrier(2)
+        outcomes: list[str] = []
+
+        def request(
+            shift_id: uuid.UUID, start_together: threading.Barrier, outcomes: list[str]
+        ) -> None:
+            with session() as db:
+                acting = db.get(User, owner_id)
+                if acting is None:  # made above, in this company
+                    outcomes.append("error: the owner is missing")
+                    return
+                start_together.wait()
+                try:
+                    service.assign_shift(db, acting, shift_id, person_id)
+                    outcomes.append("assigned")
+                except service.Conflict:
+                    outcomes.append("refused")
+                except Exception as error:  # a deadlock, or anything else: reported below
+                    outcomes.append(f"error: {error!r}"[:300])
+
+        threads = [
+            threading.Thread(target=request, args=(shift_id, start_together, outcomes))
+            for shift_id in shift_ids
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        if sorted(outcomes) != ["assigned", "refused"]:
+            problems.append(f"concurrent assignments, round {number + 1}: {outcomes}")
+            break  # one failing round is enough to show the problem
     return problems
 
 
