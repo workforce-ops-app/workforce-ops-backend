@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session
 
 from app.audit import Actor
 from app.audit.models import AuditChainHead, AuditEvent
-from app.authz.models import Permission, Role, RoleAssignment, RolePermission
+from app.authz.models import Permission, ReportingLine, Role, RoleAssignment, RolePermission
 from app.authz.roles import assign_role, create_starting_roles
 from app.authz.scope import Scope, scope_resolver
 from app.db.base import Base, utcnow
@@ -48,6 +48,7 @@ TABLES = [
         Role,
         RolePermission,
         RoleAssignment,
+        ReportingLine,
         AuditChainHead,
         AuditEvent,
     )

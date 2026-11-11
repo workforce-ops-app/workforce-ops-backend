@@ -8,6 +8,7 @@ where (data-model.md, decisions 0017 and 0024).
 - role_permissions: which permissions each role grants.
 - role_assignments: gives a person a role and says WHERE it applies: the whole company,
   one department, one team, or one employee.
+- reporting_lines: who reports to whom; decides WHOM a person permission may act on.
 
 Company-owned tables follow the company-aware key convention (tenancy.md, layer 2): every
 link goes through (company_id, <x>_id), so a role or a scope can never point into another
@@ -18,7 +19,9 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
+    Computed,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
@@ -134,3 +137,52 @@ class RoleAssignment(IdAndTimestamps, CompanyOwned, Base):
     department_id: Mapped[uuid.UUID | None] = mapped_column(UUIDBinary)
     team_id: Mapped[uuid.UUID | None] = mapped_column(UUIDBinary)
     employee_id: Mapped[uuid.UUID | None] = mapped_column(UUIDBinary)
+
+
+class ReportingLine(IdAndTimestamps, CompanyOwned, Base):
+    """One person reports to another (data-model.md, reporting_lines; decision 0024).
+
+    Following the lines upwards from a person gives everyone above them
+    (app/authz/chain.py). A person may report to several managers, and a manager may have
+    many reports, so this is a table of its own rather than a column on users.
+    """
+
+    __tablename__ = "reporting_lines"
+    __table_args__ = (
+        ForeignKeyConstraint(["company_id"], ["companies.id"]),
+        UniqueConstraint("company_id", "id"),
+        # Layer 2: both people belong to this company.
+        ForeignKeyConstraint(["company_id", "manager_id"], ["users.company_id", "users.id"]),
+        ForeignKeyConstraint(["company_id", "employee_id"], ["users.company_id", "users.id"]),
+        # Walking up starts from the employee, walking down from the manager.
+        Index("ix_reporting_lines_company_employee", "company_id", "employee_id"),
+        Index("ix_reporting_lines_company_manager", "company_id", "manager_id"),
+        # Nobody reports to themselves. Loops through other people need the chain, so the
+        # service checks those (app/authz/chain.py, add_reporting_line).
+        CheckConstraint("manager_id <> employee_id", name="reporting_lines_not_self"),
+        # One current line per pair, enforced by the database too (the service checks it
+        # first, under a lock). current_line is 1 while the line is current and NULL once
+        # it has ended; a unique key allows any number of NULLs, so ended lines (history)
+        # never block adding the same line again later.
+        UniqueConstraint(
+            "company_id",
+            "manager_id",
+            "employee_id",
+            "current_line",
+            name="uq_reporting_lines_current",
+        ),
+    )
+
+    # The person reported to.
+    manager_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary)
+    # The person reporting.
+    employee_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary)
+    # Null while the line is current. Ending a line keeps it as history (decision 0020).
+    ended_at: Mapped[datetime | None] = mapped_column(UTC_DATETIME)
+    # Worked out by the database from ended_at, never written by the application: 1 while
+    # the line is current, NULL once it has ended (a CASE without ELSE gives NULL). Exists
+    # only for the unique key above. CASE rather than MySQL's IF(), so the SQLite the tests
+    # use understands it too.
+    current_line: Mapped[bool | None] = mapped_column(
+        Boolean, Computed("CASE WHEN ended_at IS NULL THEN 1 END", persisted=True)
+    )

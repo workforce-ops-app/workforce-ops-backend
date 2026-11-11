@@ -18,7 +18,8 @@ from sqlalchemy.orm import Session
 from app.audit.models import AuditChainHead, AuditEvent
 from app.auth import passwords
 from app.auth.passwords import PasswordRejected, verify_password
-from app.authz.models import Permission, Role, RoleAssignment, RolePermission
+from app.authz.check import Forbidden, authorize
+from app.authz.models import Permission, ReportingLine, Role, RoleAssignment, RolePermission
 from app.core.config import get_settings
 from app.db.base import Base
 from app.modules.org.models import Company, Department, Team, TeamMember, User
@@ -42,6 +43,7 @@ ORG_TABLES = [
         Role,
         RolePermission,
         RoleAssignment,
+        ReportingLine,
         AuditChainHead,
         AuditEvent,
         Shift,
@@ -60,7 +62,13 @@ WAITING = "shifts wait for passwords"
 
 DEMO_PASSWORD = "a calm river bends at dusk"
 # People in each demo company.
-PEOPLE = 9
+PEOPLE = 10
+# The reporting lines each company gets (Z2).
+LINES = len(seed_demo.REPORTING_LINES)
+# The end of a company's line when a rerun has nothing left to add.
+NOTHING_NEW = "0 reporting lines added; demo password set for 0 accounts; 0 shifts added"
+# Every account given the demo password.
+ALL_PASSWORDS = f"demo password set for {PEOPLE} accounts"
 
 
 def stored(moment: datetime) -> datetime:
@@ -124,8 +132,8 @@ def test_it_creates_two_alike_companies(engine: Engine) -> None:
     lines = seed_demo.seed(engine, now=NOW)
 
     assert lines == [
-        f"Northwind Cafe: created; {NO_PASSWORD}; {WAITING}",
-        f"Summit Outfitters: created; {NO_PASSWORD}; {WAITING}",
+        f"Northwind Cafe: created; {LINES} reporting lines added; {NO_PASSWORD}; {WAITING}",
+        f"Summit Outfitters: created; {LINES} reporting lines added; {NO_PASSWORD}; {WAITING}",
     ]
     ids = company_ids(engine)
     assert set(ids) == {"Northwind Cafe", "Summit Outfitters"}
@@ -151,8 +159,8 @@ def test_running_it_twice_changes_nothing(engine: Engine) -> None:
     lines = seed_demo.seed(engine, DEMO_PASSWORD, NOW)
 
     assert lines == [
-        "Northwind Cafe: already there; demo password set for 0 accounts; 0 shifts added",
-        "Summit Outfitters: already there; demo password set for 0 accounts; 0 shifts added",
+        f"Northwind Cafe: already there; {NOTHING_NEW}",
+        f"Summit Outfitters: already there; {NOTHING_NEW}",
     ]
     assert len(company_ids(engine)) == 2
     for company_id in company_ids(engine).values():
@@ -222,8 +230,8 @@ def test_a_demo_password_is_hashed_for_every_account(engine: Engine) -> None:
     lines = seed_demo.seed(engine, DEMO_PASSWORD, NOW)
 
     assert lines == [
-        f"Northwind Cafe: created; demo password set for {PEOPLE} accounts; {ADDED}",
-        f"Summit Outfitters: created; demo password set for {PEOPLE} accounts; {ADDED}",
+        f"Northwind Cafe: created; {LINES} reporting lines added; {ALL_PASSWORDS}; {ADDED}",
+        f"Summit Outfitters: created; {LINES} reporting lines added; {ALL_PASSWORDS}; {ADDED}",
     ]
     users = all_users(engine)
     # Stored as hashes that verify, each with its own salt, never as the password itself.
@@ -239,11 +247,12 @@ def test_a_rerun_only_fills_in_missing_passwords(engine: Engine) -> None:
     hashes = {u.id: u.password_hash for u in all_users(engine)}
 
     assert lines[0] == (
-        f"Northwind Cafe: already there; demo password set for {PEOPLE} accounts; {ADDED}"
+        "Northwind Cafe: already there; 0 reporting lines added; "
+        f"demo password set for {PEOPLE} accounts; {ADDED}"
     )
     # A third run changes nothing: everyone already has a password, and the shifts exist.
     assert seed_demo.seed(engine, DEMO_PASSWORD, NOW)[0] == (
-        "Northwind Cafe: already there; demo password set for 0 accounts; 0 shifts added"
+        f"Northwind Cafe: already there; {NOTHING_NEW}"
     )
     assert {u.id: u.password_hash for u in all_users(engine)} == hashes
 
@@ -350,7 +359,7 @@ def test_main_reports_a_refused_demo_shift(
         assert seed_demo.main() == 1
     finally:
         get_settings.cache_clear()
-    assert "demo shift refused: Northwind Cafe: Kitchen" in capsys.readouterr().out
+    assert "demo data refused: Northwind Cafe: Kitchen" in capsys.readouterr().out
 
 
 def test_main_refuses_a_weak_demo_password(
@@ -577,7 +586,8 @@ def test_a_company_seeded_before_shifts_gets_them_on_the_next_run(engine: Engine
     lines = seed_demo.seed(engine, DEMO_PASSWORD, NOW)
 
     assert lines[0] == (
-        f"Northwind Cafe: already there; demo password set for {PEOPLE} accounts; {ADDED}"
+        f"Northwind Cafe: already there; {LINES} reporting lines added; "
+        f"demo password set for {PEOPLE} accounts; {ADDED}"
     )
     for company_id in company_ids(engine).values():
         assert count(engine, company_id, Shift) == SHIFTS_PER_COMPANY
@@ -625,3 +635,95 @@ def test_a_company_from_an_older_seed_is_told_to_reset(engine: Engine) -> None:
     with pytest.raises(seed_demo.SeedRefused, match="before Felix Grant joined.*reset"):
         seed_demo.seed_shifts(engine, plan, NOW)
     assert count(engine, company_ids(engine)[plan.name], Shift) == 0
+
+
+# --- Reporting lines (Z2) ------------------------------------------------------------------
+
+
+def chain_facts(engine: Engine, company: str) -> tuple[dict[str, set[str]], dict[str, User]]:
+    """Each person's direct managers by name, and the people by name, in one company."""
+    with Session(engine) as session:
+        set_company(session, company_ids(engine)[company])
+        people = {u.display_name: u for u in session.scalars(select(User))}
+        names = {u.id: u.display_name for u in people.values()}
+        managers: dict[str, set[str]] = {name: set() for name in people}
+        for line in session.scalars(select(ReportingLine)):
+            managers[names[line.employee_id]].add(names[line.manager_id])
+        for person in people.values():
+            session.expunge(person)
+        return managers, people
+
+
+def test_the_reporting_lines_cover_every_case_the_rules_need(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    managers, _ = chain_facts(engine, "Northwind Cafe")
+    # Several levels: Cara -> Felix (crew lead) -> Ana (Kitchen) -> Marcus -> Olivia.
+    assert managers["Cara Lund"] == {"Felix Grant"}
+    assert managers["Felix Grant"] == {"Ana Diaz"}
+    assert managers["Ana Diaz"] == {"Marcus Lee"}
+    assert managers["Marcus Lee"] == {"Olivia Hart"}
+    # Two managers.
+    assert managers["Ben Okafor"] == {"Ana Diaz", "Felix Grant"}
+    # An administrator over another administrator.
+    assert managers["Sofia Reyes"] == {"Marcus Lee"}
+    # Nobody above: the owner, and Ella, whom only the owner manages.
+    assert managers["Olivia Hart"] == set()
+    assert managers["Ella Novak"] == set()
+
+
+def test_both_companies_get_the_same_shape_of_chain(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    for plan in seed_demo.DEMO_COMPANIES:
+        managers, _ = chain_facts(engine, plan.name)
+        people = plan.people
+        for manager, employee in seed_demo.REPORTING_LINES:
+            assert people[manager].name in managers[people[employee].name]
+        assert sum(len(m) for m in managers.values()) == LINES
+
+
+def test_the_seeded_chain_decides_who_may_act_on_whom(engine: Engine) -> None:
+    # The demo data through authorize() (app/authz/check.py), as the application uses it.
+    seed_demo.seed(engine, now=NOW)
+    with Session(engine) as session:
+        set_company(session, company_ids(engine)["Northwind Cafe"])
+        people = {u.display_name: u for u in session.scalars(select(User))}
+        # Ana manages the Kitchen and is above Ben: she may review his time off.
+        authorize(session, people["Ana Diaz"], "time_off.review", people["Ben Okafor"])
+        # Priya manages Front of House, but nobody reports to her except Diego: not Ella.
+        with pytest.raises(Forbidden):
+            authorize(session, people["Priya Shah"], "time_off.review", people["Ella Novak"])
+        # Sofia is an administrator, but below Marcus: she may not manage his account.
+        with pytest.raises(Forbidden):
+            authorize(session, people["Sofia Reyes"], "user.manage", people["Marcus Lee"])
+        # Marcus is above Cara through two managers.
+        authorize(session, people["Marcus Lee"], "user.manage", people["Cara Lund"])
+
+
+def test_each_reporting_line_is_audited(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    company_id = company_ids(engine)["Northwind Cafe"]
+    with Session(engine) as session:
+        set_company(session, company_id)
+        # The audit log is not filtered by company (audit-log.md), so ask for this
+        # company's entries by name.
+        added = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.action == "reporting_line.added", AuditEvent.company_id == company_id
+            )
+        ).all()
+        assert len(added) == LINES
+        assert all(entry.actor_type == "system" for entry in added)
+
+
+def test_a_company_seeded_before_the_second_administrator_must_be_reset(engine: Engine) -> None:
+    # As if seeded by an older script: the company exists without Sofia Reyes.
+    plan = seed_demo.DEMO_COMPANIES[0]
+    older = seed_demo.CompanyPlan(
+        plan.name, plan.timezone, plan.email_domain, plan.people[: seed_demo.SECOND_ADMINISTRATOR]
+    )
+    seed_demo.seed_company(engine, older)
+    with pytest.raises(seed_demo.SeedRefused) as refused:
+        seed_demo.seed_reporting_lines(engine, plan)
+    assert "seeded before Sofia Reyes joined the demo data" in str(refused.value)
+    # Nothing was kept.
+    assert count(engine, company_ids(engine)[plan.name], ReportingLine) == 0

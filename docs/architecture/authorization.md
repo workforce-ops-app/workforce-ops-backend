@@ -4,7 +4,7 @@
 
 Decisions: [0017 scoped role assignments](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0017-scoped-role-assignments.md) · [0024 authorization model](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md) · [0025 sensitive actions](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md) · [0029 approval routing](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md) · [0032 delegation limits](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md)
 
-> **Status:** permissions, roles, assignments, `authorize()`, scope resolvers, and the list filter are built (`app/authz/`, migration `0005`, slice Z1). Until reporting lines exist (Z2), only the Owner counts as above anyone, so person permissions work for owners alone; the role endpoints and the delegation rules follow in Z3 to Z5.
+> **Status:** permissions, roles, assignments, `authorize()`, scope resolvers, and the list filter are built (`app/authz/`, migration `0005`, slice Z1), and so is the reporting chain (`app/authz/chain.py`, migration `0007`, slice Z2): person permissions work for anyone above the person. Reporting lines are only added by the seed script so far; the role endpoints, the endpoints to add and end lines, and the delegation rules follow in Z3 to Z5.
 
 ## The two questions every check answers
 
@@ -117,7 +117,7 @@ flowchart TD
 
 Archived roles and deactivated users grant nothing. Permissions are read on every request, so a change to someone's roles takes effect immediately.
 
-**In the code** (`app/authz/check.py`): `authorize(db, user, permission, target)` returns when allowed and raises `Forbidden` (403) or `NotFound` (404, a target of another company). Without a target, a record or person check asks "anywhere at all?", which is what a list endpoint checks before applying the scope filter; company and self checks work the same with or without one. An unknown permission code is a bug and raises `LookupError` instead of answering yes or no. Until reporting lines exist (Z2), "above" means "is an owner".
+**In the code** (`app/authz/check.py`): `authorize(db, user, permission, target)` returns when allowed and raises `Forbidden` (403) or `NotFound` (404, a target of another company). Without a target, a record or person check asks "anywhere at all?", which is what a list endpoint checks before applying the scope filter; company and self checks work the same with or without one. An unknown permission code is a bug and raises `LookupError` instead of answering yes or no. "Above" means the Owner, or above the person through reporting lines ([the reporting chain](#the-reporting-chain)).
 
 ### Scope resolvers
 
@@ -135,7 +135,7 @@ query.where(
 )
 ```
 
-The filter follows exactly the rules of `authorize()` for each kind: self permissions list the user's own rows; company permissions list everything, but only with a company-wide assignment; person permissions list only people the user is above, never the user. A department's people and a team's members are looked up first (in the company's session, so the company filter applies), and the condition names their IDs. Security tests check that the filter and `authorize()` agree for every pair of people, for a record permission and two person permissions.
+The filter follows exactly the rules of `authorize()` for each kind: self permissions list the user's own rows; company permissions list everything, but only with a company-wide assignment; person permissions list only people the user is above, never the user. A department's people and a team's members are looked up first (in the company's session, so the company filter applies), and the condition names their IDs; so are the people below the user in the reporting chain, for the same reason (the company filter does not accept a recursive query nested inside a query on another table). Security tests check that the filter and `authorize()` agree for every pair of people, for a record permission and two person permissions, and again along a chain with several levels, two managers, and peers (`tests/security/test_reporting_chain.py`).
 
 ## The reporting chain
 
@@ -158,6 +158,10 @@ SELECT 1 FROM above_b WHERE manager_id = :a;
 ```
 
 The first `SELECT` finds B's direct managers; the second repeatedly joins "the managers of the people found so far". `UNION` (not `UNION ALL`) drops duplicates, so the walk also stops if a loop ever slipped in.
+
+In the code (`app/authz/chain.py`) the last line reads the `reporting_lines` model instead ("A manages B, or manages someone above B"), because the company filter only accepts a query whose outer `SELECT` names a model it knows. It then adds `company_id = :company` to the start, to every step, and to the outer `SELECT`, as above. The same walk downwards gives everyone below a person, which the list filter uses.
+
+**Ended lines** do not count. **Deactivated people stay in the chain:** a deactivated manager holds no permissions, so they can act on nobody, but the people above them stay above the people below them. Otherwise deactivating one manager would leave their reports manageable only by the Owner.
 
 **Rules for reporting lines** ([0024](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md)):
 - Adding or ending a line needs `reporting_line.manage` and a position above **both** people. The Owner can always do it.
@@ -247,5 +251,6 @@ The session endpoint returns the signed-in user's effective permissions, so the 
 | Starting roles and giving someone a role (audited) | `app/authz/roles.py` |
 | A module's permissions | `app/modules/<feature>/permissions.py`, a list named `PERMISSIONS`; found automatically |
 | A module's scope resolver | `@scope_resolver(Model)` in the module (people: `app/authz/scope.py`) |
-| Reporting chain queries | `app/authz/` (Z2) |
-| Tests | `tests/unit/test_authz.py`, `tests/security/test_authorization.py`; escalation tests AZ1 to AZ15 arrive with the endpoints that make those changes (Z3 to Z5) |
+| The `reporting_lines` table | `app/authz/models.py`, migration `0007` |
+| Reporting chain queries, and adding a line with its data rules (audited) | `app/authz/chain.py`; the endpoints that add and end lines are Z5 |
+| Tests | `tests/unit/test_authz.py`, `tests/security/test_authorization.py`, `tests/security/test_reporting_chain.py` (E3, E4, AZ5, AZ6); escalation tests AZ1 to AZ15 arrive with the endpoints that make those changes (Z3 to Z5) |

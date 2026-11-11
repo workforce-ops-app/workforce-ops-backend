@@ -7,14 +7,16 @@ The two companies are built alike on purpose (same department and team names, th
 kinds of people), so a leak from one company into the other is obvious in tests and demos.
 
 - Gives the same result on every run: it only adds what is missing. A company that already
-  exists keeps its structure; it only gains passwords for accounts without one and its
-  shifts, if an earlier run could not add them yet. After that, a run changes nothing.
-- Seeds each company in three steps, each all or nothing (its own transaction): the
-  structure (departments, teams, people, roles), the missing demo passwords, then all of
-  the shifts with their audit entries. If a step fails, nothing of that step is kept and
-  the steps before it stay: a failed first step leaves no company, so the next run builds
-  it from the start; a refused shift keeps no shifts, but the company and its passwords
-  stay. The steps are separate on purpose, so passwords and shifts can come on a later run.
+  exists keeps its structure; it only gains its reporting lines, passwords for accounts
+  without one, and its shifts, if an earlier run could not add them yet. After that, a
+  run changes nothing.
+- Seeds each company in four steps, each all or nothing (its own transaction): the
+  structure (departments, teams, people, roles), the reporting lines, the missing demo
+  passwords, then all of the shifts with their audit entries. If a step fails, nothing of
+  that step is kept and the steps before it stay: a failed first step leaves no company,
+  so the next run builds it from the start; a refused shift keeps no shifts, but the
+  company, its lines, and its passwords stay. The steps are separate on purpose, so lines,
+  passwords, and shifts can come on a later run.
 - Refuses to run against a production database (APP_ENV=production).
 - Uses the reserved example.com and example.org email domains.
 - Creates companies the only way the design allows: from a session with no company
@@ -38,8 +40,10 @@ under that manager's name, exactly like one made on the website. If the rules ch
 demo data follows without changes here; if a demo shift breaks a rule, the script stops
 and says which one. The shifts are added once: a company that already has shifts is left
 alone. They wait until everyone they need has a password, because the application never
-assigns a shift to someone who has not set up their account. Reporting lines follow after
-the midterm (Z2).
+assigns a shift to someone who has not set up their account.
+
+Reporting lines (Z2) come right after the company: REPORTING_LINES below, added through the
+same service the application uses, once per company.
 """
 
 from __future__ import annotations
@@ -55,6 +59,8 @@ from sqlalchemy.orm import Session
 
 from app.audit import Actor
 from app.auth.passwords import PasswordRejected, check_password, hash_password
+from app.authz.chain import ReportingLineError, add_reporting_line
+from app.authz.models import ReportingLine
 from app.authz.roles import assign_role, create_starting_roles
 from app.core.config import get_settings
 from app.db.base import utcnow
@@ -116,6 +122,9 @@ DEMO_COMPANIES = (
             Person("Ella Novak", "Front of House", (), "employee"),
             # Manages one team only: the Weekend Crew's shifts, nothing else in the Kitchen.
             Person("Felix Grant", "Kitchen", ("Weekend Crew",), "manager", "Weekend Crew"),
+            # A second administrator, who reports to the first (an administrator over
+            # another administrator, Z2). Last in the list, so the indexes below stay put.
+            Person("Sofia Reyes", "Office", ("Leadership",), "administrator"),
         ),
     ),
     CompanyPlan(
@@ -132,6 +141,7 @@ DEMO_COMPANIES = (
             Person("Mateo Silva", "Front of House", ("Hosts",), "employee"),
             Person("Nora Quinn", "Front of House", (), "employee"),
             Person("Owen Park", "Kitchen", ("Weekend Crew",), "manager", "Weekend Crew"),
+            Person("Theo Walsh", "Office", ("Leadership",), "administrator"),
         ),
     ),
 )
@@ -147,6 +157,32 @@ KITCHEN_B = 5  # Cara Lund / Lena Fischer
 FRONT_A = 6  # Diego Ruiz / Mateo Silva
 FRONT_B = 7  # Ella Novak / Nora Quinn
 CREW_LEAD = 8  # Felix Grant / Owen Park: manager of the Weekend Crew only
+OWNER = 0  # Olivia Hart / Grace Kim
+ADMINISTRATOR = 1  # Marcus Lee / Henry Adams
+SECOND_ADMINISTRATOR = 9  # Sofia Reyes / Theo Walsh
+
+# Who reports to whom (Z2), as (manager, employee) by place in the list of people. The same
+# in both companies. It covers what the rules and the demo need (organization.md, demo
+# data):
+# - a chain of several levels: Cara reports to the crew lead, who reports to the Kitchen
+#   manager, who reports to the administrator, who reports to the owner;
+# - someone with two managers: Ben reports to the Kitchen manager and to the crew lead;
+# - an administrator over another administrator: Sofia reports to Marcus;
+# - someone with no manager: Ella (FRONT_B), so only the Owner can manage her and her
+#   requests go straight to the Owner (decision 0029).
+# The Owner is above everyone anyway; the line from the administrator to the owner records
+# whom the administrator reports to, which later decides where their requests go.
+REPORTING_LINES = (
+    (OWNER, ADMINISTRATOR),
+    (ADMINISTRATOR, SECOND_ADMINISTRATOR),
+    (ADMINISTRATOR, KITCHEN_MANAGER),
+    (ADMINISTRATOR, FRONT_MANAGER),
+    (KITCHEN_MANAGER, CREW_LEAD),
+    (KITCHEN_MANAGER, KITCHEN_A),
+    (CREW_LEAD, KITCHEN_A),
+    (CREW_LEAD, KITCHEN_B),
+    (FRONT_MANAGER, FRONT_A),
+)
 
 # Who plans a department's shifts, unless a shift names someone else.
 DEPARTMENT_MANAGER = {"Kitchen": KITCHEN_MANAGER, "Front of House": FRONT_MANAGER}
@@ -359,7 +395,57 @@ def local_to_utc(day: date, clock: str, timezone: str) -> datetime:
 
 
 class SeedRefused(RuntimeError):
-    """The application refused a demo shift: the demo data breaks a rule (a bug here)."""
+    """The demo data cannot be added: the application refused part of it (a bug here), or
+    the company was seeded by an older version of this script."""
+
+
+def seed_reporting_lines(engine: Engine, plan: CompanyPlan) -> int:
+    """Add the company's reporting lines (REPORTING_LINES), unless it already has some.
+    Returns how many were added: 0 if it had lines already.
+
+    Each line goes through the same service the application will use
+    (app/authz/chain.py, add_reporting_line), as the system, so it passes the same rules
+    (nobody reports to themselves, no duplicates, no loops) and is written to the audit
+    log. All or nothing: the lines and their audit entries are saved in one transaction.
+    """
+    # Find the company, as platform code (no company on the session).
+    with Session(engine) as platform:
+        company_id = platform.scalars(select(Company.id).where(Company.name == plan.name)).one()
+
+    with engine.begin() as connection, Session(connection) as session:
+        set_company(session, company_id)
+        # Already has lines (an earlier run): leave them as they are. Counting a column of
+        # the model lets the company filter apply.
+        if session.scalar(select(func.count(ReportingLine.company_id))):
+            return 0
+
+        people = {u.display_name: u for u in session.scalars(select(User))}
+        # A company seeded before someone in the lines joined the demo data (such as the
+        # second administrator): the script never changes an existing company's people.
+        needed = {index for pair in REPORTING_LINES for index in pair}
+        missing = sorted(plan.people[i].name for i in needed if plan.people[i].name not in people)
+        if missing:
+            raise SeedRefused(
+                f"{plan.name} was seeded before {', '.join(missing)} joined the demo data; "
+                "reset the database and seed again"
+            )
+
+        for manager, employee in REPORTING_LINES:
+            try:
+                add_reporting_line(
+                    session,
+                    Actor.system(),
+                    manager_id=people[plan.people[manager].name].id,
+                    employee_id=people[plan.people[employee].name].id,
+                )
+            except ReportingLineError as refused:
+                raise SeedRefused(
+                    f"{plan.name}: {plan.people[employee].name} reporting to "
+                    f"{plan.people[manager].name}: {refused}"
+                ) from refused
+        # Send everything; engine.begin() commits when the block ends.
+        session.flush()
+        return len(REPORTING_LINES)
 
 
 def seed_shifts(engine: Engine, plan: CompanyPlan, now: datetime | None = None) -> int | None:
@@ -527,6 +613,11 @@ def seed(
         created = seed_company(engine, plan)
         state = "created" if created else "already there"
 
+        # Reporting lines need only the people, so they come straight after the company;
+        # a company seeded before lines existed gets them on the next run.
+        added_lines = seed_reporting_lines(engine, plan)
+        reporting = f"{added_lines} reporting lines added"
+
         # Passwords before shifts: shifts only go to people who have one.
         if demo_password is None:
             passwords = "no DEMO_PASSWORD, so no one can sign in"
@@ -538,7 +629,7 @@ def seed(
         # passwords, gets them on the next run.
         added = seed_shifts(engine, plan, now)
         shifts = "shifts wait for passwords" if added is None else f"{added} shifts added"
-        lines.append(f"{plan.name}: {state}; {passwords}; {shifts}")
+        lines.append(f"{plan.name}: {state}; {reporting}; {passwords}; {shifts}")
     return lines
 
 
@@ -565,8 +656,8 @@ def main() -> int:
         for line in seed(engine, demo_password):
             print(line)
     except SeedRefused as refused:
-        # None of that company's shifts were kept; the lines before it were printed.
-        print(f"demo shift refused: {refused}")
+        # Nothing of that step was kept; the lines before it were printed.
+        print(f"demo data refused: {refused}")
         return 1
     finally:
         engine.dispose()

@@ -223,7 +223,8 @@ def test_the_owner_is_above_everyone(org: Org) -> None:
 
 def test_holding_the_permission_is_not_enough_without_being_above(org: Org) -> None:
     # Chef may review time off in Kitchen and Ana is in Kitchen, but chef is not above her
-    # (no reporting lines until Z2), and an administrator is not above anyone either.
+    # (this setup has no reporting lines), and an administrator is not above anyone either.
+    # With lines: tests/security/test_reporting_chain.py.
     assert not allowed(org, "chef", "time_off.review", person(org, "ana"))
     assert not allowed(org, "admin", "user.manage", person(org, "ana"))
 
