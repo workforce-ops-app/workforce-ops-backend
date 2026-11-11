@@ -12,6 +12,7 @@ Rules:
 - Nobody is booked on two overlapping shifts (409). The person's row is locked while this
   is checked, so two requests at the same moment cannot both pass.
 - A shift that has ended, or was cancelled, can no longer be changed (409).
+- No new shift goes into an archived department (409).
 - Time off is checked here once time-off requests exist (time-off slices).
 - Several shifts at once (batch): every shift passes the same checks as one shift would,
   all in one transaction, so either every change is saved or none is. At 10 or more shifts
@@ -154,6 +155,10 @@ def _create(db: Session, user: User, body: ShiftCreate) -> Shift:
     )
     # May the user edit shifts here (this department, and this person if any)?
     authorize(db, user, "schedule.edit", item)
+    # Nothing new goes into an archived department (organization.md); its existing shifts
+    # stay as history.
+    if dept.archived_at is not None:
+        raise Conflict("This department is archived. Shifts cannot be added to it.")
     _check_times(item.starts_at, item.ends_at)
     if body.employee_id is not None:
         _check_assignable(db, item, body.employee_id)

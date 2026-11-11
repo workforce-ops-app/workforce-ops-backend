@@ -115,7 +115,7 @@ flowchart TD
 | team | the team's members and their records |
 | employee | that one person and their records |
 
-Archived roles and deactivated users grant nothing. Permissions are read on every request, so a change to someone's roles takes effect immediately.
+Archived roles and deactivated users grant nothing, and neither does an assignment for an archived department or team: the assignment stays for history, but its scope covers nothing ([organization](../features/organization.md#states-and-rules)). Permissions are read on every request, so a change to someone's roles takes effect immediately.
 
 **In the code** (`app/authz/check.py`): `authorize(db, user, permission, target)` returns when allowed and raises `Forbidden` (403) or `NotFound` (404, a target of another company). Without a target, a record or person check asks "anywhere at all?", which is what a list endpoint checks before applying the scope filter; company and self checks work the same with or without one. An unknown permission code is a bug and raises `LookupError` instead of answering yes or no. "Above" means the Owner, or above the person through reporting lines ([the reporting chain](#the-reporting-chain)).
 
