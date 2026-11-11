@@ -38,7 +38,8 @@ def workplace_zone(db: Session, dept: Department) -> str:
 def person(db: Session, user_id: uuid.UUID, *, lock: bool = False) -> User | None:
     """A person of the session's company. lock=True locks their row until the transaction
     ends (SELECT ... FOR UPDATE): two managers giving the same person overlapping shifts at
-    the same moment then take turns, so the double-booking check cannot be raced."""
+    the same moment then take turns. Together with the fresh read in has_overlap(), the
+    double-booking check cannot be raced."""
     return db.get(User, user_id, with_for_update=lock)
 
 
@@ -52,6 +53,20 @@ def has_overlap(
     """Whether the person already has a (not cancelled) shift overlapping this time.
 
     Two time ranges overlap when each starts before the other ends.
+
+    Callers lock the person's row first (person(..., lock=True)), so two changes to one
+    person take turns. That alone is not enough: under MySQL's default isolation
+    (REPEATABLE READ), an ordinary SELECT sees the database as it was at the
+    transaction's FIRST read. A request has always read something before it gets here
+    (its session and permission checks), so after waiting for the lock it would still
+    miss a shift that the other request committed meanwhile, and both would be saved.
+    A locking read (FOR SHARE) always sees the newest committed rows, so this query is
+    one. The same fix as for reporting lines (app/authz/chain.py, _is_above_fresh).
+
+    The read locks only this person's shifts in the time range (it uses the
+    company, employee, start index), so other people's bookings are not held up.
+    SQLite, which the tests use, has no row locks and ignores FOR SHARE;
+    scripts/check_migrations.py tries the race on MySQL.
     """
     conditions = [
         Shift.employee_id == employee_id,
@@ -61,7 +76,10 @@ def has_overlap(
     ]
     if ignore is not None:
         conditions.append(Shift.id != ignore)
-    return db.scalar(select(Shift.id).where(*conditions).limit(1)) is not None
+    # read=True makes it FOR SHARE: other readers may share the lock, but nobody can
+    # change these rows until this transaction ends.
+    found = select(Shift.id).where(*conditions).limit(1).with_for_update(read=True)
+    return db.scalar(found) is not None
 
 
 def shift(db: Session, shift_id: uuid.UUID) -> Shift | None:

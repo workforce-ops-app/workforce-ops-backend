@@ -14,7 +14,8 @@
    SQLite, which compares text differently, so the rules that depend on MySQL are tried
    here on the real thing.
 5. Changes that must take turns do so in MySQL (_race_problems): two requests adding
-   reporting lines at the same moment cannot add a duplicate or a loop. SQLite has no row
+   reporting lines at the same moment cannot add a duplicate or a loop, and two requests
+   booking one person at the same moment cannot double-book them. SQLite has no row
    locks, so this too can only be tried on MySQL.
 
 The database is a throwaway Docker container (removed afterwards), unless
@@ -36,7 +37,7 @@ from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import Connection, create_engine, make_url, text
+from sqlalchemy import Connection, Engine, create_engine, make_url, text
 from sqlalchemy.exc import DBAPIError, OperationalError
 
 MYSQL_IMAGE = "mysql:8.4"
@@ -251,14 +252,33 @@ def _database_rule_problems(url: str) -> list[str]:
 
 
 def _race_problems(url: str) -> list[str]:
-    """Try two requests changing reporting lines at the same moment; return what failed.
+    """Try two requests changing the same thing at the same moment; return what failed.
+
+    The locks and locking reads that make these safe only mean something in MySQL: the
+    tests run on SQLite, which has no row locks. So the races are tried here, through
+    the app's own code and sessions, on the migrated MySQL. These checks commit (two
+    transactions must see each other's work), so main() runs them before the downgrade,
+    which drops everything again. Each group of races uses its own company.
+    """
+    from app.core.config import get_settings
+
+    # Adding a reporting line writes a signed audit entry, so the settings need a signing
+    # key; a throwaway one is enough for a throwaway database.
+    os.environ.setdefault("AUDIT_SIGNING_KEY", secrets.token_urlsafe(32))
+    get_settings.cache_clear()
+
+    engine = create_engine(url)
+    try:
+        return _reporting_line_race_problems(engine) + _shift_race_problems(engine)
+    finally:
+        engine.dispose()
+
+
+def _reporting_line_race_problems(engine: Engine) -> list[str]:
+    """Two requests changing reporting lines at the same moment; return what failed.
 
     add_reporting_line() locks the company first and then checks with fresh, locking
-    reads (app/authz/chain.py). Both only mean something in MySQL: the tests run on
-    SQLite, which has no row locks. So the races are tried here, through the app's own
-    code and sessions, on the migrated MySQL. These checks commit (two transactions must
-    see each other's work), so main() runs them before the downgrade, which drops
-    everything again.
+    reads (app/authz/chain.py).
     """
     import threading
 
@@ -268,107 +288,183 @@ def _race_problems(url: str) -> list[str]:
     from app.audit import Actor
     from app.authz.chain import ReportingLineError, add_reporting_line, lock_reporting_lines
     from app.authz.models import ReportingLine
-    from app.core.config import get_settings
     from app.modules.org.models import Company, Department, User
     from app.tenancy.context import set_company
 
-    # Adding a line writes a signed audit entry, so the settings need a signing key; a
-    # throwaway one is enough for a throwaway database.
-    os.environ.setdefault("AUDIT_SIGNING_KEY", secrets.token_urlsafe(32))
-    get_settings.cache_clear()
+    problems = []
+    # A company, made by platform code (a session with no company).
+    with Session(engine) as platform:
+        company = Company(name="race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # Four people in one department.
+    with session() as db:
+        department = Department(name="Kitchen")
+        db.add(department)
+        db.flush()
+        people = {
+            name: User(
+                email=f"{name}@race.example.com",
+                display_name=name,
+                department_id=department.id,
+            )
+            for name in ("a", "b", "c", "d")
+        }
+        db.add_all(people.values())
+        db.commit()
+        ids = {name: person.id for name, person in people.items()}
+
+    def add(db: Session, manager: str, employee: str) -> None:
+        add_reporting_line(db, Actor.system(), manager_id=ids[manager], employee_id=ids[employee])
+
+    def refused_after_late_commit(first: tuple[str, str], second: tuple[str, str]) -> bool:
+        """Request 2 has already read something (as its permission check would), which
+        fixes what its ordinary SELECTs see under MySQL's REPEATABLE READ. Request 1
+        then adds `first` and commits. Is request 2's `second` still refused?"""
+        with session() as request_2:
+            request_2.scalars(select(ReportingLine)).all()  # its view is now fixed
+            with session() as request_1:
+                add(request_1, *first)
+                request_1.commit()
+            try:
+                add(request_2, *second)
+            except ReportingLineError:
+                return True
+            except DBAPIError:
+                # Refused by the database's unique key instead: still safe, but it
+                # means the service's own check read an old view.
+                return False
+            return False
+
+    # 1. The same line, added by two requests: the second must be refused.
+    if not refused_after_late_commit(("a", "b"), ("a", "b")):
+        problems.append("a duplicate reporting line committed meanwhile was not seen")
+    # 2. b -> c by one request, c -> b by another: fine alone, a loop together.
+    if not refused_after_late_commit(("b", "c"), ("c", "b")):
+        problems.append("a reporting line loop committed meanwhile was not seen")
+
+    # 3. Two changes in one company take turns: while request 1 holds the company lock,
+    # request 2 (in another thread) must wait, and go ahead once request 1 commits.
+    # Request 1 only takes the lock and writes nothing: adding a line also locks the
+    # audit log's chain head, which would make request 2 wait even without the
+    # company lock, so this tries the company lock on its own.
+    errors: list[BaseException] = []
+
+    def second_request() -> None:
+        try:
+            with session() as request_2:
+                add(request_2, "c", "d")
+                request_2.commit()
+        except BaseException as error:  # reported below
+            errors.append(error)
+
+    with session() as request_1:
+        lock_reporting_lines(request_1)
+        waiting = threading.Thread(target=second_request)
+        waiting.start()
+        waiting.join(timeout=2)
+        if not waiting.is_alive():
+            problems.append("a second reporting line change did not wait for the first")
+        request_1.commit()
+    waiting.join(timeout=30)
+    if waiting.is_alive() or errors:
+        problems.append(f"the waiting reporting line change did not finish: {errors}")
+    return problems
+
+
+def _shift_race_problems(engine: Engine) -> list[str]:
+    """Two requests booking one person on overlapping shifts; return what failed.
+
+    The double-booking check locks the person's row and then looks for overlaps with a
+    locking read (app/modules/schedules/repository.py, has_overlap). This runs the same
+    check the service runs for every assignment (_check_assignable); a time change in
+    update_shift() uses the same overlap query.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy.orm import Session
+
+    from app.db.base import utcnow
+    from app.modules.org.models import Company, Department, User
+    from app.modules.schedules import repository, service
+    from app.modules.schedules.models import Shift
+    from app.tenancy.context import set_company
 
     problems = []
-    engine = create_engine(url)
-    try:
-        # A company, made by platform code (a session with no company).
-        with Session(engine) as platform:
-            company = Company(name="race probe", timezone="UTC")
-            platform.add(company)
-            platform.commit()
-            company_id = company.id
+    # A company, made by platform code (a session with no company).
+    with Session(engine) as platform:
+        company = Company(name="shift race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
 
-        def session() -> Session:
-            """A new session for the company: one per simulated request."""
-            db = Session(engine)
-            set_company(db, company_id)
-            return db
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
 
-        # Four people in one department.
-        with session() as db:
-            department = Department(name="Kitchen")
-            db.add(department)
-            db.flush()
-            people = {
-                name: User(
-                    email=f"{name}@race.example.com",
-                    display_name=name,
-                    department_id=department.id,
-                )
-                for name in ("a", "b", "c", "d")
-            }
-            db.add_all(people.values())
-            db.commit()
-            ids = {name: person.id for name, person in people.items()}
-
-        def add(db: Session, manager: str, employee: str) -> None:
-            add_reporting_line(
-                db, Actor.system(), manager_id=ids[manager], employee_id=ids[employee]
+    # One person who can be assigned (set up, active, home department), and two open
+    # shifts in their department tomorrow that overlap: 09:00 to 17:00 and 12:00 to 20:00.
+    with session() as db:
+        department = Department(name="Kitchen")
+        db.add(department)
+        db.flush()
+        person = User(
+            email="worker@race.example.com",
+            display_name="worker",
+            department_id=department.id,
+            # Any value counts as "has set up their account". Random text is never a
+            # valid Argon2id hash, so no password can sign in as this probe person.
+            password_hash=secrets.token_hex(16),
+        )
+        tomorrow = utcnow().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        shifts = [
+            Shift(
+                department_id=department.id,
+                starts_at=tomorrow + timedelta(hours=start),
+                ends_at=tomorrow + timedelta(hours=end),
+                timezone="UTC",
+                status="open",
             )
+            for start, end in ((9, 17), (12, 20))
+        ]
+        db.add(person)
+        db.add_all(shifts)
+        db.commit()
+        person_id = person.id
+        first_id, second_id = (item.id for item in shifts)
 
-        def refused_after_late_commit(first: tuple[str, str], second: tuple[str, str]) -> bool:
-            """Request 2 has already read something (as its permission check would), which
-            fixes what its ordinary SELECTs see under MySQL's REPEATABLE READ. Request 1
-            then adds `first` and commits. Is request 2's `second` still refused?"""
-            with session() as request_2:
-                request_2.scalars(select(ReportingLine)).all()  # its view is now fixed
-                with session() as request_1:
-                    add(request_1, *first)
-                    request_1.commit()
-                try:
-                    add(request_2, *second)
-                except ReportingLineError:
-                    return True
-                except DBAPIError:
-                    # Refused by the database's unique key instead: still safe, but it
-                    # means the service's own check read an old view.
-                    return False
-                return False
-
-        # 1. The same line, added by two requests: the second must be refused.
-        if not refused_after_late_commit(("a", "b"), ("a", "b")):
-            problems.append("a duplicate reporting line committed meanwhile was not seen")
-        # 2. b -> c by one request, c -> b by another: fine alone, a loop together.
-        if not refused_after_late_commit(("b", "c"), ("c", "b")):
-            problems.append("a reporting line loop committed meanwhile was not seen")
-
-        # 3. Two changes in one company take turns: while request 1 holds the company lock,
-        # request 2 (in another thread) must wait, and go ahead once request 1 commits.
-        # Request 1 only takes the lock and writes nothing: adding a line also locks the
-        # audit log's chain head, which would make request 2 wait even without the
-        # company lock, so this tries the company lock on its own.
-        errors: list[BaseException] = []
-
-        def second_request() -> None:
-            try:
-                with session() as request_2:
-                    add(request_2, "c", "d")
-                    request_2.commit()
-            except BaseException as error:  # reported below
-                errors.append(error)
-
+    # Request 2 reads its shift first, as the endpoint does before checking permission.
+    # Under MySQL's REPEATABLE READ, that read fixes what its ordinary SELECTs see.
+    with session() as request_2:
+        second = repository.shift(request_2, second_id)
+        if second is None:  # made above, in this company, so always found
+            raise RuntimeError("the race probe's second shift is missing")
+        # Request 1 now books the person on the first shift and commits.
         with session() as request_1:
-            lock_reporting_lines(request_1)
-            waiting = threading.Thread(target=second_request)
-            waiting.start()
-            waiting.join(timeout=2)
-            if not waiting.is_alive():
-                problems.append("a second reporting line change did not wait for the first")
+            first = repository.shift(request_1, first_id)
+            if first is None:
+                raise RuntimeError("the race probe's first shift is missing")
+            service._check_assignable(request_1, first, person_id)
+            first.employee_id = person_id
+            first.status = "scheduled"
             request_1.commit()
-        waiting.join(timeout=30)
-        if waiting.is_alive() or errors:
-            problems.append(f"the waiting reporting line change did not finish: {errors}")
-    finally:
-        engine.dispose()
+        # Request 2 books the same person on the overlapping shift: it must be refused.
+        try:
+            service._check_assignable(request_2, second, person_id)
+        except service.Conflict:
+            pass  # refused: the overlap committed meanwhile was seen
+        else:
+            problems.append("an overlapping shift committed meanwhile was not seen")
     return problems
 
 

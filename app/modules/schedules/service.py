@@ -10,7 +10,8 @@ Rules:
 - Only an active person who has set up their account, whose home department is the
   shift's department or who is on a team in it, can be assigned (422).
 - Nobody is booked on two overlapping shifts (409). The person's row is locked while this
-  is checked, so two requests at the same moment cannot both pass.
+  is checked, and the check reads the newest committed shifts (repository.has_overlap),
+  so two requests at the same moment cannot both pass.
 - A shift that has ended, or was cancelled, can no longer be changed (409).
 - Time off is checked here once time-off requests exist (time-off slices).
 - Several shifts at once (batch): every shift passes the same checks as one shift would,
