@@ -187,6 +187,53 @@ def test_the_excerpt_is_at_most_200_characters_of_the_original_around_the_match(
     assert finding.excerpt in value
 
 
+# Review on #134: the excerpt was placed at the same RELATIVE position in the original as
+# the match in the normalized text. Encoded padding stretches the original but not the
+# normalized text, so the window landed away from the attack. Padding of each kind, on
+# each side of the attack: "%41" is three characters of the original but one ("a") once
+# decoded; "b" is one character either way.
+PADDINGS = {"encoded": "%41", "plain": "b"}
+PLACES = {"start": (0, 600), "middle": (300, 300), "end": (600, 0)}
+
+
+@pytest.mark.parametrize("place", list(PLACES))
+@pytest.mark.parametrize(("before", "after"), [("encoded", "plain"), ("plain", "encoded")])
+@pytest.mark.parametrize(
+    ("kind", "attack"), [(kind, value) for kind, values in ATTACKS.items() for value in values]
+)
+def test_the_excerpt_of_a_long_value_contains_the_attack_as_sent(
+    kind: str, attack: str, before: str, after: str, place: str
+) -> None:
+    """The security page shows the excerpt as the evidence: it must contain the attack
+    exactly as it was sent, wherever the attack is in a long, partly encoded value."""
+    left, right = PLACES[place]
+    value = PADDINGS[before] * left + " " + attack + " " + PADDINGS[after] * right
+    findings = inspect([("body.note", value)])
+    assert kind in {finding.kind for finding in findings}
+    for finding in findings:
+        assert len(finding.excerpt) <= MAX_EXCERPT_CHARS
+        assert finding.excerpt in value  # a piece of what was sent, never rewritten
+        assert attack in finding.excerpt, (finding.pattern_id, finding.excerpt)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        # The review's first case: matched only in the undecoded form, whose length the
+        # excerpt used to ignore.
+        "%41" * 300 + "%08x.%08x.%08x" + "%41" * 300,
+        # Its second: encoded XSS, matched in the decoded form, far from the relative spot.
+        "a" * 600 + "%3Cscript%3E" + "%42" * 600,
+    ],
+    ids=["format string, undecoded form", "xss, decoded form"],
+)
+def test_the_excerpt_shows_what_the_pattern_matched(value: str) -> None:
+    """The attacker's view: the stored excerpt, run through the detector on its own, is
+    still flagged by the same pattern, so the evidence really shows the attack."""
+    [finding] = inspect([("query.q", value)])
+    assert finding.pattern_id in {pattern.id for pattern, _ in matches(finding.excerpt)}
+
+
 def test_one_value_can_match_several_types() -> None:
     # A command that reads a system file is both; the study counts it in both columns.
     assert kinds("; cat /etc/passwd") == {"command_injection", "path_traversal"}
@@ -277,6 +324,24 @@ def test_worst_case_input_is_inspected_quickly(value: str) -> None:
         matches(value)
         times.append(time.perf_counter() - start)
     assert sorted(times)[2] < BUDGET_SECONDS, sorted(times)
+
+
+def test_a_full_request_of_long_attack_values_is_inspected_quickly() -> None:
+    """DE4 and DE5: finding excerpts adds work for every match in a long value, so the
+    whole request, at the caps (50 values of 2,000 characters, each matching several
+    patterns, the attacks between encoded padding), must stay within a budget. It takes
+    about 0.15 seconds; the budget is generous for slow CI machines, while excerpts that
+    re-normalized the whole value for every match took over a second."""
+    attacks = "%08x.%08x.%08x <script> ' or 1=1 ; cat /etc/passwd ../../ {{x}} "
+    value = ("%41" * 330 + attacks + "%41" * 330)[:MAX_VALUE_CHARS]
+    values = [(f"body.v{n}", value) for n in range(MAX_TOTAL_CHARS // MAX_VALUE_CHARS)]
+    times = []
+    for _ in range(3):
+        start = time.perf_counter()
+        findings = inspect(values)
+        times.append(time.perf_counter() - start)
+    assert len(findings) >= 5 * len(values)  # every value matched several patterns
+    assert sorted(times)[1] < 1.0, sorted(times)
 
 
 # --- DE10: plain Python only -------------------------------------------------------

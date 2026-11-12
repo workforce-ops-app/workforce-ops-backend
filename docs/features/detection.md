@@ -86,7 +86,7 @@ Attackers disguise input, so each value is simplified before matching, in this o
 
 Each value is matched twice: in this normalized form, and in the same form **without step 1**. URL-decoding can destroy an attack as well as reveal one: in the printf attack `%08x`, `%08` reads as an encoded byte, so the decoded text no longer contains it. A pattern counts as matched if either form matches.
 
-The normalized text is used only for matching. The stored excerpt is the original text, so the security page shows what was really sent. A match position in the normalized text does not line up with the original once anything was decoded, so the excerpt is the original value when it is 200 characters or fewer, and otherwise a 200 character window at the same relative position.
+The normalized text is used only for matching. The stored excerpt is the original text, so the security page shows what was really sent. A match position in the normalized text does not line up with the original once anything was decoded, so positions are not copied across. The excerpt is the original value when it is 200 characters or fewer. For a longer value, the detector tries 200 character windows of the original, 50 characters apart, finds the first run of neighbouring windows that the pattern still matches on their own, and centres the excerpt on the stretch they all share, so the excerpt contains the matched part as it was sent. Only an attack spread over more than 200 characters of the original (heavy encoding) falls back to a window at the same relative position.
 
 ### What is collected, and what never is
 
