@@ -101,11 +101,12 @@ Rules 2 and 3 overlap on purpose: either one alone keeps the known credential fi
 
 Rows are only ever inserted, never changed, so the rate cap (DE6) keeps its counts in the worker's memory and writes the result once:
 
-1. The worker keeps a counter for each source and minute (`session or address`, `minute`).
+1. The worker keeps a counter for each source and minute (`session or address`, `minute`). The minute is the one the worker handles the event in, by its own clock, not the one the event happened in: events wait in the queue, so some arrive after their minute has ended, and counting them by their own minute would let every late batch start a fresh counter and get 20 more rows. A late event therefore shares the current minute's cap; its row still stores when it really happened.
 2. The first 20 events in a minute are written as normal rows.
 3. After that, events are only counted. When the minute ends (checked each time the worker takes a copy, and at least every 10 seconds), the worker **inserts** one `detection.summary` row whose `count` is how many events were held back, then forgets the counter.
 4. At most **10,000 sources** are tracked at once. Events from further sources in the same minute are only counted, in one shared overflow counter, so memory stays bounded even if every request comes from a new address. When the minute ends it is written as one `detection.summary` row in `platform_security_events` with no address, since it mixes sources and companies.
 5. When the application stops, the worker writes the summaries it still holds before it exits.
+6. A failed insert loses no counts. A counter is forgotten only once its summary row is saved (otherwise the next check tries again with the same count), and an event takes its place under the cap only once its row is saved. Each company's rows, and the platform's, are saved in a transaction of their own; the writer then raises an error naming exactly the events that were not saved, so the worker can write those again without using up the cap twice or duplicating rows that were saved.
 
 The queue (DE11) is a `queue.Queue` with a size of 200, filled with `put_nowait`. So a full queue never makes a request wait: the copy is dropped and a drop counter goes up, written each minute as one `detection.dropped` row in `platform_security_events`. Together with DE4, the queue can hold at most about 20 million characters of copied text.
 

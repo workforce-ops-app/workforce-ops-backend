@@ -19,15 +19,16 @@ from typing import Any
 
 import pytest
 from sqlalchemy import Engine, create_engine, event, func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base
 from app.db.registry import import_all_models
 from app.modules.org.models import Company, Department, User
+from app.modules.security import repository
 from app.modules.security.models import DROPPED, SUMMARY, PlatformSecurityEvent, SecurityEvent
-from app.modules.security.writer import Event, EventWriter, remove_old_events
+from app.modules.security.writer import Event, EventWriteError, EventWriter, remove_old_events
 from app.tenancy.context import set_company
 
 NOON = datetime(2026, 11, 11, 12, 0, 0)
@@ -168,8 +169,10 @@ def test_a_person_of_another_company_cannot_be_named(setup: Setup) -> None:
         company_id=setup.companies["a"],
         user_id=setup.people["bea"],
     )
-    with pytest.raises(IntegrityError):
+    with pytest.raises(EventWriteError) as refused:
         setup.writer().write([forged])
+    assert isinstance(refused.value.__cause__, IntegrityError)  # the database refused it
+    assert refused.value.unsaved == [forged]
     assert setup.company_rows("a") == [] and setup.company_rows("b") == []
 
 
@@ -249,6 +252,161 @@ def test_stopping_writes_every_summary_still_held(setup: Setup) -> None:
     writer.close()  # the minute has not ended, but the application is stopping
     [summary] = [row for row in setup.company_rows("a") if row.kind == SUMMARY]
     assert summary.count == 3
+
+
+# --- Review on #135: late events and failed inserts -----------------------------------
+
+
+def test_late_events_cannot_reset_an_ended_minutes_cap(setup: Setup) -> None:
+    """Events from a minute that has already ended (they waited in the queue) count
+    against the minute they are handled in. Before the fix, every late batch found its
+    own minute's counter already forgotten, started a new one, and got 20 more rows."""
+    writer = setup.writer()
+    setup.clock.now = NOON + timedelta(minutes=1, seconds=1)
+    # Three batches of 10 events that all happened at noon, handled at 12:01.
+    for _ in range(3):
+        writer.write([xss(setup, at=NOON) for _ in range(10)])
+    # The attacker's view: 20 rows in this minute of writing, never 30.
+    assert len(setup.company_rows("a")) == 20
+    # The 10 held back go into one summary when 12:01 ends.
+    setup.clock.now = NOON + timedelta(minutes=2)
+    writer.flush_due()
+    [summary] = [row for row in setup.company_rows("a") if row.kind == SUMMARY]
+    assert summary.count == 10
+    # Each row still says when its event really happened.
+    assert {row.occurred_at for row in setup.company_rows("a") if row.kind != SUMMARY} == {NOON}
+
+
+def test_late_and_current_events_share_one_cap(setup: Setup) -> None:
+    writer = setup.writer()
+    setup.clock.now = NOON + timedelta(minutes=1)
+    writer.write([xss(setup, at=NOON) for _ in range(15)])  # late
+    writer.write([xss(setup, at=setup.clock.now) for _ in range(15)])  # on time
+    assert len(setup.company_rows("a")) == 20
+
+
+class Outage:
+    """Makes the database refuse inserts until it is over (the insert functions raise the
+    error a lost connection gives), for one company's table, or for the platform table
+    when company is None."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, company: uuid.UUID | None) -> None:
+        self.on = True
+        real_company = repository.insert_company_events
+        real_platform = repository.insert_platform_events
+
+        def failing_company(engine: Engine, company_id: uuid.UUID, rows: Any) -> None:
+            if self.on and company_id == company:
+                raise OperationalError("INSERT", {}, Exception("connection lost"))
+            real_company(engine, company_id, rows)
+
+        def failing_platform(engine: Engine, rows: Any) -> None:
+            if self.on and company is None:
+                raise OperationalError("INSERT", {}, Exception("connection lost"))
+            real_platform(engine, rows)
+
+        monkeypatch.setattr(repository, "insert_company_events", failing_company)
+        monkeypatch.setattr(repository, "insert_platform_events", failing_platform)
+
+
+def test_a_failed_write_uses_up_no_places_under_the_cap(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer = setup.writer()
+    outage = Outage(monkeypatch, company=setup.companies["a"])
+    batch = [xss(setup, at=NOON + timedelta(seconds=n)) for n in range(15)]
+    with pytest.raises(EventWriteError) as failed:
+        writer.write(batch)
+    assert failed.value.unsaved == batch  # exactly the events that were not saved
+    assert setup.company_rows("a") == []
+
+    # The database is back; the caller writes the unsaved events again. All 15 are saved:
+    # the failed attempt took none of the 20 places.
+    outage.on = False
+    writer.write(failed.value.unsaved)
+    assert len(setup.company_rows("a")) == 15
+    # And the cap still ends at exactly 20: 5 more rows, then held back.
+    writer.write([xss(setup) for _ in range(8)])
+    assert len(setup.company_rows("a")) == 20
+    setup.clock.now = NOON + timedelta(minutes=1)
+    writer.flush_due()
+    [summary] = [row for row in setup.company_rows("a") if row.kind == SUMMARY]
+    assert summary.count == 3
+
+
+def test_a_failed_summary_is_tried_again_with_its_count(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer = setup.writer()
+    writer.write([xss(setup) for _ in range(25)])  # 20 rows, 5 held back
+    outage = Outage(monkeypatch, company=setup.companies["a"])
+    setup.clock.now = NOON + timedelta(minutes=1)
+    with pytest.raises(EventWriteError):
+        writer.flush_due()
+    # Before the fix, the counter was already forgotten here, and the 5 were lost.
+    outage.on = False
+    writer.flush_due()
+    summaries = [row for row in setup.company_rows("a") if row.kind == SUMMARY]
+    assert [row.count for row in summaries] == [5]
+    # Once saved, it is never written twice.
+    writer.flush_due()
+    writer.close()
+    assert len([row for row in setup.company_rows("a") if row.kind == SUMMARY]) == 1
+
+
+def test_a_batch_whose_summary_flush_fails_can_be_written_again_whole(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """write() first writes the summaries of ended minutes. If that fails, nothing of the
+    new batch has been counted, so the error names the whole batch."""
+    writer = setup.writer()
+    writer.write([xss(setup) for _ in range(21)])  # 20 rows, 1 held back
+    outage = Outage(monkeypatch, company=setup.companies["a"])
+    setup.clock.now = NOON + timedelta(minutes=1)
+    batch = [xss(setup, at=setup.clock.now) for _ in range(3)]
+    with pytest.raises(EventWriteError) as failed:
+        writer.write(batch)
+    assert failed.value.unsaved == batch
+    outage.on = False
+    writer.write(failed.value.unsaved)
+    rows = setup.company_rows("a")
+    # Noon's 20 rows and its summary (count 1), then the 3 from 12:01.
+    assert [row.count for row in rows if row.kind == SUMMARY] == [1]
+    assert len([row for row in rows if row.kind != SUMMARY]) == 23
+
+
+def test_one_companys_failure_does_not_duplicate_another_companys_rows(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each company's rows are their own transaction: when only Summit's fail, Northwind's
+    are saved and are not in the error, so writing the unsaved ones again duplicates
+    nothing."""
+    writer = setup.writer()
+    outage = Outage(monkeypatch, company=setup.companies["b"])
+    north = [xss(setup, company="a", source="session:a") for _ in range(2)]
+    summit = [xss(setup, company="b", source="session:b") for _ in range(3)]
+    with pytest.raises(EventWriteError) as failed:
+        writer.write(north + summit)
+    assert failed.value.unsaved == summit
+    outage.on = False
+    writer.write(failed.value.unsaved)
+    assert len(setup.company_rows("a")) == 2
+    assert len(setup.company_rows("b")) == 3
+
+
+def test_a_failed_overflow_summary_keeps_its_count(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer = setup.writer(max_sources=1)
+    writer.write([xss(setup, source=f"session:{n}") for n in range(5)])  # 1 tracked, 4 over
+    outage = Outage(monkeypatch, company=None)
+    setup.clock.now = NOON + timedelta(minutes=1)
+    with pytest.raises(EventWriteError):
+        writer.flush_due()
+    outage.on = False
+    writer.flush_due()
+    [overflow] = setup.platform_rows()
+    assert overflow.kind == SUMMARY and overflow.count == 4
 
 
 def test_dropped_request_copies_are_recorded_as_one_platform_row(setup: Setup) -> None:
