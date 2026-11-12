@@ -129,6 +129,49 @@ def test_a_team_manager_covers_their_members_shifts_only(shifts: ShiftSetup) -> 
         assert db.get(Shift, uuid.UUID(bens["id"])).employee_id == shifts.ids["ben"]  # type: ignore[union-attr]
 
 
+@pytest.mark.parametrize("change", ["edit", "cancel", "assign"])
+def test_a_shift_that_left_the_managers_scope_meanwhile_cannot_be_changed(
+    shifts: ShiftSetup, change: str
+) -> None:
+    """Stale permission (review on #127): the team lead's request reads Ben's shift, which
+    is in their scope, and passes its first permission check. Before it takes its locks,
+    the owner makes the shift open, which a team manager does not cover. The lead's change
+    must be refused (403) and change nothing: permission is checked again on the shift as
+    it is after the locks."""
+    from app.authz.check import Forbidden
+    from app.modules.org.models import User
+    from app.modules.schedules import repository, service
+    from app.modules.schedules.schemas import ShiftUpdate
+
+    bens = shifts.new_shift("owner", employee_id=shifts.ids["ben"])
+    shift_id = uuid.UUID(bens["id"])
+
+    with shifts.db() as db:
+        lead = db.get(User, shifts.ids["lead"])
+        assert lead is not None
+        # The lead's request reads the shift (kept, as an endpoint keeps it): Ben's.
+        stale = repository.shift(db, shift_id)
+        assert stale is not None and stale.employee_id == shifts.ids["ben"]
+        # Meanwhile the owner makes it open.
+        owner = shifts.browser("owner")
+        opened = owner.post(f"/api/shifts/{shift_id}/assign", json={"employee_id": None})
+        assert opened.status_code == 200, opened.text
+        # Now the lead's change goes ahead, still holding the old copy.
+        actions = {
+            "edit": lambda: service.update_shift(db, lead, shift_id, ShiftUpdate(notes="mine")),
+            "cancel": lambda: service.cancel_shift(db, lead, shift_id),
+            "assign": lambda: service.assign_shift(db, lead, shift_id, shifts.ids["ben"]),
+        }
+        with pytest.raises(Forbidden):
+            actions[change]()
+
+    # The attacker's view: the shift is exactly as the owner left it.
+    with shifts.db() as db:
+        saved = db.get(Shift, shift_id)
+        assert saved is not None
+        assert (saved.status, saved.employee_id, saved.notes) == ("open", None, None)
+
+
 def test_employees_see_their_department_and_their_own_shifts_only(shifts: ShiftSetup) -> None:
     ana = shifts.browser("ana")
     kitchen = shifts.new_shift("owner")
