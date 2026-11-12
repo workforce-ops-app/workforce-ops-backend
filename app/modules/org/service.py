@@ -14,16 +14,25 @@ Rules:
 - A department cannot be archived while it is the home department of anyone not
   deactivated, has upcoming shifts, or still has active teams (409): move the people and
   shifts, and archive the teams, first. Its row is locked while this is checked, so two
-  changes to one department take turns.
+  changes to one department take turns, and the checks read the newest committed rows
+  (locking reads), so nothing committed meanwhile is missed.
 - Archiving a team keeps its member list for history; role assignments for an archived
   department or team stop granting anything (app/authz/check.py).
 - A deactivated person cannot be added to a team (409); nobody is on a team twice (409).
+- Every change to a team locks the team's row first and reads it fresh, so a change that
+  waited for an archive is refused (409) instead of changing an archived team.
+- Two requests saving the same name (or the same membership) at the same moment can both
+  pass the check; the database's unique key then refuses the second. Wherever that
+  happens (sending the row, writing the audit entry, or committing), the answer is 409,
+  never 500 (_saved_or_conflict).
 
 Listing departments and teams only needs a signed-in person: every screen that plans
 shifts or shows people needs their names.
 """
 
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
@@ -62,12 +71,26 @@ DEPARTMENT_NAME_TAKEN = "A department with this name already exists."
 TEAM_NAME_TAKEN = "This department already has a team with this name."
 
 
-def _commit_or_conflict(db: Session, detail: str) -> None:
-    """Commit; if the database refuses a duplicate name (two requests creating the same
-    name at the same moment both passed the check above it), answer 409, not 500."""
+@contextmanager
+def _saved_or_conflict(db: Session, detail: str) -> Iterator[None]:
+    """Run the writes inside the `with` block, then commit; if the database refuses a
+    duplicate anywhere along the way, roll back and answer 409 with `detail`, not 500.
+
+    Why the whole block and not only the commit: two requests saving the same name at the
+    same moment both pass the service's own check (neither sees the other's row yet). The
+    database's unique key then refuses the second, but it does so as soon as the row is
+    sent, which happens before the commit: at an explicit db.flush(), or inside record(),
+    which flushes the change together with its audit entry. So every step that can send
+    the row is inside the block.
+    """
     try:
+        # 1. The caller's writes (adding or changing the row, the audit entry).
+        yield
+        # 2. Everything passed: save it all at once.
         db.commit()
     except IntegrityError as error:
+        # 3. Refused by a unique key: undo the whole change, audit entry included, and
+        #    answer as the service's own check would have.
         db.rollback()
         raise Conflict(detail) from error
 
@@ -109,17 +132,18 @@ def create_department(db: Session, user: User, body: DepartmentCreate) -> Depart
         raise Conflict(DEPARTMENT_NAME_TAKEN)
     # 3. Add it; the company filter fills in company_id from the session (tenancy layer 1).
     item = Department(name=body.name, timezone=body.timezone)
-    db.add(item)
-    db.flush()  # gives the new row its ID, for the audit entry
-    record(
-        db,
-        actor=Actor.user(user.id),
-        action="department.created",
-        target_type="department",
-        target_id=item.id,
-        details={"name": item.name, "timezone": item.timezone},
-    )
-    _commit_or_conflict(db, DEPARTMENT_NAME_TAKEN)
+    # 4. Save it with its audit entry; a duplicate name saved meanwhile is a 409.
+    with _saved_or_conflict(db, DEPARTMENT_NAME_TAKEN):
+        db.add(item)
+        db.flush()  # gives the new row its ID, for the audit entry
+        record(
+            db,
+            actor=Actor.user(user.id),
+            action="department.created",
+            target_type="department",
+            target_id=item.id,
+            details={"name": item.name, "timezone": item.timezone},
+        )
     return item
 
 
@@ -148,16 +172,18 @@ def update_department(
         # shifts use the new one.
         item.timezone = body.timezone
 
-    if changed:
-        record(
-            db,
-            actor=Actor.user(user.id),
-            action="department.updated",
-            target_type="department",
-            target_id=item.id,
-            details={"fields": changed},
-        )
-    _commit_or_conflict(db, DEPARTMENT_NAME_TAKEN)
+    # record() sends the new name to the database, so a duplicate saved meanwhile is
+    # refused there: inside the block, it is a 409.
+    with _saved_or_conflict(db, DEPARTMENT_NAME_TAKEN):
+        if changed:
+            record(
+                db,
+                actor=Actor.user(user.id),
+                action="department.updated",
+                target_type="department",
+                target_id=item.id,
+                details={"fields": changed},
+            )
     return item
 
 
@@ -170,6 +196,8 @@ def archive_department(db: Session, user: User, department_id: uuid.UUID) -> Dep
         raise NotFound()
     if item.archived_at is not None:
         raise Conflict("This department is already archived.")
+    # Each check is a fresh, locking read (repository.py): it sees what other requests
+    # committed while this one waited for the lock, and holds it until this one ends.
     if repository.is_anyones_home(db, item.id):
         raise Conflict("People still have this as their home department. Move them first.")
     if repository.has_upcoming_shifts(db, item.id, utcnow()):
@@ -227,23 +255,32 @@ def create_team(db: Session, user: User, body: TeamCreate) -> Team:
         raise Conflict(TEAM_NAME_TAKEN)
 
     item = Team(department_id=department.id, name=body.name)
-    db.add(item)
-    db.flush()
-    record(
-        db,
-        actor=Actor.user(user.id),
-        action="team.created",
-        target_type="team",
-        target_id=item.id,
-        details={"department_id": str(department.id), "name": item.name},
-    )
-    _commit_or_conflict(db, TEAM_NAME_TAKEN)
+    # Saved with its audit entry; a duplicate name saved meanwhile is a 409.
+    with _saved_or_conflict(db, TEAM_NAME_TAKEN):
+        db.add(item)
+        db.flush()  # gives the new row its ID, for the audit entry
+        record(
+            db,
+            actor=Actor.user(user.id),
+            action="team.created",
+            target_type="team",
+            target_id=item.id,
+            details={"department_id": str(department.id), "name": item.name},
+        )
     return item
 
 
 def _changeable_team(db: Session, team_id: uuid.UUID) -> Team:
-    """The team, if it exists in the company and is not archived."""
-    item = repository.team(db, team_id)
+    """The team, locked and read fresh, if it exists in the company and is not archived.
+
+    Every change to a team starts here. The lock makes two changes to one team take turns
+    (an archive and a rename, or an archive and a new member). Reading fresh matters for
+    the one that waited: it sees the team as the other request left it, so a change that
+    waited for an archive is refused (409) instead of changing an archived team.
+    """
+    # 1. Lock the row (SELECT ... FOR UPDATE) and read its newest committed version.
+    item = repository.team(db, team_id, lock=True)
+    # 2. Unknown, or another company's: 404. Archived (perhaps just now): 409.
     if item is None:
         raise NotFound()
     if item.archived_at is not None:
@@ -258,16 +295,18 @@ def rename_team(db: Session, user: User, team_id: uuid.UUID, name: str) -> Team:
     taken = repository.team_named(db, item.department_id, name)
     if taken is not None and taken.id != item.id:
         raise Conflict(TEAM_NAME_TAKEN)
-    item.name = name
-    record(
-        db,
-        actor=Actor.user(user.id),
-        action="team.updated",
-        target_type="team",
-        target_id=item.id,
-        details={"fields": ["name"]},
-    )
-    _commit_or_conflict(db, TEAM_NAME_TAKEN)
+    # record() sends the new name to the database, so a duplicate saved meanwhile is
+    # refused there: inside the block, it is a 409.
+    with _saved_or_conflict(db, TEAM_NAME_TAKEN):
+        item.name = name
+        record(
+            db,
+            actor=Actor.user(user.id),
+            action="team.updated",
+            target_type="team",
+            target_id=item.id,
+            details={"fields": ["name"]},
+        )
     return item
 
 
@@ -298,17 +337,18 @@ def add_member(db: Session, user: User, team_id: uuid.UUID, user_id: uuid.UUID) 
         raise Conflict("This person is already on this team.")
 
     row = TeamMember(team_id=item.id, user_id=member.id)
-    db.add(row)
-    record(
-        db,
-        actor=Actor.user(user.id),
-        action="team_member.added",
-        target_type="team",
-        target_id=item.id,
-        details={"user_id": str(member.id)},
-    )
-    # Two requests adding the same person at the same moment: the key refuses the second.
-    _commit_or_conflict(db, "This person is already on this team.")
+    # Two requests adding the same person at the same moment: the key refuses the second,
+    # when record() sends the new row along with the audit entry. Inside the block: 409.
+    with _saved_or_conflict(db, "This person is already on this team."):
+        db.add(row)
+        record(
+            db,
+            actor=Actor.user(user.id),
+            action="team_member.added",
+            target_type="team",
+            target_id=item.id,
+            details={"user_id": str(member.id)},
+        )
     return row
 
 

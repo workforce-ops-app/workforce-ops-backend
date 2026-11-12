@@ -261,3 +261,17 @@ def test_an_archived_team_keeps_its_members_but_takes_no_changes(shifts: ShiftSe
         owner.post(f"{team}/members", json={"user_id": str(shifts.ids["ana"])}).status_code == 409
     )
     assert owner.delete(f"{team}/members/{shifts.ids['ben']}").status_code == 409
+
+
+def test_an_archived_team_no_longer_makes_anyone_eligible_for_shifts(shifts: ShiftSetup) -> None:
+    """Ben's home is Front; only the Weekend Crew (a Kitchen team) lets him work Kitchen
+    shifts. Once the team is archived, his membership stays listed for history but must
+    not count any more (review on #136)."""
+    owner = shifts.browser("owner")
+    item = shifts.new_shift("owner")
+    url = f"/api/shifts/{item['id']}/assign"
+    owner.post(f"/api/teams/{shifts.ids['crew']}/archive")
+    refused = owner.post(url, json={"employee_id": str(shifts.ids["ben"])})
+    assert refused.status_code == 422
+    # The attacker's view: the shift is still open, with nobody on it.
+    assert owner.get(f"/api/shifts/{item['id']}").json()["employee"] is None

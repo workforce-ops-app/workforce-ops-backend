@@ -150,11 +150,17 @@ def _check_assignable(db: Session, shift: Shift, employee_id: uuid.UUID) -> None
     # Unknown (or of another company), deactivated, or not set up yet ("invited").
     if person is None or person.deactivated_at is not None or person.password_hash is None:
         raise Invalid(CANNOT_ASSIGN)
-    # Home department, or on a team in the shift's department.
+    # Home department, or on an active team in the shift's department. An archived team
+    # keeps its member list for history (organization.md), but being listed on it no
+    # longer makes anyone eligible.
     on_team = db.execute(
         select(TeamMember.user_id, Team.id)
         .join(Team, Team.id == TeamMember.team_id)
-        .where(TeamMember.user_id == person.id, Team.department_id == shift.department_id)
+        .where(
+            TeamMember.user_id == person.id,
+            Team.department_id == shift.department_id,
+            Team.archived_at.is_(None),
+        )
         .limit(1)
     ).first()
     if person.department_id != shift.department_id and on_team is None:

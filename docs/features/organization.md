@@ -51,9 +51,12 @@ flowchart LR
 - A department's time zone is an IANA name such as `America/Chicago`, or none (the company's applies). Changing it does not move existing shifts: each keeps the zone it was created with ([schedules](schedules.md#states-and-rules)).
 - A team belongs to one department for good: renaming is the only change.
 - Archiving instead of deleting ([0020](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md)). An archived department or team cannot be changed, and nothing new goes into it: no teams, members, or shifts (409).
-- A department cannot be archived while it is the home department of anyone not deactivated, has upcoming shifts, or still has active teams (409); move the people and shifts, and archive the teams, first. Its row is locked while this is checked, and creating a team locks it too, so neither can slip in between.
+- A department cannot be archived while it is the home department of anyone not deactivated, has upcoming shifts, or still has active teams (409); move the people and shifts, and archive the teams, first. Its row is locked while this is checked, and creating a team locks it too, so neither can slip in between. Each check is a locking read, so it sees a person, shift, or team that another request committed while this one waited for the lock (under MySQL's REPEATABLE READ an ordinary read would not).
 - Archiving a department or team ends its role assignments' effect (archived scopes cover nothing, `app/authz/check.py`): the assignments stay for history but grant nothing. A team keeps its member list for history.
 - A deactivated person cannot be added to a team (409); nobody is on a team twice (409).
+- Every change to a team (rename, archive, add or remove a member) locks the team's row first and reads it fresh, so a change that waited for an archive is refused (409) instead of changing an archived team.
+- Two requests saving the same name or the same membership at the same moment: the database's unique key refuses the second, and the answer is 409, never 500, wherever the database refuses it (when the row is sent, with the audit entry, or at the commit).
+- A person on an archived team is no longer eligible for that department's shifts through it ([schedules](schedules.md#states-and-rules)).
 - Known limitation: creating a shift does not lock the department, so a shift created at the very moment the department is archived can still be saved. Both are rare administrator actions; the shift can be cancelled afterwards.
 
 **People**

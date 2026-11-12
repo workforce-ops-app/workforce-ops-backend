@@ -101,18 +101,34 @@ def list_active_departments(
     return list(db.scalars(statement))
 
 
+# The next three checks decide whether a department may be archived. archive_department()
+# runs them after it has locked the department, and each one is a locking read
+# (FOR SHARE). Why: under MySQL's default isolation (REPEATABLE READ), an ordinary SELECT
+# sees the database as it was at the transaction's FIRST read, and the request has always
+# read something before it gets here (its session and permission checks). After waiting
+# for the department's lock it would still miss a team, a shift, or a person committed
+# meanwhile, and archive the department anyway. A locking read always sees the newest
+# committed rows, and holds them until this transaction ends, so they cannot be changed
+# under the archive either. The same fix as for double-booking
+# (app/modules/schedules/repository.py, has_overlap). SQLite, which the tests use, has no
+# row locks and ignores FOR SHARE; scripts/check_migrations.py tries the race on MySQL.
+
+
 def is_anyones_home(db: Session, department_id: uuid.UUID) -> bool:
-    """Whether the department is the home department of anyone not deactivated."""
+    """Whether the department is the home department of anyone not deactivated (a fresh,
+    locking read: see above)."""
     found = db.scalar(
         select(User.id)
         .where(User.department_id == department_id, User.deactivated_at.is_(None))
         .limit(1)
+        .with_for_update(read=True)  # FOR SHARE: the newest committed rows
     )
     return found is not None
 
 
 def has_upcoming_shifts(db: Session, department_id: uuid.UUID, now: datetime) -> bool:
-    """Whether the department has a shift that has not ended yet and is not cancelled."""
+    """Whether the department has a shift that has not ended yet and is not cancelled (a
+    fresh, locking read: see above)."""
     # The schedules module owns shifts; imported here, inside the function, because
     # schedules itself builds on the org models (a module-level import would be circular).
     from app.modules.schedules.models import Shift
@@ -125,16 +141,21 @@ def has_upcoming_shifts(db: Session, department_id: uuid.UUID, now: datetime) ->
             Shift.ends_at > now,
         )
         .limit(1)
+        .with_for_update(read=True)  # FOR SHARE: the newest committed rows
     )
     return found is not None
 
 
 def has_active_teams(db: Session, department_id: uuid.UUID) -> bool:
-    """Whether the department still has a team that is not archived."""
+    """Whether the department still has a team that is not archived (a fresh, locking
+    read: see above). A team created by create_team() cannot slip past this: creating one
+    locks the department first, so it either committed before this request got the
+    department's lock (and this read sees it) or waits until this request has finished."""
     found = db.scalar(
         select(Team.id)
         .where(Team.department_id == department_id, Team.archived_at.is_(None))
         .limit(1)
+        .with_for_update(read=True)  # FOR SHARE: the newest committed rows
     )
     return found is not None
 
@@ -142,9 +163,15 @@ def has_active_teams(db: Session, department_id: uuid.UUID) -> bool:
 # --- Teams -----------------------------------------------------------------------------
 
 
-def team(db: Session, team_id: uuid.UUID) -> Team | None:
-    """A team of the session's company, archived or not (another company's: 404)."""
-    return db.get(Team, team_id)
+def team(db: Session, team_id: uuid.UUID, *, lock: bool = False) -> Team | None:
+    """A team of the session's company, archived or not (another company's: 404).
+
+    lock=True locks its row until the transaction ends (SELECT ... FOR UPDATE) and reads
+    its newest committed version, replacing any copy this session already holds
+    (populate_existing). So two changes to one team take turns, and a change that waited
+    for an archive sees the team as archived rather than as it was when the request began.
+    """
+    return db.get(Team, team_id, with_for_update=lock, populate_existing=lock)
 
 
 def team_named(db: Session, department_id: uuid.UUID, name: str) -> Team | None:
