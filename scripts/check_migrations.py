@@ -16,10 +16,16 @@
 5. Changes that must take turns do so in MySQL (_race_problems): two requests adding
    reporting lines at the same moment cannot add a duplicate or a loop, and two requests
    booking one person at the same moment cannot double-book them. SQLite has no row
-   locks, so this too can only be tried on MySQL.
+   locks, so this too can only be tried on MySQL. They run as the application user, so
+   they also show its rights are enough for the app's own locking reads.
+6. The application user's rights (_grant_problems, #43): created by the same first-start
+   script Docker Compose uses (docker/mysql/init/01-users.sh) and granted by the
+   migrations (app/db/grants.py), it cannot change the structure, cannot change or
+   remove audit entries, and can read every table the app uses.
 
 The database is a throwaway Docker container (removed afterwards), unless
-MIGRATION_CHECK_DATABASE_URL points at an empty database to use instead.
+MIGRATION_CHECK_DATABASE_URL points at an empty database to use instead. That one URL
+is then used for everything, and step 6 is skipped: it needs the two users.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from alembic import command
@@ -50,6 +57,8 @@ if TYPE_CHECKING:  # names used only in type hints
 
 MYSQL_IMAGE = "mysql:8.4"
 READY_TIMEOUT_SECONDS = 180
+# The first-start scripts Docker Compose gives MySQL; the throwaway container gets the same.
+INIT_SCRIPTS = Path(__file__).resolve().parents[1] / "docker" / "mysql" / "init"
 
 
 def _free_port() -> int:
@@ -83,27 +92,36 @@ def _docker() -> str:
     return path
 
 
-def _start_mysql() -> tuple[str, str]:
-    """Start an empty MySQL container; return its name and a database URL for it."""
+def _start_mysql() -> tuple[str, str, str]:
+    """Start an empty MySQL container with the two users, as Docker Compose creates them.
+
+    Returns the container's name, the migrations user's URL, and the application user's.
+    """
     name = f"workforce-ops-migration-check-{secrets.token_hex(4)}"
-    password = secrets.token_hex(16)  # throwaway, never stored
+    # Throwaway passwords, never stored. Hex only, so they fit in a URL as they are.
+    root, app, migrations = (secrets.token_hex(16) for _ in range(3))
     port = _free_port()
     # Every argument is fixed or generated here; nothing comes from user input.
     subprocess.run(  # noqa: S603
         [
             _docker(), "run", "--detach", "--rm", "--name", name,
             "--publish", f"127.0.0.1:{port}:3306",
-            "--env", f"MYSQL_ROOT_PASSWORD={password}",
+            "--volume", f"{INIT_SCRIPTS}:/docker-entrypoint-initdb.d:ro",
+            "--env", f"MYSQL_ROOT_PASSWORD={root}",
             "--env", "MYSQL_DATABASE=migration_check",
-            "--env", "MYSQL_USER=migration_check",
-            "--env", f"MYSQL_PASSWORD={password}",
+            "--env", f"MYSQL_APP_PASSWORD={app}",
+            "--env", f"MYSQL_MIGRATIONS_PASSWORD={migrations}",
             MYSQL_IMAGE,
         ],
         check=True,
         capture_output=True,
     )  # fmt: skip
-    url = f"mysql+pymysql://migration_check:{password}@127.0.0.1:{port}/migration_check"
-    return name, url
+    address = f"127.0.0.1:{port}/migration_check"
+    return (
+        name,
+        f"mysql+pymysql://workforce_migrations:{migrations}@{address}",
+        f"mysql+pymysql://workforce_app:{app}@{address}",
+    )
 
 
 def _differences_from_models(url: str) -> list[str]:
@@ -732,6 +750,66 @@ def _org_race_problems(engine: Engine) -> list[str]:
     return problems
 
 
+# MySQL's error numbers for a missing right: on a table (1142), on a column (1143), on
+# the database (1044), and for an action needing a special right (1227). A refusal for any
+# other reason (a typo in the SQL, say) would prove nothing, so it counts as a problem.
+_NO_RIGHT = {1044, 1142, 1143, 1227}
+
+
+def _grant_problems(app_url: str) -> list[str]:
+    """What the application user can do that it must not, or cannot that it must.
+
+    Each statement runs on its own connection that commits at once (structure changes
+    commit anyway in MySQL) and must be refused for a missing right. Then every table
+    the app uses must be readable.
+    """
+    from app.db.grants import APP_RIGHTS
+
+    must_be_refused = [
+        # The structure: a break-in through the API cannot create, change, or drop tables.
+        "CREATE TABLE grant_probe (id INT)",
+        "ALTER TABLE users ADD COLUMN grant_probe INT",
+        "CREATE INDEX grant_probe ON users (display_name)",
+        "TRUNCATE TABLE sessions",
+        "DROP TABLE shifts",
+        # The audit log: entries and heads cannot be changed or removed (audit-log.md).
+        "UPDATE audit_events SET action = action",
+        "DELETE FROM audit_events",
+        "DELETE FROM audit_chain_heads",
+        # Security events are added and removed after a year, never changed.
+        "UPDATE security_events SET occurred_at = occurred_at",
+        "UPDATE platform_security_events SET occurred_at = occurred_at",
+        # Nothing outside its own database: not MySQL's own users and rights.
+        "SELECT user FROM mysql.user",
+        # It cannot give itself (or anyone) more rights.
+        "GRANT DELETE ON audit_events TO CURRENT_USER()",
+        "CREATE USER grant_probe IDENTIFIED BY 'grant-probe-password'",
+    ]
+    problems = []
+    engine = create_engine(app_url, isolation_level="AUTOCOMMIT")
+    try:
+        for sql in must_be_refused:
+            with engine.connect() as connection:
+                try:
+                    connection.execute(text(sql))
+                except DBAPIError as error:
+                    code = error.orig.args[0] if error.orig is not None else None
+                    if code not in _NO_RIGHT:
+                        problems.append(f"application user: {sql!r} failed otherwise: {error.orig}")
+                    continue
+                problems.append(f"the application user was allowed: {sql}")
+        with engine.connect() as connection:
+            for table in APP_RIGHTS:
+                try:
+                    # The names come from APP_RIGHTS in the code, never from input.
+                    connection.execute(text(f"SELECT * FROM `{table}` LIMIT 0"))  # noqa: S608
+                except DBAPIError as error:
+                    problems.append(f"the application user cannot read {table}: {error.orig}")
+    finally:
+        engine.dispose()
+    return problems
+
+
 def main() -> int:
     config = Config("alembic.ini")
     heads = ScriptDirectory.from_config(config).get_heads()
@@ -740,27 +818,36 @@ def main() -> int:
         return 1
 
     container = None
-    url = os.environ.get("MIGRATION_CHECK_DATABASE_URL")
+    url = os.environ.get("MIGRATION_CHECK_DATABASE_URL", "")
+    # With MIGRATION_CHECK_DATABASE_URL, one user does both jobs.
+    app_url = url
     if not url:
-        container, url = _start_mysql()
+        container, url, app_url = _start_mysql()
     try:
         _wait_until_ready(url)
-        # migrations/env.py reads the URL from the app settings: the address goes in
-        # DATABASE_URL and the password in DATABASE_PASSWORD, the same split the app uses.
-        # Setting both here also overrides any DATABASE_PASSWORD in the developer's .env.
-        parsed = make_url(url)
-        os.environ["DATABASE_URL"] = parsed.set(password=None).render_as_string()
-        os.environ["DATABASE_PASSWORD"] = parsed.password or ""
+        # migrations/env.py reads the URLs from the app settings: each address goes in its
+        # URL setting and each password in its own, the same split the app uses. Setting
+        # them here also overrides whatever the developer's .env says.
+        for prefix, each in (("", app_url), ("MIGRATIONS_", url)):
+            parsed = make_url(each)
+            os.environ[f"{prefix}DATABASE_URL"] = parsed.set(password=None).render_as_string()
+            os.environ[f"{prefix}DATABASE_PASSWORD"] = parsed.password or ""
         from app.core.config import get_settings
 
         get_settings.cache_clear()
         command.upgrade(config, "head")
         # The race checks commit rows, so they run before the downgrade removes everything.
-        race_problems = _race_problems(url)
+        # They run as the application user, like the app.
+        race_problems = _race_problems(app_url)
         command.downgrade(config, "base")
         command.upgrade(config, "head")
         differences = _differences_from_models(url)
         rule_problems = _database_rule_problems(url) + race_problems
+        # Last, as a refused change that got through could leave the database broken.
+        if app_url != url:
+            rule_problems += _grant_problems(app_url)
+        else:
+            print("one database user given: the application user's rights are not checked")
     finally:
         if container:
             subprocess.run([_docker(), "stop", container], capture_output=True)  # noqa: S603
@@ -780,7 +867,7 @@ def main() -> int:
     where = "a fresh MySQL 8.4" if container else "MIGRATION_CHECK_DATABASE_URL"
     print(
         f"one head ({heads[0]}); upgrade, downgrade, upgrade passed on {where}; "
-        "models match; database rules hold"
+        "models match; database rules and the application user's rights hold"
     )
     return 0
 

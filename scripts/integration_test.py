@@ -4,7 +4,8 @@
 
 Builds the image, starts the API and MySQL as a separate Compose project with
 throwaway passwords and free ports (so it never touches your own running copy or its
-data), waits until both are healthy, runs tests/integration against it, then removes
+data), waits until both are healthy, applies the migrations with the migrate tool (the
+migrations user), runs tests/integration against it, then removes
 everything it created, including the database volume.
 """
 
@@ -63,6 +64,9 @@ def main() -> int:
         # the test proves the API still connects with such a password.
         "MYSQL_ROOT_PASSWORD": secrets.token_hex(16),
         "MYSQL_APP_PASSWORD": "p@ss:w/rd%41#x?y-" + secrets.token_hex(8),
+        # The migrations user's, with a quote and a backslash too: the first-start script
+        # (docker/mysql/init/01-users.sh) must write it into SQL exactly as it is.
+        "MYSQL_MIGRATIONS_PASSWORD": "m'g\\r@t:e/%41#?-" + secrets.token_hex(8),
         # A throwaway audit signing key for this run only.
         "AUDIT_SIGNING_KEY": secrets.token_urlsafe(32),
         "CSRF_KEY": secrets.token_urlsafe(32),
@@ -97,6 +101,13 @@ def main() -> int:
         if up.returncode != 0:
             subprocess.run([*compose, "logs", "--no-color"], env=env)  # noqa: S603
             print("the containers did not become healthy")
+            return 1
+
+        # Apply the migrations the way contributors do: the migrate tool, which connects
+        # as the migrations user and then gives the application user its rights (#43).
+        migrate = subprocess.run([*compose, "run", "--rm", "migrate"], env=env)  # noqa: S603
+        if migrate.returncode != 0:
+            print("the migrations did not apply")
             return 1
 
         # Run tests/integration with pytest, in this same Python. The two extra

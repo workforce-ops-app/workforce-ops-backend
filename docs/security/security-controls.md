@@ -74,7 +74,8 @@ Tests are in `tests/security/` unless another folder is named.
 | HMAC-signed chain per company; the key is outside the database | T4, R2 | `app/audit/signing.py` | `test_audit_log.py::test_editing_an_entry_in_the_database_is_detected`, `test_removing_an_entry_is_detected`, `test_a_plain_hash_cannot_repair_an_edited_chain` |
 | The chain comes from the session's company, never from the caller | T4, I1 | `record()` | `test_audit_log.py::test_a_company_cannot_write_into_another_companys_chain` |
 | No passwords, tokens, secrets, or hashes in entries | I5 | `_check_details()` | `test_audit_log.py::test_no_entry_can_contain_a_password_token_or_hash` |
-| Insert-only database rights and verification | T4, R2 | not built yet (#43, #58) | |
+| Separate database users: the application user may only read and write data, per table, and only add to the audit log; the migrations user changes the structure and is never given to the API | T4, R2, D3, P4 | `app/db/grants.py`, `migrations/env.py`, `docker/mysql/init/01-users.sh`, the `migrate` tool in `docker-compose.yml` | `check_migrations.py` (`_grant_problems`), `tests/unit/test_grants.py`, `tests/integration/test_compose.py` |
+| Verification of the audit log | T4, R2 | not built yet (#58) | |
 
 ## Cryptography
 

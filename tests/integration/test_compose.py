@@ -1,4 +1,5 @@
-"""The backend as Docker Compose runs it: reachable, healthy, and not running as root.
+"""The backend as Docker Compose runs it: reachable, healthy, not running as root, and
+connected as a database user that can only read and write data (#43).
 
 Run by `python -m scripts.integration_test`, which starts a throwaway Compose project and
 sets INTEGRATION_API_URL and INTEGRATION_COMPOSE_PROJECT. Without them (for example a
@@ -77,6 +78,46 @@ def test_api_reaches_the_database() -> None:
         "print(get_engine().connect().execute(text('SELECT 1')).scalar())",
     )
     assert output == "1"
+
+
+def _as_the_api(sql: str) -> str:
+    """Run one statement with the API's own database connection, inside its container.
+
+    Prints "ok" when MySQL allowed it, or "refused <MySQL error number>".
+    """
+    return compose_exec(
+        "api",
+        "python",
+        "-c",
+        "import sys; from sqlalchemy import text; from sqlalchemy.exc import DBAPIError; "
+        "from app.db.session import get_engine\n"
+        "try:\n"
+        "    with get_engine().begin() as c: c.execute(text(sys.argv[1]))\n"
+        "    print('ok')\n"
+        "except DBAPIError as e: print('refused', e.orig.args[0])",
+        sql,
+    )
+
+
+def test_the_api_reads_data_after_the_migrations() -> None:
+    # The migrate tool ran (scripts/integration_test.py) and gave the application user
+    # its rights, table by table (app/db/grants.py).
+    assert _as_the_api("SELECT COUNT(*) FROM users") == "ok"
+
+
+def test_the_api_cannot_change_the_structure_or_the_audit_log() -> None:
+    # The API connects as the application user (#43). A break-in through it cannot drop
+    # or change tables, nor edit or remove audit entries. 1142: no right on that table.
+    assert _as_the_api("DROP TABLE shifts") == "refused 1142"
+    assert _as_the_api("ALTER TABLE users ADD COLUMN probe INT") == "refused 1142"
+    assert _as_the_api("UPDATE audit_events SET action = action") == "refused 1142"
+    assert _as_the_api("DELETE FROM audit_events") == "refused 1142"
+
+
+def test_the_api_container_does_not_hold_the_migrations_password() -> None:
+    # Only the migrate tool gets it; the running API has the application user's only.
+    names = compose_exec("api", "env").splitlines()
+    assert not [name for name in names if name.startswith("MIGRATIONS_DATABASE")]
 
 
 def test_api_container_does_not_run_as_root() -> None:

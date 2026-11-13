@@ -73,4 +73,4 @@ Tenancy decides **which company's data exists** for a request. Authorization (`a
 ## Known limits
 
 - MySQL has no row-level security, so layer 1 lives in the application. Layers 2 to 4 exist so that a single application bug is not enough to leak data.
-- Direct database access (for example with a stolen database password) bypasses layer 1. Database credentials are therefore limited per purpose (application vs migrations), and audit tables are append-only for the application user ([audit log](audit-log.md)).
+- Direct database access (for example with a stolen database password) bypasses layer 1. Database credentials are therefore limited per purpose (application vs migrations, `app/db/grants.py`), and audit tables are append-only for the application user ([audit log](audit-log.md#protection-in-the-database)). The application user can still read and write every company's rows: the per-company filter is the application's job, not the database's.

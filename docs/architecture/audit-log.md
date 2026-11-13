@@ -4,7 +4,7 @@
 
 Decision: [0018](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0018-audit-log-chains.md).
 
-> **Status:** writing is built (`app/audit/`, migration `0003`, slice L1). Verification and the viewer follow in Phase 4 (#58); insert-only database rights in T2 (#43).
+> **Status:** writing is built (`app/audit/`, migration `0003`, slice L1). Insert-only database rights are built too (`app/db/grants.py`, T2, #43). Verification and the viewer follow in Phase 4 (#58).
 
 ## How an entry is written
 
@@ -98,7 +98,7 @@ A verification failure names the first bad `seq` (or, when the end is missing, t
 | application | `INSERT`, `SELECT` on `audit_events`; `INSERT`, `SELECT`, `UPDATE` on `audit_chain_heads` (a chain's first entry creates its head). Never `DELETE` on either |
 | migrations | schema changes only, not used by the running application |
 
-These rights arrive with T2 (#43). Until then the application's database user can change rows directly; the signatures make any such change detectable.
+These rights are set table by table in `app/db/grants.py` (T2, #43): MySQL cannot take one table's rights away from a grant on the whole database, so the application user has no database-wide grant at all. `scripts/check_migrations.py` proves on MySQL that the application user's `UPDATE` and `DELETE` on the audit tables are refused. Someone with the migrations user's password could still change rows; the signatures make any such change detectable.
 
 ## The signing key
 

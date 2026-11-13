@@ -3,6 +3,8 @@
 # The API is at http://localhost:8000/api/health and MySQL at localhost:3307 (next to
 # XAMPP's 3306). Both are published on 127.0.0.1 only, so other computers on the
 # network cannot reach them. Passwords come from .env (see .env.example).
+# Apply the migrations with the separate migrations user (#43):
+#   docker compose run --rm migrate
 
 name: workforce-ops-backend
 
@@ -10,18 +12,22 @@ services:
   # MySQL 8.4 LTS, the official image (decision 0010).
   db:
     image: mysql:8.4
-    # The image creates the database and the app user on its first start only.
+    # On its first start only (an empty volume), the image creates the database, then
+    # runs docker/mysql/init/01-users.sh, which creates the two users: the application
+    # user (data only, rights per table from the migrations) and the migrations user.
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
       MYSQL_DATABASE: workforce_ops
-      MYSQL_USER: workforce_app
-      MYSQL_PASSWORD: ${MYSQL_APP_PASSWORD:?set MYSQL_APP_PASSWORD in .env}
+      MYSQL_APP_PASSWORD: ${MYSQL_APP_PASSWORD:?set MYSQL_APP_PASSWORD in .env}
+      MYSQL_MIGRATIONS_PASSWORD: ${MYSQL_MIGRATIONS_PASSWORD:?set MYSQL_MIGRATIONS_PASSWORD in .env}
     ports:
       - "127.0.0.1:${DB_PORT:-3307}:3306"
     volumes:
       # Keep the data in a named volume, so it survives `docker compose down`
       # (only `down --volumes` deletes it).
       - db-data:/var/lib/mysql
+      # The first-start scripts, read-only.
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
     networks:
       - database
     healthcheck:
@@ -42,6 +48,8 @@ services:
       # Inside Compose the database is the "db" service on its normal port. The password
       # is passed on its own, never pasted into the URL: characters such as @ : / % in it
       # would break the URL (the app combines the two safely, app/core/config.py).
+      # This is the application user: it can read and write data only (app/db/grants.py).
+      # The migrations user's password is deliberately not given to this container.
       DATABASE_URL: mysql+pymysql://workforce_app@db:3306/workforce_ops
       DATABASE_PASSWORD: ${MYSQL_APP_PASSWORD:?set MYSQL_APP_PASSWORD in .env}
       # The key that signs the audit log. Required: sign-in writes audit entries, and
@@ -63,8 +71,28 @@ services:
       - database
       - workforce-ops
 
+  # Applies the migrations as the migrations user, then sets the application user's
+  # rights (migrations/env.py). Runs only when asked for: docker compose run --rm migrate.
+  # The same image as the API, but its own container, so the API never holds the
+  # migrations password. Only on the database network: it needs nothing else.
+  migrate:
+    build: .
+    image: workforce-ops-backend:local
+    profiles: ["tools"]
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      # Who the application user is, for the grants (no password: it does not sign in).
+      DATABASE_URL: mysql+pymysql://workforce_app@db:3306/workforce_ops
+      MIGRATIONS_DATABASE_URL: mysql+pymysql://workforce_migrations@db:3306/workforce_ops
+      MIGRATIONS_DATABASE_PASSWORD: ${MYSQL_MIGRATIONS_PASSWORD:?set MYSQL_MIGRATIONS_PASSWORD in .env}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - database
+
 networks:
-  # Only the API can reach MySQL.
+  # Only the API (and the migrate tool) can reach MySQL.
   database:
   # Shared with the frontend's nginx, which forwards /api here; MySQL is not on it.
   workforce-ops:
