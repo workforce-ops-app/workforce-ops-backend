@@ -1,6 +1,6 @@
 # Detection and the security page
 
-- **Status:** the detector (DT3, #129: `app/detection/`) and the security event tables and their writer (DT2, #128: `app/modules/security/`) are built; the detection layer, the endpoints, and the page follow in the other slices
+- **Status:** the detector (DT3, #129: `app/detection/`), the security event tables and their writer (DT2, #128: `app/modules/security/`), and demo security events in the seed script (DT6, #132: `scripts/seed_demo.py`) are built; the detection layer, the endpoints, and the page follow in the other slices
 - **Related:** design workforce-ops-app/workforce-ops-backend#115, detection workforce-ops-app/workforce-ops-backend#116, security page workforce-ops-app/workforce-ops-frontend#61, tracker workforce-ops-app/.github#91; refused requests workforce-ops-app/workforce-ops-backend#92; method [decision 0030](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0030-security-study-method.md); results go to the [research repository](https://github.com/workforce-ops-app/workforce-ops-research)
 
 ## In short
@@ -153,7 +153,7 @@ There is no endpoint to change or remove events. Both endpoints read only `secur
 
 ### Frontend
 
-The security page (workforce-ops-app/workforce-ops-frontend#61): counts per type at the top, then the event list with filters. Each row shows the time, type, pattern, field, route, person (or "not signed in"), address, and excerpt. Every value is set with `textContent`.
+The security page (workforce-ops-app/workforce-ops-frontend#61): counts per type at the top, then the event list with filters. The seed script gives both demo companies events to show before any real traffic exists ([organization: demo data](organization.md#demo-data)). Each row shows the time, type, pattern, field, route, person (or "not signed in"), address, and excerpt. Every value is set with `textContent`.
 
 ### Audit and security
 
