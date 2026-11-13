@@ -68,6 +68,9 @@ class OneTimeToken(IdAndTimestamps, CompanyOwned, Base):
         ForeignKeyConstraint(["company_id", "user_id"], ["users.company_id", "users.id"]),
         ForeignKeyConstraint(["company_id", "created_by"], ["users.company_id", "users.id"]),
         Index("ix_one_time_tokens_company_user", "company_id", "user_id"),
+        # MySQL needs an index for each foreign key; named here, so the models and the
+        # migration agree (otherwise MySQL makes one up).
+        Index("ix_one_time_tokens_company_created_by", "company_id", "created_by"),
         # Redeeming finds the link by its token's hash, so it is unique and indexed.
         UniqueConstraint("token_hash"),
         # Only the two kinds of link exist.

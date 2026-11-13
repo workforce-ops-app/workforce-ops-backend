@@ -52,6 +52,7 @@ def upgrade() -> None:
         sa.UniqueConstraint("token_hash"),
         sa.CheckConstraint("purpose IN ('setup', 'reset')", name="one_time_tokens_purpose"),
         sa.Index("ix_one_time_tokens_company_user", "company_id", "user_id"),
+        sa.Index("ix_one_time_tokens_company_created_by", "company_id", "created_by"),
     )
 
 

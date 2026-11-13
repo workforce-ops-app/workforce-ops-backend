@@ -743,7 +743,8 @@ def _link_race_problems(engine: Engine) -> list[str]:
        sees that the first has used it (app/auth/links.py). Without the lock, both would
        read "not used yet" and both would set a password.
     2. A new link created while the old one is being redeemed: both lock the person first
-       and the link second, so they take turns (never a deadlock, never an error).
+       and the link second, so they take turns: either the old link is refused, or it
+       sets the password first (and then a setup link no longer fits). Never an error.
     """
     import threading
 
@@ -841,6 +842,9 @@ def _link_race_problems(engine: Engine) -> list[str]:
             try:
                 create(person_id)
                 outcomes.append("replaced")
+            except links.Conflict:
+                # Redeemed first: the person has a password now, so no setup link.
+                outcomes.append("has a password")
             except Exception as error:  # a 500 in the app: reported below
                 outcomes.append(f"error: {error!r}"[:300])
 
@@ -854,10 +858,10 @@ def _link_race_problems(engine: Engine) -> list[str]:
             thread.start()
         for thread in threads:
             thread.join(timeout=120)
-        # Either order is fine (redeemed then replaced, or replaced and then refused);
-        # an error is not, and the person must not end up with a password set by a
-        # cancelled link after the new one was made.
-        if any(outcome.startswith("error") for outcome in outcomes) or len(outcomes) != 2:
+        # Either order is fine: replaced first, so the old link is refused; or redeemed
+        # first, so the person has a password and a setup link no longer fits. Anything
+        # else (an error, a deadlock, or a cancelled link that still set the password) is not.
+        if sorted(outcomes) not in (["refused", "replaced"], ["has a password", "set"]):
             problems.append(f"a link replaced while it was used, round {number + 1}: {outcomes}")
             break
     return problems
