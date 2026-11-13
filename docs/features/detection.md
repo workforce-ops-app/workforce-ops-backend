@@ -1,6 +1,6 @@
 # Detection and the security page
 
-- **Status:** the detector is built (DT3, #129: `app/detection/`); storing events, the detection layer, the endpoints, and the page follow in the other slices
+- **Status:** the detector (DT3, #129: `app/detection/`) and the security event tables and their writer (DT2, #128: `app/modules/security/`) are built; the detection layer, the endpoints, and the page follow in the other slices
 - **Related:** design workforce-ops-app/workforce-ops-backend#115, detection workforce-ops-app/workforce-ops-backend#116, security page workforce-ops-app/workforce-ops-frontend#61, tracker workforce-ops-app/.github#91; refused requests workforce-ops-app/workforce-ops-backend#92; method [decision 0030](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0030-security-study-method.md); results go to the [research repository](https://github.com/workforce-ops-app/workforce-ops-research)
 
 ## In short
@@ -103,11 +103,12 @@ Rules 2 and 3 overlap on purpose: either one alone keeps the known credential fi
 
 Rows are only ever inserted, never changed, so the rate cap (DE6) keeps its counts in the worker's memory and writes the result once:
 
-1. The worker keeps a counter for each source and minute (`session or address`, `minute`).
+1. The worker keeps a counter for each source and minute (`session or address`, `minute`). The minute is the one the worker handles the event in, by its own clock, not the one the event happened in: events wait in the queue, so some arrive after their minute has ended, and counting them by their own minute would let every late batch start a fresh counter and get 20 more rows. A late event therefore shares the current minute's cap; its row still stores when it really happened.
 2. The first 20 events in a minute are written as normal rows.
 3. After that, events are only counted. When the minute ends (checked each time the worker takes a copy, and at least every 10 seconds), the worker **inserts** one `detection.summary` row whose `count` is how many events were held back, then forgets the counter.
-4. At most **10,000 sources** are tracked at once. Events from further sources in the same minute go into one shared overflow counter, written the same way, so memory stays bounded even if every request comes from a new address.
+4. At most **10,000 sources** are tracked at once. Events from further sources in the same minute are only counted, in one shared overflow counter, so memory stays bounded even if every request comes from a new address. When the minute ends it is written as one `detection.summary` row in `platform_security_events` with no address, since it mixes sources and companies.
 5. When the application stops, the worker writes the summaries it still holds before it exits.
+6. A failed insert loses no counts. A counter is forgotten only once its summary row is saved (otherwise the next check tries again with the same count), and an event takes its place under the cap only once its row is saved. Each company's rows, and the platform's, are saved in a transaction of their own; the writer then raises an error naming exactly the events that were not saved, so the worker can write those again without using up the cap twice or duplicating rows that were saved.
 
 The queue (DE11) is a `queue.Queue` with a size of 200, filled with `put_nowait`. So a full queue never makes a request wait: the copy is dropped and a drop counter goes up, written each minute as one `detection.dropped` row in `platform_security_events`. Together with DE4, the queue can hold at most about 20 million characters of copied text.
 
@@ -139,7 +140,7 @@ Events with a company and events without one are kept in **separate tables**, so
 - Only the detection writer inserts into it, in a database session with no company. No endpoint reads it: the platform view is a stretch goal and gets its own permission and checks when it is designed.
 - A company's session can never see these rows, because no company query touches this table, and the table has no company column a mistaken filter could match.
 
-Both tables are kept for **1 year**, then removed by a nightly job (data model, retention). The application's database user may insert, read, and remove rows older than a year; it may not change them. Security events are **not** audit entries: they record what someone sent, not something the application did, and a flood of them must not grow the signed audit chain.
+Both tables are kept for **1 year**, then removed by a nightly job (data model, retention): `python -m scripts.remove_old_security_events`, which deletes each company's old rows in that company's own session. Until the application has its own background jobs, it is scheduled on the host (the script's docstring shows how). The application's database user may insert, read, and remove rows older than a year; it may not change them. Database grants enforce this once #43 gives the application its own database user; until then, a security test shows the writer only ever inserts. Security events are **not** audit entries: they record what someone sent, not something the application did, and a flood of them must not grow the signed audit chain.
 
 ### Backend
 
