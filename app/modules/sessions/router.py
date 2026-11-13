@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.auth.csrf import csrf_token
 from app.auth.dependencies import Database, SignedInPerson
+from app.auth.limits import client_address
 from app.auth.models import UserSession
 from app.auth.passwords import PasswordRejected
 from app.auth.reauth import change_password, reauthenticate
@@ -89,7 +90,10 @@ def _info(request: Request, db: Session, user: User, session: UserSession) -> Se
 def create_session(
     body: SignInRequest, request: Request, response: Response, db: Database
 ) -> SessionInfo:
-    """Sign in. Every failure gets the same 401 answer (threat I3)."""
+    """Sign in. Every failure gets the same 401 answer (threat I3). At most 20 attempts a
+    minute from one address, successful or not; past that the answer is 429 before any
+    password is checked (app/auth/limits.py)."""
+    request.app.state.limits.sign_in_per_address.hit(client_address(request))
     result = sign_in(db, body.email, body.password)
     if result is None:
         raise HTTPException(status_code=401, detail=SIGN_IN_FAILED)

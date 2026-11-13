@@ -4,7 +4,7 @@
 
 Decisions: [0027 authentication and sessions](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md) · [0025 sensitive actions and security settings](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md) · [0003 one address for pages and API](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0003-same-origin-deployment.md) · Threats: S1 to S5, I3, D1 in the [threat model](../security/threat-model.md)
 
-> **Status:** passwords (`app/auth/passwords.py`), sign-in with sessions (`app/auth/sessions.py`, the `sessions` endpoints, migration `0004`), and CSRF protection (`app/auth/csrf.py`) are built, and so are password re-entry and changing your own password (`app/auth/reauth.py`, #51); lockouts and links follow in the next Phase 2 slices. Until lockouts (S4) exist, an account with `locked_until` in the future is refused, but failures are not counted yet.
+> **Status:** passwords (`app/auth/passwords.py`), sign-in with sessions (`app/auth/sessions.py`, the `sessions` endpoints, migration `0004`), and CSRF protection (`app/auth/csrf.py`) are built, and so are password re-entry and changing your own password (`app/auth/reauth.py`, #51) and lockouts and rate limits (`app/auth/limits.py`, #50); links follow in the next Phase 2 slice.
 
 ## Passwords
 
@@ -117,6 +117,13 @@ Three defenses, so one mistake is not enough:
 | Requests per session | 300 per minute | memory of the API process |
 
 - A locked account gets the same answer as any failed sign-in (see [signing in](#signing-in)), so a lock does not reveal that the account exists. Only the per-address and per-session rate limits answer **429**, since they do not depend on which account was tried.
+- **What counts:** every wrong password for an existing account: at sign-in, at re-entry, and as the current password when changing it. Attempts on accounts without a password or deactivated ones are refused but not counted (there is no password to guess).
+- **While locked**, the password is not tried at all, not even the right one: the dummy hash takes the real one's place, so the answer takes the same time, and guesses made during a lock are neither tried nor counted. Re-entry while locked answers 403 "Too many wrong passwords" (the person is signed in, so this reveals nothing new).
+- **Locks are at the 5th, 10th, and each failure from the 15th on**; failures between those steps are counted but do not lock again.
+- **"24 hours without failures"** is read from `users.updated_at`, which a failure sets. Another change to the account since then (a new name, say) only delays the reset, the cautious direction; this keeps the slice free of a migration.
+- **Attempts on one account take turns:** sign-in and re-entry lock the person's row before reading the count, so guesses sent at the same moment are each counted. `scripts/check_migrations.py` tries six at once on MySQL.
+- **429 answers** carry `Retry-After`, the seconds until the minute ends. The per-address limit runs before any password is checked; the per-session limit runs on every signed-in request. Both are fixed one-minute windows: up to twice the limit can pass across the moment one minute turns into the next, which is fine for slowing guessing. A flood of new addresses in one minute (past 100,000) shares one count, so memory stays bounded.
+- **The client's address** comes from uvicorn, which reads nginx's `X-Forwarded-For` only for requests from the containers on the shared Docker network (`FORWARDED_ALLOW_IPS` in `docker-compose.yml`, the network's upper half; its gateway, where browsers on the same computer come from, is outside it) and takes the right-most address it does not trust, the one nginx added. A browser cannot pick its own address by sending the header.
 - An administrator can unlock an account (`user.manage`, above the person); it is audited.
 - Repeated lockouts are recorded as security events for detection (next tier).
 - The 1 hour maximum means an attacker can delay a real user, but never lock them out for good (threat D1).
@@ -187,7 +194,7 @@ This limits the damage from a session left open on a shared computer or stolen b
 |---|---|
 | `auth.signed_in` | successful sign-in |
 | `auth.sign_in_failed` | a failed sign-in for an existing account; `details.reason` is `wrong_password`, `no_password`, `deactivated`, or `locked`. The actor is `system` (nobody is signed in) and the target is the account tried |
-| `auth.locked`, `auth.unlocked` | an account is locked by the schedule, or unlocked by an administrator |
+| `auth.locked`, `auth.unlocked` | an account is locked by the schedule (actor `system`; `details`: `failures`, `minutes`), or unlocked by an administrator |
 | `auth.password_changed` | a user changes their own password |
 | `auth.link_created`, `auth.link_used` | a setup or reset link is created or used |
 | `auth.sessions_ended` | an administrator signs someone out, or deactivation ends their sessions |
@@ -220,6 +227,6 @@ Entries never contain passwords, tokens, or hashes. Failed sign-ins for emails t
 | The session endpoints | `app/modules/sessions/` (router and response shapes; also `PUT /api/me/password`) |
 | Re-entry, `require_reauth()`, and changing your own password | `app/auth/reauth.py`; tests in `tests/unit/test_reauth_api.py` and `tests/security/test_reauth.py` (AU8 password part, AU9, AU10) |
 | CSRF and Origin checks | `app/auth/csrf.py` |
-| Lockouts and rate limits | `app/auth/limits.py` |
+| Lockouts and rate limits | `app/auth/limits.py`; the per-address limit in `app/modules/sessions/router.py`, the per-session limit in `app/auth/dependencies.py`; tests in `tests/unit/test_limits.py` and `tests/security/test_lockouts.py` (AU2) |
 | Setup and reset links | `app/auth/links.py` |
 | Tests | `tests/unit/test_sessions_api.py`, `tests/security/test_sign_in.py` (AU3, AU4, AU5, and companies), `tests/security/test_csrf.py` (AU6), `tests/unit/test_passwords.py`, `tests/security/test_password_rules.py` (AU1) |

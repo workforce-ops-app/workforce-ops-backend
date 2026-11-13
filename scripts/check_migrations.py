@@ -732,6 +732,82 @@ def _org_race_problems(engine: Engine) -> list[str]:
     return problems
 
 
+def _lockout_race_problems(engine: Engine) -> list[str]:
+    """Wrong passwords for one account sent at the same moment; return what failed.
+
+    Each sign-in locks the account's row before it reads the count of wrong passwords
+    (app/auth/sessions.py). Without that, guesses sent together would each read the same
+    count and each write it plus one, so a burst of parallel guesses would count as one
+    and never reach the lockout. Six guesses sent together must take turns: the first
+    five are counted and the fifth locks the account, so the sixth is refused as locked
+    without being tried or counted. Without the lock they all read the same count, and
+    the account ends up below 5 and unlocked (tried).
+    """
+    import threading
+
+    from sqlalchemy.orm import Session
+
+    from app.audit import Actor
+    from app.auth import sessions
+    from app.auth.passwords import hash_password
+    from app.authz.roles import create_starting_roles
+    from app.modules.org.models import Company, Department, User
+    from app.tenancy.context import set_company
+
+    with Session(engine) as platform:
+        company = Company(name="lockout race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+    with Session(engine) as db:
+        set_company(db, company_id)
+        home = Department(name="Office")
+        db.add(home)
+        db.flush()
+        create_starting_roles(db, Actor.system())
+        person = User(
+            email=f"guessed-{company_id.hex}@lockout-race.example.com",
+            display_name="guessed",
+            department_id=home.id,
+            password_hash=hash_password("the real long passphrase here"),
+        )
+        db.add(person)
+        db.commit()
+        person_id, address = person.id, person.email
+
+    guesses = 6
+    start = threading.Barrier(guesses)
+    errors: list[str] = []
+
+    def guess() -> None:
+        # Each guess is its own request, in a session with no company yet, as at sign-in.
+        with Session(engine) as db:
+            start.wait()
+            try:
+                if sessions.sign_in(db, address, "a wrong guess"):
+                    errors.append("a wrong password signed in")
+            except Exception as error:  # a 500 in the app: reported below
+                errors.append(f"error: {error!r}"[:300])
+
+    threads = [threading.Thread(target=guess) for _ in range(guesses)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+    with Session(engine) as db:
+        set_company(db, company_id)
+        guessed = db.get(User, person_id)
+        counted = guessed.failed_sign_ins if guessed is not None else None
+        locked = guessed is not None and guessed.locked_until is not None
+    problems = [f"wrong passwords at the same moment: {error}" for error in errors]
+    if counted != 5 or not locked:
+        problems.append(
+            f"{guesses} wrong passwords at the same moment counted {counted} (expected 5, "
+            f"then locked), locked={locked}"
+        )
+    return problems
+
+
 def main() -> int:
     config = Config("alembic.ini")
     heads = ScriptDirectory.from_config(config).get_heads()
