@@ -19,12 +19,13 @@ Rules:
 - Archiving a team keeps its member list for history; role assignments for an archived
   department or team stop granting anything (app/authz/check.py).
 - A deactivated person cannot be added to a team (409); nobody is on a team twice (409).
+  The person's row is locked (after the team's), so a deactivation cannot slip in between.
 - Every change to a team locks the team's row first and reads it fresh, so a change that
   waited for an archive is refused (409) instead of changing an archived team.
 - Two requests saving the same name (or the same membership) at the same moment can both
   pass the check; the database's unique key then refuses the second. Wherever that
   happens (sending the row, writing the audit entry, or committing), the answer is 409,
-  never 500 (_saved_or_conflict).
+  never 500 (saved_or_conflict).
 
 Listing departments and teams only needs a signed-in person: every screen that plans
 shifts or shows people needs their names.
@@ -72,7 +73,7 @@ TEAM_NAME_TAKEN = "This department already has a team with this name."
 
 
 @contextmanager
-def _saved_or_conflict(db: Session, detail: str) -> Iterator[None]:
+def saved_or_conflict(db: Session, detail: str) -> Iterator[None]:
     """Run the writes inside the `with` block, then commit; if the database refuses a
     duplicate anywhere along the way, roll back and answer 409 with `detail`, not 500.
 
@@ -133,7 +134,7 @@ def create_department(db: Session, user: User, body: DepartmentCreate) -> Depart
     # 3. Add it; the company filter fills in company_id from the session (tenancy layer 1).
     item = Department(name=body.name, timezone=body.timezone)
     # 4. Save it with its audit entry; a duplicate name saved meanwhile is a 409.
-    with _saved_or_conflict(db, DEPARTMENT_NAME_TAKEN):
+    with saved_or_conflict(db, DEPARTMENT_NAME_TAKEN):
         db.add(item)
         db.flush()  # gives the new row its ID, for the audit entry
         record(
@@ -174,7 +175,7 @@ def update_department(
 
     # record() sends the new name to the database, so a duplicate saved meanwhile is
     # refused there: inside the block, it is a 409.
-    with _saved_or_conflict(db, DEPARTMENT_NAME_TAKEN):
+    with saved_or_conflict(db, DEPARTMENT_NAME_TAKEN):
         if changed:
             record(
                 db,
@@ -256,7 +257,7 @@ def create_team(db: Session, user: User, body: TeamCreate) -> Team:
 
     item = Team(department_id=department.id, name=body.name)
     # Saved with its audit entry; a duplicate name saved meanwhile is a 409.
-    with _saved_or_conflict(db, TEAM_NAME_TAKEN):
+    with saved_or_conflict(db, TEAM_NAME_TAKEN):
         db.add(item)
         db.flush()  # gives the new row its ID, for the audit entry
         record(
@@ -297,7 +298,7 @@ def rename_team(db: Session, user: User, team_id: uuid.UUID, name: str) -> Team:
         raise Conflict(TEAM_NAME_TAKEN)
     # record() sends the new name to the database, so a duplicate saved meanwhile is
     # refused there: inside the block, it is a 409.
-    with _saved_or_conflict(db, TEAM_NAME_TAKEN):
+    with saved_or_conflict(db, TEAM_NAME_TAKEN):
         item.name = name
         record(
             db,
@@ -327,8 +328,10 @@ def add_member(db: Session, user: User, team_id: uuid.UUID, user_id: uuid.UUID) 
     authorize(db, user, "org.manage")
     item = _changeable_team(db, team_id)
     # The person must be the company's own (another company's: 422, like any unknown
-    # reference in a body), and not deactivated.
-    member = repository.person(db, user_id)
+    # reference in a body), and not deactivated. Their row is locked after the team's, so
+    # a deactivation at the same moment takes turns with this, and whichever waited sees
+    # the other's result (app/modules/org/people.py): nobody deactivated joins a team.
+    member = repository.person(db, user_id, lock=True)
     if member is None:
         raise Invalid("Unknown person.")
     if member.deactivated_at is not None:
@@ -339,7 +342,7 @@ def add_member(db: Session, user: User, team_id: uuid.UUID, user_id: uuid.UUID) 
     row = TeamMember(team_id=item.id, user_id=member.id)
     # Two requests adding the same person at the same moment: the key refuses the second,
     # when record() sends the new row along with the audit entry. Inside the block: 409.
-    with _saved_or_conflict(db, "This person is already on this team."):
+    with saved_or_conflict(db, "This person is already on this team."):
         db.add(row)
         record(
             db,

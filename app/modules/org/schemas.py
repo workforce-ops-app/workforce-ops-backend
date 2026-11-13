@@ -116,3 +116,68 @@ class MemberOut(BaseModel):
 
     team_id: uuid.UUID
     user_id: uuid.UUID
+
+
+# --- People ----------------------------------------------------------------------------
+
+# An email as people type it: surrounding spaces removed, at most 254 characters (the
+# column), with one "@" that has text on both sides and a dot in the part after it. That
+# is all the checking it gets: the only real test of an address is whether the person can
+# be reached at it, and there is no email delivery yet. It is stored in lowercase
+# (models.User).
+Email = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$"),
+]
+
+
+class UserOut(BaseModel):
+    """A person, as the people allowed to see them see them (GET /api/users)."""
+
+    id: uuid.UUID
+    display_name: str
+    email: str
+    # The home department: every person has exactly one.
+    department_id: uuid.UUID
+    # The teams they are on (archived teams included: the list is history too).
+    team_ids: list[uuid.UUID]
+    # "invited" (no password yet), "active", or "deactivated" (organization.md, People).
+    status: str
+    # Whether wrong passwords have locked the account for now.
+    locked: bool
+
+
+class UserPage(BaseModel):
+    """A page of people; next_cursor is null after the last page."""
+
+    items: list[UserOut]
+    next_cursor: str | None
+
+
+class UserCreate(Strict):
+    """POST /api/users. The account has no password until its setup link is used.
+
+    manager_id is who the new person reports to. It decides who may act on the account
+    afterwards (only someone above a person may), so it is required unless the creator is
+    an Owner, who is above everyone anyway (organization.md, People).
+    """
+
+    display_name: Name
+    email: Email
+    department_id: uuid.UUID
+    manager_id: uuid.UUID | None = None
+
+
+class UserUpdate(Strict):
+    """PATCH /api/users/{id}: only the fields sent are changed."""
+
+    display_name: Name | None = None
+    email: Email | None = None
+    department_id: uuid.UUID | None = None
+
+
+class DeactivatedOut(UserOut):
+    """The answer to a deactivation: the person, plus the upcoming shifts that are still
+    assigned to them, for the administrator to reassign (organization.md, People)."""
+
+    upcoming_shift_ids: list[uuid.UUID]
