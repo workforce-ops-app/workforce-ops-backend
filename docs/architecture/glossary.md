@@ -27,6 +27,8 @@
 | **Setup / reset link** | A one-time link an administrator creates so a person can set their password: for a new account, or after a forgotten password. |
 | **Password re-entry** | Typing the password again shortly before a sensitive action, even while signed in. |
 | **Lockout** | A short period in which an account cannot sign in after repeated wrong passwords; never longer than 1 hour. |
+| **Announcement** | A short message from someone who manages people to an **audience**: one team, one department, or the whole company. |
+| **Audience** | Who an announcement is for: a team's members, the people whose home department it is, or everyone in the company, worked out when they read it. |
 | **Audit chain** | One company's audit entries, each signed together with the previous entry's signature, so tampering is detectable. |
 | **Workplace zone** | The time zone a shift is scheduled in: the department's zone if set, otherwise the company's. |
 | **Deactivated / archived** | Records are switched off instead of deleted: users are deactivated; companies, departments, teams, and roles are archived. |
