@@ -14,6 +14,7 @@ from fastapi import APIRouter, FastAPI
 
 from app import modules
 from app.auth.csrf import CsrfMiddleware
+from app.auth.limits import Limits
 from app.core.caching import NoStoreMiddleware
 from app.core.config import Settings, get_settings
 from app.core.errors import register_error_handlers
@@ -83,6 +84,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # (app/modules/sessions/router.py) always use the same one.
     app.state.csrf_key = settings.csrf_key.get_secret_value().encode("utf-8")
     app.add_middleware(CsrfMiddleware, key=app.state.csrf_key, origin=settings.app_origin)
+    # The rate limits' counts, kept in this process's memory (app/auth/limits.py). One set
+    # per app, so every test app starts with fresh counts.
+    app.state.limits = Limits()
     register_error_handlers(app, log_full_errors=log_full_errors)
     # Added last, so it is the outermost layer: every answer, including the CSRF check's
     # 403 and the catch-all 500, is marked never to be stored (app/core/caching.py).
