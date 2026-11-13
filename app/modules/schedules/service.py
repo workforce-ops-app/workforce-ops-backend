@@ -10,8 +10,13 @@ Rules:
 - Only an active person who has set up their account, whose home department is the
   shift's department or who is on a team in it, can be assigned (422).
 - Nobody is booked on two overlapping shifts (409). The person's row is locked while this
-  is checked, so two requests at the same moment cannot both pass.
+  is checked, and the check reads the newest committed shifts (repository.has_overlap),
+  so two requests at the same moment cannot both pass.
+- Every change to an existing shift locks first, in one order: the people it touches, then
+  the shift, then writes (_lock_for_change). A shift reassigned by someone else meanwhile
+  is refused (409) rather than changed without its person's lock.
 - A shift that has ended, or was cancelled, can no longer be changed (409).
+- No new shift goes into an archived department (409).
 - Time off is checked here once time-off requests exist (time-off slices).
 - Several shifts at once (batch): every shift passes the same checks as one shift would,
   all in one transaction, so either every change is saved or none is. At 10 or more shifts
@@ -97,17 +102,65 @@ def _check_changeable(shift: Shift) -> None:
         raise Conflict("This shift has ended and can no longer be changed.")
 
 
+def _lock_for_change(
+    db: Session, shift_ids: list[uuid.UUID], also: uuid.UUID | None = None
+) -> None:
+    """Lock everything a change to these shifts touches, in one fixed order, before any of
+    them is changed. `also` is a person the change adds (the new person of an assignment).
+
+    Why an order: the double-booking check reads a person's shifts with a locking read
+    (repository.has_overlap). If a request could change one of those shifts before it held
+    the person's lock, two requests could each hold what the other waits for (a deadlock),
+    and MySQL would end one of them with an error. So every change follows the same order:
+
+    1. the people: each shift's current person, plus `also`, sorted by ID, so two requests
+       needing the same two people never take them in opposite orders;
+    2. the shifts, sorted by ID, read fresh (repository.shift with lock=True);
+    3. only then any write: the shift itself, and the audit entry, which locks the audit
+       log's chain head last.
+
+    The people come from the shift as this request first read it, which may be out of date.
+    Step 2 reads the shift fresh, and if it now belongs to someone whose lock this request
+    does not hold, someone reassigned it meanwhile: the request is refused (409), so that
+    nothing is ever changed without its person's lock.
+
+    Locks already held are simply held again, so a batch can lock everything first and each
+    step can still call this for its own shift.
+    """
+    # 1. The people, sorted. The first read of a shift may be missing (404 later, in the
+    #    step that reads it) or open (no person).
+    people = {also} if also is not None else set()
+    for shift_id in shift_ids:
+        known = repository.shift(db, shift_id)
+        if known is not None and known.employee_id is not None:
+            people.add(known.employee_id)
+    for person_id in sorted(people):
+        repository.person(db, person_id, lock=True)
+
+    # 2. The shifts, sorted, read fresh. Their person must be one whose lock is now held.
+    for shift_id in sorted(shift_ids):
+        fresh = repository.shift(db, shift_id, lock=True)
+        if fresh is not None and fresh.employee_id is not None and fresh.employee_id not in people:
+            raise Conflict("This shift was just changed by someone else. Reload and try again.")
+
+
 def _check_assignable(db: Session, shift: Shift, employee_id: uuid.UUID) -> None:
     """Refuse anyone who cannot work this shift (see the rules at the top)."""
     person = repository.person(db, employee_id, lock=True)
     # Unknown (or of another company), deactivated, or not set up yet ("invited").
     if person is None or person.deactivated_at is not None or person.password_hash is None:
         raise Invalid(CANNOT_ASSIGN)
-    # Home department, or on a team in the shift's department.
+    # Home department, or on an active team in the shift's department. An archived team
+    # keeps its member list for history (organization.md), but being listed on it no
+    # longer makes anyone eligible.
     on_team = db.execute(
         select(TeamMember.user_id, Team.id)
         .join(Team, Team.id == TeamMember.team_id)
-        .where(TeamMember.user_id == person.id, Team.department_id == shift.department_id)
+        .where(
+            TeamMember.user_id == person.id,
+            Team.department_id == shift.department_id,
+            Team.archived_at.is_(None),
+        )
         .limit(1)
     ).first()
     if person.department_id != shift.department_id and on_team is None:
@@ -154,6 +207,10 @@ def _create(db: Session, user: User, body: ShiftCreate) -> Shift:
     )
     # May the user edit shifts here (this department, and this person if any)?
     authorize(db, user, "schedule.edit", item)
+    # Nothing new goes into an archived department (organization.md); its existing shifts
+    # stay as history.
+    if dept.archived_at is not None:
+        raise Conflict("This department is archived. Shifts cannot be added to it.")
     _check_times(item.starts_at, item.ends_at)
     if body.employee_id is not None:
         _check_assignable(db, item, body.employee_id)
@@ -183,6 +240,15 @@ def update_shift(db: Session, user: User, shift_id: uuid.UUID, body: ShiftUpdate
     if item is None:
         raise NotFound()
     authorize(db, user, "schedule.edit", item)
+    # Lock the person and the shift before changing anything (see _lock_for_change); this
+    # also reloads the shift, so the checks below see it as it is now.
+    _lock_for_change(db, [item.id])
+    # Check permission AGAIN, on the shift as it is now. The check above used the copy this
+    # request first read; while it waited for the locks, someone may have reassigned the
+    # shift or made it open, which can take it out of this user's scope (a team manager
+    # covers their members' shifts, not open ones). The first check stays, so a user who
+    # may not edit the shift never waits for, or holds, its locks.
+    authorize(db, user, "schedule.edit", item)
     _check_changeable(item)
 
     changed = sorted(body.model_fields_set)
@@ -194,11 +260,14 @@ def update_shift(db: Session, user: User, shift_id: uuid.UUID, body: ShiftUpdate
             value = _utc(value)
         setattr(item, field, value)
     _check_times(item.starts_at, item.ends_at)
-    if {"starts_at", "ends_at"} & set(changed) and item.employee_id is not None:
-        # New times: the person must still be free (and their row locked while checking).
-        repository.person(db, item.employee_id, lock=True)
-        if repository.has_overlap(db, item.employee_id, item.starts_at, item.ends_at, item.id):
-            raise Conflict("This person already has a shift at that time.")
+    # New times: the person must still be free. Their row is already locked above.
+    new_times = bool({"starts_at", "ends_at"} & set(changed))
+    if (
+        new_times
+        and item.employee_id is not None
+        and repository.has_overlap(db, item.employee_id, item.starts_at, item.ends_at, item.id)
+    ):
+        raise Conflict("This person already has a shift at that time.")
 
     if changed:
         record(
@@ -227,15 +296,27 @@ def _assign(db: Session, user: User, shift_id: uuid.UUID, employee_id: uuid.UUID
     item = repository.shift(db, shift_id)
     if item is None:
         raise NotFound()
-    authorize(db, user, "schedule.edit", item)  # the shift as it is now...
+    authorize(db, user, "schedule.edit", item)  # the shift as it was first read...
+    # Lock the previous person, the new one, and the shift before changing anything (see
+    # _lock_for_change); this also reloads the shift, so the checks see it as it is now.
+    _lock_for_change(db, [item.id], also=employee_id)
+    # Check permission AGAIN, on the shift as it is now. The check above used the copy this
+    # request first read; while it waited for the locks, someone may have reassigned the
+    # shift or made it open, which can take it out of this user's scope (a team manager
+    # covers their members' shifts, not open ones). The first check stays, so a user who
+    # may not edit the shift never waits for, or holds, its locks.
+    authorize(db, user, "schedule.edit", item)
     _check_changeable(item)
     previous = item.employee_id
 
+    # Check the new person BEFORE the shift is changed: the overlap check runs a query, and
+    # a changed shift would be written (flushed) to the database just before it.
+    if employee_id is not None:
+        _check_assignable(db, item, employee_id)
     if employee_id is None:
         item.employee_id, item.status = None, "open"
     else:
         item.employee_id, item.status = employee_id, "scheduled"
-        _check_assignable(db, item, employee_id)
     # ...and as it will be: a manager cannot move a shift out of their own scope either.
     authorize(db, user, "schedule.edit", item)
 
@@ -264,6 +345,14 @@ def _cancel(db: Session, user: User, shift_id: uuid.UUID) -> Shift:
     item = repository.shift(db, shift_id)
     if item is None:
         raise NotFound()
+    authorize(db, user, "schedule.edit", item)
+    # Lock the person and the shift before changing it (see _lock_for_change).
+    _lock_for_change(db, [item.id])
+    # Check permission AGAIN, on the shift as it is now. The check above used the copy this
+    # request first read; while it waited for the locks, someone may have reassigned the
+    # shift or made it open, which can take it out of this user's scope (a team manager
+    # covers their members' shifts, not open ones). The first check stays, so a user who
+    # may not edit the shift never waits for, or holds, its locks.
     authorize(db, user, "schedule.edit", item)
     _check_changeable(item)
     item.status = "cancelled"
@@ -310,7 +399,17 @@ def batch(db: Session, user: User, body: BatchCreate | BatchCancel | BatchAssign
     if body.confirm_count is not None and body.confirm_count != count:
         raise Conflict(f"This changes {count} shifts, not {body.confirm_count}. Nothing was saved.")
 
-    # 4. Each shift goes through exactly the same checks as a single change, and writes its
+    # 4. Lock everything the batch touches first, in the same order a single change uses
+    #    (_lock_for_change): all the people, then all the shifts. The steps below write audit
+    #    entries as they go, and an audit entry locks the audit log's chain head; a later
+    #    step must never wait for a person or a shift while holding that.
+    if isinstance(body, BatchCreate):
+        _lock_for_change(db, [], also=body.employee_id)
+    else:
+        new_person = body.employee_id if isinstance(body, BatchAssign) else None
+        _lock_for_change(db, list(body.shift_ids), also=new_person)
+
+    # 5. Each shift goes through exactly the same checks as a single change, and writes its
     #    own audit entry (shift.created, shift.cancelled, shift.assigned, or shift.opened).
     if isinstance(body, BatchCreate):
         common = body.model_dump(exclude={"action", "times", "confirm_count"})
@@ -323,7 +422,7 @@ def batch(db: Session, user: User, body: BatchCreate | BatchCancel | BatchAssign
     else:
         items = [_assign(db, user, shift_id, body.employee_id) for shift_id in body.shift_ids]
 
-    # 5. One entry for the batch as a whole, listing the shifts it touched, so the log shows
+    # 6. One entry for the batch as a whole, listing the shifts it touched, so the log shows
     #    they were changed together (and by whom) rather than as unrelated single changes.
     record(
         db,
