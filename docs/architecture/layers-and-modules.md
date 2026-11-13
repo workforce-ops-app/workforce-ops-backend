@@ -4,7 +4,7 @@
 
 Decisions: [0004 feature modules](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0004-backend-feature-modules.md) · [0012 extension points](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0012-extensibility-patterns.md)
 
-> **Status:** partly built. `app/main.py`, `app/core/` (settings, logging, errors), `app/db/` (database connection, base model, migrations), `app/tenancy/` (the company filter), `app/audit/` (writing the signed audit log), `app/auth/` (passwords, sign-in, and sessions), `app/authz/` (permissions, roles, and `authorize()`), the health, sessions, and schedules modules, and the org tables plus department-list endpoint exist; the other shared layers arrive in Phase 2.
+> **Status:** partly built. `app/main.py`, `app/core/` (settings, logging, errors), `app/db/` (database connection, base model, migrations), `app/tenancy/` (the company filter), `app/audit/` (writing the signed audit log), `app/auth/` (passwords, sign-in, and sessions), `app/authz/` (permissions, roles, and `authorize()`), `app/settings/` (company settings), the health, sessions, and schedules modules, and the org tables plus department-list endpoint exist; the other shared layers arrive in Phase 2.
 
 ## The package
 
@@ -17,13 +17,15 @@ app/
 ├── authz/           permissions, scopes, reporting chain, authorize() (Phase 2)
 ├── tenancy/         context.py (the session's company), filter.py (CompanyOwned and the automatic company filter)
 ├── audit/           the signed audit log (Phase 2)
+├── settings/        company settings: registry.py (declarations), models.py, service.py
 └── modules/<feature>/
     ├── router.py       HTTP only: paths, status codes, request and response models
     ├── schemas.py      request and response shapes
     ├── service.py      business rules; calls authorize()
     ├── repository.py   the only code that talks to the database
     ├── models.py       tables
-    └── permissions.py  the permissions this module declares
+    ├── permissions.py  the permissions this module declares
+    └── settings.py     the company settings this module declares (optional)
 ```
 
 ## How a request flows

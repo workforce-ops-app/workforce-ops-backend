@@ -15,6 +15,7 @@ from argon2 import PasswordHasher
 from sqlalchemy import Engine, create_engine, func, select
 from sqlalchemy.orm import Session
 
+from app.audit import Actor
 from app.audit.models import AuditChainHead, AuditEvent
 from app.auth import passwords
 from app.auth.passwords import PasswordRejected, verify_password
@@ -25,6 +26,8 @@ from app.db.base import Base
 from app.modules.org.models import Company, Department, Team, TeamMember, User
 from app.modules.schedules import service as shift_service
 from app.modules.schedules.models import Shift
+from app.settings.models import CompanySetting
+from app.settings.service import PASSWORD_MIN_LENGTH, change_setting
 from app.tenancy.context import set_company
 from scripts import seed_demo
 from tests.audit_data import TEST_KEY, use_key
@@ -47,6 +50,7 @@ ORG_TABLES = [
         AuditChainHead,
         AuditEvent,
         Shift,
+        CompanySetting,
     )
 ]
 
@@ -263,6 +267,24 @@ def test_a_weak_demo_password_changes_nothing(engine: Engine, weak: str) -> None
     with pytest.raises(PasswordRejected):
         seed_demo.seed(engine, weak)
     assert company_ids(engine) == {}
+
+
+def test_a_company_with_a_longer_minimum_refuses_a_shorter_demo_password(
+    engine: Engine,
+) -> None:
+    # Northwind Cafe is seeded without passwords, then raises its minimum past the length
+    # of the demo password (26 characters).
+    seed_demo.seed(engine, now=NOW)
+    northwind = company_ids(engine)["Northwind Cafe"]
+    with Session(engine) as session:
+        set_company(session, northwind)
+        change_setting(session, PASSWORD_MIN_LENGTH, 30, actor=Actor.system())
+        session.commit()
+
+    # Its own minimum applies, as for any password set there: refused, and none kept.
+    with pytest.raises(seed_demo.SeedRefused, match="Northwind Cafe.*at least 30"):
+        seed_demo.seed(engine, DEMO_PASSWORD, NOW)
+    assert not any(u.password_hash for u in all_users(engine))
 
 
 def test_the_people_cover_the_cases_later_slices_need() -> None:

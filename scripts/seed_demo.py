@@ -69,6 +69,7 @@ from app.modules.schedules import repository as shift_repository
 from app.modules.schedules.models import Shift
 from app.modules.schedules.schemas import ShiftCreate
 from app.modules.schedules.service import create_shift
+from app.settings.service import password_min_length
 from app.tenancy.context import set_company
 
 
@@ -581,6 +582,10 @@ def set_demo_passwords(engine: Engine, plan: CompanyPlan, password: str) -> int:
 
     Accounts that already have a password are left alone, so running the script again
     changes nothing. Returns how many accounts got the password.
+
+    The password is checked again here against the company's own minimum length (its
+    auth.password_min_length setting), as for any password a person sets: a company that
+    has raised its minimum refuses a shorter demo password, and nothing of it changes.
     """
     # Find the company, as platform code (no company on the session).
     with Session(engine) as platform:
@@ -590,6 +595,18 @@ def set_demo_passwords(engine: Engine, plan: CompanyPlan, password: str) -> int:
     with Session(engine) as session:
         set_company(session, company_id)
         users = session.scalars(select(User).where(User.password_hash.is_(None))).all()
+        minimum = password_min_length(session)
+        for user in users:
+            try:
+                check_password(
+                    password,
+                    company_name=plan.name,
+                    email=user.email,
+                    display_name=user.display_name,
+                    min_length=minimum,
+                )
+            except PasswordRejected as rejected:
+                raise SeedRefused(f"DEMO_PASSWORD for {plan.name}: {rejected}") from rejected
         for user in users:
             # A separate hash per account: each gets its own random salt.
             user.password_hash = hash_password(password)

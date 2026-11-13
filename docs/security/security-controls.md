@@ -32,12 +32,13 @@ Tests are in `tests/security/` unless another folder is named.
 | An unknown permission or a record without a scope resolver is an error, never a yes | E8 | `get_permission()`, `resolve()` | `test_an_unknown_permission_is_a_bug_not_a_yes`, `test_a_record_without_a_scope_resolver_is_a_bug_not_a_yes` |
 | A manager cannot move a shift out of their scope (checked before and after the change) | E8, I2 | `assign_shift()` in `app/modules/schedules/service.py` | `test_shifts.py::test_a_manager_cannot_see_or_change_another_departments_shifts` |
 | Request bodies accept only listed fields (no `company_id`, status, or anything else) | T2 | `extra="forbid"` in `app/modules/schedules/schemas.py` | `test_shifts.py::test_fields_outside_the_rules_cannot_be_set` |
+| Company settings can only be stricter than the platform, within its limits (AZ10); a weaker value written straight into the table is ignored; a company reads and changes only its own; every change is audited | E7, I2 | `app/settings/registry.py`, `app/settings/service.py` | `tests/security/test_company_settings.py`, `tests/unit/test_company_settings.py` |
 
 ### Sign-in and sessions
 
 | Protection | Threats | Where | Tests |
 |---|---|---|---|
-| Passwords: 15 to 128 characters, any characters, common-password blocklist, no names | S1 | `app/auth/passwords.py`, `app/auth/common-passwords.txt` | `test_password_rules.py` |
+| Passwords: 15 to 128 characters (or the company's longer minimum, up to 64), any characters, common-password blocklist, no names | S1 | `app/auth/passwords.py`, `app/auth/common-passwords.txt`, `password_min_length()` in `app/settings/service.py` | `test_password_rules.py`, `test_company_settings.py::test_the_company_minimum_applies_to_new_passwords` |
 | Argon2id password hashes (64 MiB, 3 passes), upgraded at sign-in when settings rise | S1, I5 | `app/auth/passwords.py` | `test_password_rules.py::test_the_stored_hash_never_contains_the_password`, `tests/unit/test_passwords.py` |
 | Every failed sign-in gets the same answer, does the same work, and takes at least 0.5 seconds | I3 | `sign_in()` in `app/auth/sessions.py` | `test_sign_in.py::test_every_failed_sign_in_gets_exactly_the_same_answer`, `..._does_the_same_work`, `..._takes_at_least_the_same_minimum_time` |
 | Random 256-bit session token; only its SHA-256 is stored | S2, I5 | `new_token()` in `app/auth/sessions.py` | `test_each_sign_in_gets_a_new_unguessable_token`, `test_no_answer_contains_a_password_hash_or_token_hash` |
