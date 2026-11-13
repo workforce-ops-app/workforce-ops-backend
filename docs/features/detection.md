@@ -232,17 +232,17 @@ How the detector is measured for the report. The scripts, datasets, and results 
 ---
 ## Slices
 
-Filed under tracker workforce-ops-app/.github#91 once this design merges. Each is one pull request.
+Filed under tracker workforce-ops-app/.github#91: the backend slices are sub-issues of #116, the security page is workforce-ops-app/workforce-ops-frontend#61, and the study's slices are in the research repository (under workforce-ops-app/.github#92). Each is one pull request.
 
-| ID | Repository | Slice | Depends on |
-|---|---|---|---|
-| DT1 | backend | this design page (#115) | |
-| DT2 | backend | `security_events` and `platform_security_events` tables, the insert-only writer with the rate cap (DE6), and the yearly clean-up job | DT1 |
-| DT3 | backend | the detector module: normalization, patterns, unit tests, and the worst-case timing test (DE4, DE5, DE10) | DT1 |
-| DT4 | backend | the detection layer: copy values by the collection rules (including `SecretStr` on credential fields), the bounded queue, inspect after the answer, record events (DE1 to DE3, DE7 to DE9, DE11) | DT2, DT3 |
-| DT5 | backend | `security.view` permission and the two endpoints | DT2 |
-| DT6 | backend | security events in the demo data | DT2 |
-| DT7 | frontend | the security page (#61) | DT5 |
-| DS1 | research | fetch the datasets at pinned commits, apply the selection rules, write the split with checksums | DT1 |
-| DS2 | research | the scoring script with tests: precision, recall, F1, intervals, confusion matrix, timing | DS1, DT3 |
-| DS3 | research | score the tagged detector on the test set and the field set; publish the results | DS2, DT4, backend #118, #119 |
+| ID | Repository | Slice | Depends on | Issue |
+|---|---|---|---|---|
+| DT1 | backend | this design page | | #115 (done) |
+| DT2 | backend | `security_events` and `platform_security_events` tables, the insert-only writer with the rate cap (DE6), and the yearly clean-up job | DT1 | #128 |
+| DT3 | backend | the detector module: normalization, patterns, unit tests, and the worst-case timing test (DE4, DE5, DE10) | DT1 | #129 |
+| DT4 | backend | the detection layer: copy values by the collection rules (including `SecretStr` on credential fields), the bounded queue, inspect after the answer, record events (DE1 to DE3, DE7 to DE9, DE11) | DT2, DT3 | #130 |
+| DT5 | backend | `security.view` permission and the two endpoints | DT2 | #131 |
+| DT6 | backend | security events in the demo data | DT2 | #132 |
+| DT7 | frontend | the security page | DT5 | workforce-ops-app/workforce-ops-frontend#61 |
+| DS1 | research | fetch the datasets at pinned commits, apply the selection rules, write the split with checksums | DT1 | workforce-ops-app/workforce-ops-research#6 |
+| DS2 | research | the scoring script with tests: precision, recall, F1, intervals, confusion matrix, timing | DS1, DT3 | workforce-ops-app/workforce-ops-research#7 |
+| DS3 | research | score the tagged detector on the test set and the field set; publish the results | DS2, DT4, backend #118, #119 | workforce-ops-app/workforce-ops-research#8 |
