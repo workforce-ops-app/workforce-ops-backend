@@ -10,7 +10,9 @@ It follows the flowchart on the authorization page, top to bottom:
    such rows; this is the last line).
 2. Deactivated people may do nothing.
 3. The user's active role assignments that grant the permission are loaded. Archived roles
-   grant nothing. None at all: 403. Everything is denied unless a rule below allows it.
+   grant nothing, and neither does an assignment for an archived department or team
+   (archived scopes cover nothing, organization.md). None at all: 403. Everything is
+   denied unless a rule below allows it.
 4. Then by the permission's kind:
    - self:    the target must be the user's own (themselves, or a record of theirs).
    - company: one of the assignments must be for the whole company.
@@ -37,7 +39,7 @@ from app.authz.chain import is_above_in_chain, people_below
 from app.authz.models import Role, RoleAssignment, RolePermission
 from app.authz.registry import Kind, all_permissions, get_permission
 from app.authz.scope import Grant, ScopeColumns, condition_for, covers, resolve
-from app.modules.org.models import User
+from app.modules.org.models import Department, Team, User
 
 
 class Forbidden(HTTPException):
@@ -55,11 +57,22 @@ class NotFound(HTTPException):
 
 
 def _active_assignments(user: User) -> list[ColumnElement[bool]]:
-    """The conditions for the user's assignments that can grant anything right now."""
+    """The conditions for the user's assignments that can grant anything right now.
+
+    Every query that uses these also LEFT OUTER JOINs the assignment's department and team
+    (always both, since the conditions name their columns). An assignment for a whole
+    company or one employee has neither, so the join finds no row, and the archived_at
+    conditions below are true for it. The company filter adds its condition to each join,
+    as for every other join (tenancy.md: joins).
+    """
     return [
         RoleAssignment.user_id == user.id,
         # Archived roles grant nothing.
         Role.archived_at.is_(None),
+        # Nor do assignments for an archived department or team: the scope still exists for
+        # history, but it covers nothing.
+        Department.archived_at.is_(None),
+        Team.archived_at.is_(None),
     ]
 
 
@@ -85,9 +98,14 @@ def grants(db: Session, user: User, code: str) -> list[Grant]:
             RoleAssignment.employee_id,
             Role.id,
             RolePermission.role_id,
+            Department.id,
+            Team.id,
         )
         .join(Role, Role.id == RoleAssignment.role_id)
         .join(RolePermission, RolePermission.role_id == Role.id)
+        # The assignment's department and team, if it has one (see _active_assignments).
+        .outerjoin(Department, Department.id == RoleAssignment.department_id)
+        .outerjoin(Team, Team.id == RoleAssignment.team_id)
         .where(*_active_assignments(user), RolePermission.permission_code == code)
     )
     return [Grant(*row[:4]) for row in rows]
@@ -100,9 +118,11 @@ def effective_permissions(db: Session, user: User) -> list[str]:
     if is_owner(db, user):
         return sorted(all_permissions())  # the Owner holds every permission
     rows = db.execute(
-        select(RolePermission.permission_code, Role.id, RoleAssignment.id)
+        select(RolePermission.permission_code, Role.id, RoleAssignment.id, Department.id, Team.id)
         .join(Role, Role.id == RolePermission.role_id)
         .join(RoleAssignment, RoleAssignment.role_id == Role.id)
+        .outerjoin(Department, Department.id == RoleAssignment.department_id)
+        .outerjoin(Team, Team.id == RoleAssignment.team_id)
         .where(*_active_assignments(user))
     )
     return sorted({row[0] for row in rows})
@@ -112,9 +132,13 @@ def is_owner(db: Session, user: User) -> bool:
     """Whether the user holds the (active) Owner role for the whole company."""
     if user.deactivated_at is not None:
         return False
+    # A company-wide assignment has no department or team, but the conditions in
+    # _active_assignments name their columns, so the joins are always there.
     found = db.scalar(
-        select(RoleAssignment.id, Role.id)
+        select(RoleAssignment.id, Role.id, Department.id, Team.id)
         .join(Role, Role.id == RoleAssignment.role_id)
+        .outerjoin(Department, Department.id == RoleAssignment.department_id)
+        .outerjoin(Team, Team.id == RoleAssignment.team_id)
         .where(
             *_active_assignments(user),
             Role.built_in == "owner",

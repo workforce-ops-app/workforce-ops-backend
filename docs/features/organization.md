@@ -1,6 +1,6 @@
 # Company structure, people, and access
 
-- **Status:** tables built (`app/modules/org/models.py`, migration `0002`); demo companies, structure, people, and their roles seeded by `scripts/seed_demo.py`; this module's permissions declared (`app/modules/org/permissions.py`); department listing built; remaining endpoints planned (core tier)
+- **Status:** tables built (`app/modules/org/models.py`, migration `0002`); demo companies, structure, people, and their roles seeded by `scripts/seed_demo.py`; this module's permissions declared (`app/modules/org/permissions.py`); departments, teams, and team members built (Z3 part 1, #54); people endpoints planned (Z3 part 2, #54); remaining endpoints planned (core tier)
 - **Related:** workforce-ops-app/workforce-ops-backend#8; frontend page: administration screens (workforce-ops-app/workforce-ops-frontend#3); design: [data model](../architecture/data-model.md), [authorization](../architecture/authorization.md), [authentication](../architecture/authentication.md)
 
 ## In short
@@ -47,8 +47,17 @@ flowchart LR
 ### States and rules
 
 **Departments and teams**
-- Names are unique within the company (departments) or within the department (teams).
-- Archiving instead of deleting ([0020](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md)). A department cannot be archived while it is someone's home department or has upcoming shifts (409); move the people and shifts first. Archiving a team ends its role assignments' effect (archived scopes cover nothing) and keeps its member list for history.
+- Names are unique within the company (departments) or within the department (teams), ignoring case, archived ones included, so an old name cannot be confused with a new one in history (409). Surrounding spaces are removed; a name is 1 to 120 characters.
+- A department's time zone is an IANA name such as `America/Chicago`, or none (the company's applies). Changing it does not move existing shifts: each keeps the zone it was created with ([schedules](schedules.md#states-and-rules)).
+- A team belongs to one department for good: renaming is the only change.
+- Archiving instead of deleting ([0020](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md)). An archived department or team cannot be changed, and nothing new goes into it: no teams, members, or shifts (409).
+- A department cannot be archived while it is the home department of anyone not deactivated, has upcoming shifts, or still has active teams (409); move the people and shifts, and archive the teams, first. Its row is locked while this is checked, and creating a team locks it too, so neither can slip in between. Each check is a locking read, so it sees a person, shift, or team that another request committed while this one waited for the lock (under MySQL's REPEATABLE READ an ordinary read would not).
+- Archiving a department or team ends its role assignments' effect (archived scopes cover nothing, `app/authz/check.py`): the assignments stay for history but grant nothing. A team keeps its member list for history.
+- A deactivated person cannot be added to a team (409); nobody is on a team twice (409).
+- Every change to a team (rename, archive, add or remove a member) locks the team's row first and reads it fresh, so a change that waited for an archive is refused (409) instead of changing an archived team.
+- Two requests saving the same name or the same membership at the same moment: the database's unique key refuses the second, and the answer is 409, never 500, wherever the database refuses it (when the row is sent, with the audit entry, or at the commit).
+- A person on an archived team is no longer eligible for that department's shifts through it ([schedules](schedules.md#states-and-rules)).
+- Known limitation: creating a shift does not lock the department, so a shift created at the very moment the department is archived can still be saved. Both are rare administrator actions; the shift can be cancelled afterwards.
 
 **People**
 
@@ -85,10 +94,10 @@ stateDiagram-v2
 | Method and path | Permission | Does |
 |---|---|---|
 | `GET /departments?cursor=&limit=` | signed in | page through active departments by name (built early in #88) |
-| `GET /teams` | signed in | list teams (planned in #54) |
+| `GET /teams?department_id=&cursor=&limit=` | signed in | page through active teams by name, optionally of one department |
 | `POST /departments`, `PATCH /departments/{id}`, `POST /departments/{id}/archive` | `org.manage` | create, rename or set the time zone, archive |
 | `POST /teams`, `PATCH /teams/{id}`, `POST /teams/{id}/archive` | `org.manage` | create, rename, archive |
-| `POST /teams/{id}/members`, `DELETE /teams/{id}/members/{user_id}` | `org.manage` | add or remove a team member |
+| `POST /teams/{id}/members` `{user_id}`, `DELETE /teams/{id}/members/{user_id}` | `org.manage` | add (201) or remove (204) a team member |
 | `GET /users`, `GET /users/{id}` | `user.view` (scope filter) | list and view people |
 | `POST /users` | `user.manage` | create an account (name, email, home department) |
 | `PATCH /users/{id}` | `user.manage`, above the person | change name, email, or home department |
@@ -130,7 +139,9 @@ The seed script (`python -m scripts.seed_demo`) creates the demo data for local 
 **Threats** ([threat model](../security/threat-model.md)): I1 and T3 (other companies' people), I2 (people outside scope), I3 (email already taken), E1 to E6 and E9 (access changes).
 
 **Security tests:**
-- Every endpoint above, requested as a user of the other demo company, answers 404.
+- Every endpoint above, requested as a user of the other demo company, answers 404; a body that names another company's record (a team's department, a new member) answers 422, like any unknown ID (built for departments, teams, and members: `tests/security/test_org_structure.py`).
+- Only `org.manage` changes departments, teams, and members: managers and employees get 403 on every one, and a request without the CSRF token changes nothing.
+- A role for an archived department or team grants nothing.
 - A manager cannot list or view people outside their scope (403).
 - Every escalation rule AZ1 to AZ15 has a test.
 - Deactivation ends the person's sessions and cancels their links.

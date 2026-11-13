@@ -16,6 +16,7 @@ Rules:
   the shift, then writes (_lock_for_change). A shift reassigned by someone else meanwhile
   is refused (409) rather than changed without its person's lock.
 - A shift that has ended, or was cancelled, can no longer be changed (409).
+- No new shift goes into an archived department (409).
 - Time off is checked here once time-off requests exist (time-off slices).
 - Several shifts at once (batch): every shift passes the same checks as one shift would,
   all in one transaction, so either every change is saved or none is. At 10 or more shifts
@@ -149,11 +150,17 @@ def _check_assignable(db: Session, shift: Shift, employee_id: uuid.UUID) -> None
     # Unknown (or of another company), deactivated, or not set up yet ("invited").
     if person is None or person.deactivated_at is not None or person.password_hash is None:
         raise Invalid(CANNOT_ASSIGN)
-    # Home department, or on a team in the shift's department.
+    # Home department, or on an active team in the shift's department. An archived team
+    # keeps its member list for history (organization.md), but being listed on it no
+    # longer makes anyone eligible.
     on_team = db.execute(
         select(TeamMember.user_id, Team.id)
         .join(Team, Team.id == TeamMember.team_id)
-        .where(TeamMember.user_id == person.id, Team.department_id == shift.department_id)
+        .where(
+            TeamMember.user_id == person.id,
+            Team.department_id == shift.department_id,
+            Team.archived_at.is_(None),
+        )
         .limit(1)
     ).first()
     if person.department_id != shift.department_id and on_team is None:
@@ -200,6 +207,10 @@ def _create(db: Session, user: User, body: ShiftCreate) -> Shift:
     )
     # May the user edit shifts here (this department, and this person if any)?
     authorize(db, user, "schedule.edit", item)
+    # Nothing new goes into an archived department (organization.md); its existing shifts
+    # stay as history.
+    if dept.archived_at is not None:
+        raise Conflict("This department is archived. Shifts cannot be added to it.")
     _check_times(item.starts_at, item.ends_at)
     if body.employee_id is not None:
         _check_assignable(db, item, body.employee_id)
