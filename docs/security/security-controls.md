@@ -31,7 +31,9 @@ Tests are in `tests/security/` unless another folder is named.
 | Permissions are read fresh on every request; deactivated people and archived roles get nothing | E1, E8 | `grants()` in `app/authz/check.py` | `test_a_role_change_takes_effect_at_once`, `test_a_deactivated_person_may_do_nothing_even_as_owner`, `test_an_archived_role_grants_nothing` |
 | An unknown permission or a record without a scope resolver is an error, never a yes | E8 | `get_permission()`, `resolve()` | `test_an_unknown_permission_is_a_bug_not_a_yes`, `test_a_record_without_a_scope_resolver_is_a_bug_not_a_yes` |
 | A manager cannot move a shift out of their scope (checked before and after the change) | E8, I2 | `assign_shift()` in `app/modules/schedules/service.py` | `test_shifts.py::test_a_manager_cannot_see_or_change_another_departments_shifts` |
-| Request bodies accept only listed fields (no `company_id`, status, or anything else) | T2 | `extra="forbid"` in `app/modules/schedules/schemas.py` | `test_shifts.py::test_fields_outside_the_rules_cannot_be_set` |
+| Account actions need `user.manage` and a place above the person; a new account reports to the creator or someone below them; nobody creates or moves a person where their own `user.manage` does not reach; owners cannot be deactivated | E3, E6, E8 | `app/modules/org/people.py`, `covers_department()` in `app/authz/check.py` | `test_people.py::test_user_manage_without_a_place_above_is_refused`, `test_a_new_account_cannot_be_hung_under_someone_out_of_reach`, `test_nobody_moves_a_person_out_of_their_own_reach`, `test_users_api.py::test_an_owner_cannot_be_deactivated` |
+| A taken email gets the same answer whichever company has it (no lookup across companies) | I3 | `create_person()`, `change_person()` in `app/modules/org/people.py` | `test_people.py::test_a_taken_email_never_says_which_company_has_it` |
+| Request bodies accept only listed fields (no `company_id`, status, or anything else) | T2 | `extra="forbid"` in `app/modules/schedules/schemas.py` and `app/modules/org/schemas.py` | `test_shifts.py::test_fields_outside_the_rules_cannot_be_set`, `test_users_api.py::test_account_input_is_checked` |
 
 ### Sign-in and sessions
 
@@ -43,7 +45,7 @@ Tests are in `tests/security/` unless another folder is named.
 | Random 256-bit session token; only its SHA-256 is stored | S2, I5 | `new_token()` in `app/auth/sessions.py` | `test_each_sign_in_gets_a_new_unguessable_token`, `test_no_answer_contains_a_password_hash_or_token_hash` |
 | A new token at every sign-in; the browser's previous session ends | S3 | `sign_in()`, `end_previous_session()` | `test_a_planted_token_never_becomes_a_signed_in_session`, `test_signing_in_again_ends_the_browsers_previous_session` |
 | `__Host-session` cookie: `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/` | S2, S4 | `_set_cookie()` in `app/modules/sessions/router.py` | `test_the_cookie_has_every_protective_attribute` |
-| Sessions end after 1 hour idle or 30 days; deactivation ends them; sign out deletes the row | S2 | `load_session()`, `sign_out()`, `sign_out_everywhere()` | `test_a_session_ends_after_an_hour_without_requests`, `test_activity_keeps_a_session_alive_but_never_past_30_days`, `test_deactivating_a_person_ends_their_session`, `test_signing_out_everywhere_cannot_reach_another_companys_sessions` |
+| Sessions end after 1 hour idle or 30 days; deactivation ends them; sign out deletes the row | S2 | `load_session()`, `sign_out()`, `sign_out_everywhere()` | `test_a_session_ends_after_an_hour_without_requests`, `test_activity_keeps_a_session_alive_but_never_past_30_days`, `test_deactivating_a_person_ends_their_session`, `test_signing_out_everywhere_cannot_reach_another_companys_sessions`, `test_users_api.py::test_deactivating_ends_every_session_and_lists_upcoming_shifts`, `test_signing_someone_out_everywhere` |
 | Lockouts and rate limits | S1, D1 | not built yet (#50) | |
 
 ### Forged requests (CSRF)
