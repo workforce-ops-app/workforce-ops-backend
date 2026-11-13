@@ -38,6 +38,7 @@ CORE = {
     "settings.manage": "company",
     "audit.view": "company",
     "audit.verify": "company",
+    "security.view": "company",
     "company.transfer_ownership": "company",
 }
 
