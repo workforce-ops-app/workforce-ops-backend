@@ -4,7 +4,7 @@
 
 Decisions behind this page: [0016 tenancy](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0016-tenant-isolation.md) · [0017 scoped roles](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0017-scoped-role-assignments.md) · [0018 audit](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0018-audit-log-chains.md) · [0019 IDs](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0019-uuidv7-ids.md) · [0020 deletion](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md) · [0021 time](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md) · [0022 SQLAlchemy](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0022-sqlalchemy-and-alembic.md)
 
-> **Status:** partly built. `companies`, `departments`, `teams`, `users`, and `team_members` exist (`app/modules/org/models.py`, migration `0002`), and so do the audit log (`0003`), sessions (`0004`), permissions, roles, and role assignments (`0005`), shifts (`0006`), and `reporting_lines` (`app/authz/models.py`, migration `0007`); the other tables are created when the features that need them are built. Feature tables (time off, coverage and swaps, tasks, announcements, notifications) are documented on their feature pages.
+> **Status:** partly built. `companies`, `departments`, `teams`, `users`, and `team_members` exist (`app/modules/org/models.py`, migration `0002`), and so do the audit log (`0003`), sessions (`0004`), permissions, roles, and role assignments (`0005`), shifts (`0006`), `reporting_lines` (`app/authz/models.py`, migration `0007`), and `one_time_tokens` (`app/auth/models.py`, migration `0009`); the other tables are created when the features that need them are built. Feature tables (time off, coverage and swaps, tasks, announcements, notifications) are documented on their feature pages.
 
 **How to read this page:** the [diagram](#overview-diagram) is a summary. The [entities](#entities) and [relationships](#relationships) sections are the detailed, authoritative version. A change to a table updates all three (see [adding a table](#adding-a-table)).
 
@@ -407,7 +407,7 @@ Sessions end after 1 hour without activity or 30 days after sign-in, whichever c
 | `expires_at` | `DATETIME(6)` | required; 48 hours after creation by default |
 | `used_at` | `DATETIME(6)` | null = not used yet; a token works once |
 
-Creating a new link cancels the person's earlier unused links. Used and expired rows are deleted.
+Creating a new link cancels the person's earlier unused links by deleting them, together with any used or expired ones, so a person has at most one row. A unique key on `token_hash` (redeeming finds the link by it) and a `CHECK` on `purpose`.
 
 ### shifts
 

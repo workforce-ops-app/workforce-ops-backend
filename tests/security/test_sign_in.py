@@ -5,7 +5,7 @@ AU4 (S2, S3): the cookie is locked down, and a token from before sign-in never b
 signed-in session.
 AU5 (S2): sessions end after 1 hour idle and 30 days at most.
 Plus: a session only ever works for its own company, and the one read across companies
-(cross_company_read) is used by sign-in alone.
+(cross_company_read) is used by sign-in and links alone.
 """
 
 import pathlib
@@ -278,7 +278,9 @@ def test_only_sign_in_uses_the_cross_company_read() -> None:
         if "cross_company_read(" in path.read_text(encoding="utf-8")
         or "tenancy_cross_company_read" in path.read_text(encoding="utf-8")
     )
-    assert users == ["auth/sessions.py", "tenancy/filter.py"]
+    # sessions.py: the account by email, and the session by its token's hash.
+    # links.py: a setup or reset link by its token's hash (nobody is signed in yet).
+    assert users == ["auth/links.py", "auth/sessions.py", "tenancy/filter.py"]
 
 
 def test_no_answer_contains_a_password_hash_or_token_hash(signin: SignInSetup) -> None:

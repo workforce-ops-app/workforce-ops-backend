@@ -15,8 +15,9 @@
    here on the real thing.
 5. Changes that must take turns do so in MySQL (_race_problems): two requests adding
    reporting lines at the same moment cannot add a duplicate or a loop, and two requests
-   booking one person at the same moment cannot double-book them. SQLite has no row
-   locks, so this too can only be tried on MySQL.
+   booking one person at the same moment cannot double-book them, and one setup link
+   used twice at the same moment sets a password only once. SQLite has no row locks,
+   so this too can only be tried on MySQL.
 
 The database is a throwaway Docker container (removed afterwards), unless
 MIGRATION_CHECK_DATABASE_URL points at an empty database to use instead.
@@ -281,6 +282,7 @@ def _race_problems(url: str) -> list[str]:
             _reporting_line_race_problems(engine)
             + _shift_race_problems(engine)
             + _org_race_problems(engine)
+            + _link_race_problems(engine)
         )
     finally:
         engine.dispose()
@@ -729,6 +731,139 @@ def _org_race_problems(engine: Engine) -> list[str]:
         if sorted(outcomes) != ["created", "refused"]:
             problems.append(f"two departments with one name, round {number + 1}: {outcomes}")
             break  # one failing round is enough to show the problem
+    return problems
+
+
+def _link_race_problems(engine: Engine) -> list[str]:
+    """Setup and reset links used and replaced at the same moment; return what failed.
+
+    1. One link redeemed by two requests at the same moment, several rounds: exactly one
+       sets the password, the other is refused as a link that does not work. Redeeming
+       locks the person and then the link and reads the link fresh, so the second request
+       sees that the first has used it (app/auth/links.py). Without the lock, both would
+       read "not used yet" and both would set a password.
+    2. A new link created while the old one is being redeemed: both lock the person first
+       and the link second, so they take turns: either the old link is refused, or it
+       sets the password first (and then a setup link no longer fits). Never an error.
+    """
+    import threading
+
+    from sqlalchemy.orm import Session
+
+    from app.audit import Actor
+    from app.auth import links
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.modules.org.models import Company, Department, User
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    with Session(engine) as platform:
+        company = Company(name="link race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # An owner (above everyone, with user.manage) and a new person without a password.
+    with session() as db:
+        home = Department(name="Office")
+        db.add(home)
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        owner = User(
+            email="owner@link-race.example.com", display_name="owner", department_id=home.id
+        )
+        db.add(owner)
+        db.flush()
+        assign_role(db, Actor.system(), user_id=owner.id, role=roles["owner"], scope_type="company")
+        db.commit()
+        owner_id, home_id = owner.id, home.id
+
+    def new_person(number: int) -> object:
+        with session() as db:
+            person = User(
+                email=f"new-{number}@link-race.example.com",
+                display_name=f"new {number}",
+                department_id=home_id,
+            )
+            db.add(person)
+            db.commit()
+            return person.id
+
+    def create(person_id: object) -> str:
+        """A setup link for the person, created by the owner; returns the token."""
+        with session() as db:
+            acting = db.get(User, owner_id)
+            if acting is None:  # made above, in this company
+                raise RuntimeError("the race probe's owner is missing")
+            return links.create_link(db, acting, person_id, "setup").token  # type: ignore[arg-type]
+
+    def redeem(token: str, password: str, start: threading.Barrier, outcomes: list[str]) -> None:
+        # Each redemption is its own request, in a session with no company yet.
+        with Session(engine) as db:
+            start.wait()
+            try:
+                links.redeem(db, token, password)
+                outcomes.append("set")
+            except links.LinkNotValid:
+                outcomes.append("refused")
+            except Exception as error:  # a 500 in the app: reported below
+                outcomes.append(f"error: {error!r}"[:300])
+
+    # 1. One link, two redemptions at once.
+    for number in range(3):
+        token = create(new_person(number))
+        start, outcomes = threading.Barrier(2), []
+        threads = [
+            threading.Thread(target=redeem, args=(token, phrase, start, outcomes))
+            for phrase in ("first chosen long passphrase", "second chosen long passphrase")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+        if sorted(outcomes) != ["refused", "set"]:
+            problems.append(f"one link used twice at once, round {number + 1}: {outcomes}")
+            break  # one failing round is enough to show the problem
+
+    # 2. A new link for the person while the old one is redeemed.
+    for number in range(3):
+        person_id = new_person(100 + number)
+        token = create(person_id)
+        start, outcomes = threading.Barrier(2), []
+
+        def replace(start: threading.Barrier, outcomes: list[str], person_id: object) -> None:
+            start.wait()
+            try:
+                create(person_id)
+                outcomes.append("replaced")
+            except links.Conflict:
+                # Redeemed first: the person has a password now, so no setup link.
+                outcomes.append("has a password")
+            except Exception as error:  # a 500 in the app: reported below
+                outcomes.append(f"error: {error!r}"[:300])
+
+        threads = [
+            threading.Thread(
+                target=redeem, args=(token, "a chosen long passphrase", start, outcomes)
+            ),
+            threading.Thread(target=replace, args=(start, outcomes, person_id)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+        # Either order is fine: replaced first, so the old link is refused; or redeemed
+        # first, so the person has a password and a setup link no longer fits. Anything
+        # else (an error, a deadlock, or a cancelled link that still set the password) is not.
+        if sorted(outcomes) not in (["refused", "replaced"], ["has a password", "set"]):
+            problems.append(f"a link replaced while it was used, round {number + 1}: {outcomes}")
+            break
     return problems
 
 

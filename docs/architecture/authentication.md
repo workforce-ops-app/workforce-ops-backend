@@ -4,7 +4,7 @@
 
 Decisions: [0027 authentication and sessions](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md) · [0025 sensitive actions and security settings](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md) · [0003 one address for pages and API](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0003-same-origin-deployment.md) · Threats: S1 to S5, I3, D1 in the [threat model](../security/threat-model.md)
 
-> **Status:** passwords (`app/auth/passwords.py`), sign-in with sessions (`app/auth/sessions.py`, the `sessions` endpoints, migration `0004`), and CSRF protection (`app/auth/csrf.py`) are built; lockouts, links, and re-entry follow in the next Phase 2 slices. Until lockouts (S4) exist, an account with `locked_until` in the future is refused, but failures are not counted yet.
+> **Status:** passwords (`app/auth/passwords.py`), sign-in with sessions (`app/auth/sessions.py`, the `sessions` endpoints, migration `0004`), CSRF protection (`app/auth/csrf.py`), and setup and reset links (`app/auth/links.py`, the `password_links` endpoints, migration `0009`, #57) are built; lockouts and re-entry follow in the next Phase 2 slices. Until lockouts (S4) exist, an account with `locked_until` in the future is refused, but failures are not counted yet.
 
 ## Passwords
 
@@ -53,7 +53,7 @@ sequenceDiagram
 - **One message for every failure.** An unknown email, a wrong password, a locked, deactivated, or not-yet-set-up account all get the same answer in the same time: "Email or password is incorrect. After several failed attempts, sign-in is paused for a while." Otherwise the sign-in form would tell an attacker which emails have accounts (threat I3). A locked account is refused even with the correct password until the lock ends.
 - Emails are unique across the platform, so an email and a password identify exactly one account and one company ([data model](data-model.md#users)).
 - The session's company is the user's company; it is never taken from the request ([tenancy](tenancy.md)).
-- **Finding the account before the company is known.** Every company table is filtered by the session's company, but at sign-in there is none yet. Two lookups, and only these, are allowed to look across companies with `cross_company_read()`: the account by email at sign-in, and the session by its token's hash on each request. Each reads only the ID and company; everything after that runs for the company found. A security test fails if any other file uses it ([tenancy](tenancy.md)).
+- **Finding the account before the company is known.** Every company table is filtered by the session's company, but at sign-in there is none yet. Three lookups, and only these, are allowed to look across companies with `cross_company_read()`: the account by email at sign-in, the session by its token's hash on each request, and a setup or reset link by its token's hash when it is redeemed. Each reads only the ID and company; everything after that runs for the company found. A security test fails if any other file uses it ([tenancy](tenancy.md)).
 - **No planted sessions (session fixation).** Sign-in always creates a new random token; a token the browser already carried is never turned into a signed-in session. If that earlier token still belonged to a working session, the session is ended, so a copy of the old token stops working.
 - **The same time for every failure.** Each failure does exactly one Argon2id check (against a dummy hash when there is no real one), and a failed sign-in also waits until at least 0.5 s have passed (`FAILED_SIGN_IN_SECONDS`, kept above the Argon2id time). That hides the few milliseconds a failure for an existing account spends writing its audit entry.
 - Failed sign-ins for unknown emails are logged without the email, which might be a password typed into the wrong field.
@@ -146,6 +146,12 @@ sequenceDiagram
 - Valid for 48 hours by default (companies may shorten it, not below 1 hour), and works once. A new link cancels the person's earlier unused links.
 - Only someone with `user.manage` who is above the person may create a link ([authorization](authorization.md)). Nobody creates a link for themselves.
 - A new account has no password until its setup link is used, so it cannot be signed into before then.
+- **Which link when:** a setup link only for an account without a password (new, or reactivated), a reset link only for one with a password; neither for a deactivated account (409). The administrator's answer (201) holds the link and when it expires; it is shown that once and never stored.
+- **Using it** (`POST /api/password-links/redeem {token, new_password}`, 204): the link must exist, be unused, be less than 48 hours old, and belong to an active account. Every link that does not work gets the same 400 answer ("This link does not work..."), whatever the reason: unknown, used, expired, or cancelled. A password that breaks the rules gets 422 and leaves the link working, so the person can try another.
+- Using a link sets the password, marks the link used, clears any lockout (the person proved who they are through the administrator), and ends every session of the person, so nobody stays signed in with an old password (AU8).
+- **Cancelling** is deleting: a new link deletes the person's earlier rows, used and expired ones included, so each person has at most one row. There is no cleanup job yet; old rows go when the next link is made.
+- **Taking turns:** creating and redeeming both lock the person's row first and the link's row second, and read the link fresh, so one link used twice at the same moment sets a password only once, and a new link made at the same moment never deadlocks with it. `scripts/check_migrations.py` tries both on MySQL.
+- The 48 hours are fixed until company settings exist (#59).
 
 ## Password re-entry for sensitive actions
 
@@ -211,5 +217,5 @@ Entries never contain passwords, tokens, or hashes. Failed sign-ins for emails t
 | The session endpoints | `app/modules/sessions/` (router and response shapes) |
 | CSRF and Origin checks | `app/auth/csrf.py` |
 | Lockouts and rate limits | `app/auth/limits.py` |
-| Setup and reset links | `app/auth/links.py` |
+| Setup and reset links | `app/auth/links.py` (rules), `OneTimeToken` in `app/auth/models.py` (the `one_time_tokens` table), `app/modules/password_links/` (endpoints); tests in `tests/security/test_password_links.py` (AU7, AU8) and `tests/unit/test_link_locking.py` |
 | Tests | `tests/unit/test_sessions_api.py`, `tests/security/test_sign_in.py` (AU3, AU4, AU5, and companies), `tests/security/test_csrf.py` (AU6), `tests/unit/test_passwords.py`, `tests/security/test_password_rules.py` (AU1) |
