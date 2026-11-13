@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.auth.sessions import COOKIE_NAME, Current, load_session
 from app.db.session import get_session
+from app.modules.security.layer import Identity, note_identity
 
 # The request's database session, as an endpoint parameter type.
 Database = Annotated[Session, Depends(get_session)]
@@ -24,6 +25,12 @@ def signed_in(request: Request, db: Database) -> Current:
     current = load_session(db, request.cookies.get(COOKIE_NAME))
     if current is None:
         raise HTTPException(status_code=401, detail="Sign in first.")
+    # Detection may place this request's events in the session's company, and only
+    # because this check passed (rule DE9, app/modules/security/layer.py).
+    note_identity(
+        request.scope.setdefault("state", {}),
+        Identity(current.session.id, current.company_id, current.user.id),
+    )
     return current
 
 

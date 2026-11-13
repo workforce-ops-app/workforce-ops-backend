@@ -1,6 +1,6 @@
 # Detection and the security page
 
-- **Status:** the detector (DT3, #129: `app/detection/`) and the security event tables and their writer (DT2, #128: `app/modules/security/`) are built; the detection layer, the endpoints, and the page follow in the other slices
+- **Status:** the detector (DT3, #129: `app/detection/`), the security event tables and their writer (DT2, #128: `app/modules/security/`), and the detection layer (DT4, #130: `app/modules/security/layer.py` and `worker.py`) are built; the endpoints and the page follow in the other slices
 - **Related:** design workforce-ops-app/workforce-ops-backend#115, detection workforce-ops-app/workforce-ops-backend#116, security page workforce-ops-app/workforce-ops-frontend#61, tracker workforce-ops-app/.github#91; refused requests workforce-ops-app/workforce-ops-backend#92; method [decision 0030](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0030-security-study-method.md); results go to the [research repository](https://github.com/workforce-ops-app/workforce-ops-research)
 
 ## In short
@@ -98,6 +98,17 @@ The copy is made in the request, before anything is queued, by these rules in or
 4. **Credential fields are typed as secrets.** Every password or token in a request model uses pydantic's `SecretStr`. A test walks every route's request model and fails if a `SecretStr` field sits on a route that is not skipped and has a name that rule 3 does not catch. So a new credential field cannot slip into detection unnoticed.
 
 Rules 2 and 3 overlap on purpose: either one alone keeps the known credential fields out, and together they also cover a field someone adds later.
+
+How the layer applies these rules (`app/modules/security/layer.py`):
+- **A route that takes a `SecretStr` is a credential route:** a second test, stricter than rule 4, fails if such a route is not marked `detection_skip`, even when rule 3 already catches the field by its name.
+- **The route is found before the request goes on,** the same way the router finds it, so a request the CSRF check refuses still counts as a sign-in when it is one. A request for no known route (404) has no path values; its query string and body are still read.
+- **Field names** are written `path.<name>`, `query.<name>`, and `body.<name>`, with `.` for nested objects and `[n]` for list items (for example `body.items[0].note`), cut to 100 characters. Only strings are collected, not numbers, booleans, or null, and nothing deeper than 32 levels.
+- **The body is never read ahead of the endpoint.** The layer keeps a copy of the bytes as the endpoint reads them, only when the request says it is JSON, and only up to 1 MiB (a larger body is not inspected: half a document cannot be read). A body the application never reads, for example one the CSRF check refuses first, is not inspected.
+- **The company comes from `signed_in()`** (`app/auth/dependencies.py`): it notes the checked session on the request, and only then can an event go to a company (DE9). A request carrying a valid cookie to a route that never checks the session, such as the health check, goes to `platform_security_events`, the cautious direction.
+- **The request ID** is made by the layer and kept in the request's state, so the log line for the same request (#92) can use the same one.
+- **A failure in the layer** is logged without any of the request's values and never reaches the request (DE1). The copy is made after the answer has been sent; only if the application failed unexpectedly is it made before the 500 goes out, which costs a few microseconds.
+
+The worker (`app/modules/security/worker.py`) runs in one thread started with the application. It takes one copy at a time, waking at least every 10 seconds. Events the writer could not save are written again with the next copy, at most 1,000 of them (the oldest beyond that are let go, and the loss is logged), so a long database outage cannot grow memory without bound. On a clean stop it handles what is still queued and writes every count it holds.
 
 ### Rate cap and queue
 

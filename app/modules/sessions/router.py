@@ -27,6 +27,7 @@ from app.auth.sessions import (
 )
 from app.authz.check import effective_permissions
 from app.modules.org.models import Company, User
+from app.modules.security.layer import detection_skip
 from app.modules.sessions.schemas import (
     SessionCompany,
     SessionInfo,
@@ -79,11 +80,12 @@ def _info(request: Request, db: Session, user: User, session: UserSession) -> Se
 
 
 @router.post("", status_code=201)
+@detection_skip  # a credential route: detection copies nothing of it (rule DE3)
 def create_session(
     body: SignInRequest, request: Request, response: Response, db: Database
 ) -> SessionInfo:
     """Sign in. Every failure gets the same 401 answer (threat I3)."""
-    result = sign_in(db, body.email, body.password)
+    result = sign_in(db, body.email, body.password.get_secret_value())
     if result is None:
         raise HTTPException(status_code=401, detail=SIGN_IN_FAILED)
     # The browser's previous session, if any, ends now: it gets only the new token.

@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 
 class SignInRequest(BaseModel):
@@ -11,7 +11,9 @@ class SignInRequest(BaseModel):
     password rules (when a password is set) and the sign-in itself."""
 
     email: str = Field(max_length=254)
-    password: str = Field(max_length=1024)
+    # SecretStr: never shown in a repr, an error, or a log line, and marks the field as a
+    # credential for the detection walk test (docs/features/detection.md, rule 4).
+    password: SecretStr = Field(max_length=1024)
 
 
 class SessionUser(BaseModel):
