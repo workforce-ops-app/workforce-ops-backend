@@ -4,6 +4,8 @@
     GET    /api/sessions/current  who is signed in, for which company
     DELETE /api/sessions/current  sign out
     DELETE /api/sessions          sign out everywhere (all of your own sessions)
+    POST   /api/sessions/current/reauth  enter the password again (sensitive actions)
+    PUT    /api/me/password       change your own password; this browser gets a new session
 
 The rules live in app/auth/sessions.py; this file only turns HTTP into calls and back.
 """
@@ -16,6 +18,8 @@ from sqlalchemy.orm import Session
 from app.auth.csrf import csrf_token
 from app.auth.dependencies import Database, SignedInPerson
 from app.auth.models import UserSession
+from app.auth.passwords import PasswordRejected
+from app.auth.reauth import change_password, reauthenticate
 from app.auth.sessions import (
     COOKIE_NAME,
     SIGN_IN_FAILED,
@@ -28,13 +32,16 @@ from app.auth.sessions import (
 from app.authz.check import effective_permissions
 from app.modules.org.models import Company, User
 from app.modules.sessions.schemas import (
+    PasswordChange,
+    ReauthRequest,
     SessionCompany,
     SessionInfo,
     SessionUser,
     SignInRequest,
 )
 
-router = APIRouter(prefix="/api/sessions", tags=["sessions"])
+sessions = APIRouter(prefix="/api/sessions", tags=["sessions"])
+me = APIRouter(prefix="/api/me", tags=["me"])
 
 
 def _set_cookie(response: Response, token: str, session: UserSession) -> None:
@@ -78,7 +85,7 @@ def _info(request: Request, db: Session, user: User, session: UserSession) -> Se
     )
 
 
-@router.post("", status_code=201)
+@sessions.post("", status_code=201)
 def create_session(
     body: SignInRequest, request: Request, response: Response, db: Database
 ) -> SessionInfo:
@@ -92,21 +99,54 @@ def create_session(
     return _info(request, db, result.user, result.session)
 
 
-@router.get("/current")
+@sessions.get("/current")
 def current_session(request: Request, current: SignedInPerson, db: Database) -> SessionInfo:
     """Who is signed in on this browser, and for which company."""
     return _info(request, db, current.user, current.session)
 
 
-@router.delete("/current", status_code=204)
+@sessions.delete("/current", status_code=204)
 def delete_current_session(response: Response, current: SignedInPerson, db: Database) -> None:
     """Sign out on this browser."""
     sign_out(db, current)
     _clear_cookie(response)
 
 
-@router.delete("", status_code=204)
+@sessions.delete("", status_code=204)
 def delete_all_sessions(response: Response, current: SignedInPerson, db: Database) -> None:
     """Sign out on every browser."""
     sign_out_everywhere(db, current)
     _clear_cookie(response)
+
+
+@sessions.post("/current/reauth", status_code=204)
+def reauth(body: ReauthRequest, current: SignedInPerson, db: Database) -> None:
+    """Enter the password again: sensitive actions are allowed for 5 minutes on this
+    browser. A wrong password is 403 (and recorded); the session itself stays."""
+    reauthenticate(db, current, body.password)
+
+
+@me.put("/password")
+def put_password(
+    body: PasswordChange,
+    request: Request,
+    response: Response,
+    current: SignedInPerson,
+    db: Database,
+) -> SessionInfo:
+    """Change your own password. Every other browser is signed out, and this one gets a new
+    session (a new cookie and a new CSRF token, both in this answer)."""
+    try:
+        changed = change_password(db, current, body.current_password, body.new_password)
+    except PasswordRejected as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    new = changed.signed_in
+    _set_cookie(response, new.token, new.session)
+    return _info(request, db, new.user, new.session)
+
+
+# The app includes the one `router` of each module (app/main.py), so both go into it. This
+# comes last: include_router copies the routes defined above at this moment.
+router = APIRouter()
+router.include_router(sessions)
+router.include_router(me)

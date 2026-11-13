@@ -44,6 +44,8 @@ Tests are in `tests/security/` unless another folder is named.
 | A new token at every sign-in; the browser's previous session ends | S3 | `sign_in()`, `end_previous_session()` | `test_a_planted_token_never_becomes_a_signed_in_session`, `test_signing_in_again_ends_the_browsers_previous_session` |
 | `__Host-session` cookie: `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/` | S2, S4 | `_set_cookie()` in `app/modules/sessions/router.py` | `test_the_cookie_has_every_protective_attribute` |
 | Sessions end after 1 hour idle or 30 days; deactivation ends them; sign out deletes the row | S2 | `load_session()`, `sign_out()`, `sign_out_everywhere()` | `test_a_session_ends_after_an_hour_without_requests`, `test_activity_keeps_a_session_alive_but_never_past_30_days`, `test_deactivating_a_person_ends_their_session`, `test_signing_out_everywhere_cannot_reach_another_companys_sessions` |
+| Sensitive actions need the password entered in this session within 5 minutes; a re-entry counts only in its own session | S2 | `require_reauth()` in `app/auth/reauth.py` | `test_reauth_api.py::test_sensitive_actions_need_a_reentry_in_the_last_five_minutes`, `test_reauth.py::test_a_reentry_counts_only_in_its_own_session` |
+| Changing your password needs the current one, ends every session, and rotates this browser's token without extending it | S2, S3 | `change_password()` in `app/auth/reauth.py` | `test_reauth.py::test_a_copied_cookie_stops_working_when_the_password_changes`, `test_a_session_alone_cannot_change_the_password`, `test_reauth_api.py::test_changing_the_password_signs_out_every_other_browser` |
 | Lockouts and rate limits | S1, D1 | not built yet (#50) | |
 
 ### Forged requests (CSRF)

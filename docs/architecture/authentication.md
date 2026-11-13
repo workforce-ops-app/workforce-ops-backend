@@ -4,7 +4,7 @@
 
 Decisions: [0027 authentication and sessions](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md) · [0025 sensitive actions and security settings](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md) · [0003 one address for pages and API](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0003-same-origin-deployment.md) · Threats: S1 to S5, I3, D1 in the [threat model](../security/threat-model.md)
 
-> **Status:** passwords (`app/auth/passwords.py`), sign-in with sessions (`app/auth/sessions.py`, the `sessions` endpoints, migration `0004`), and CSRF protection (`app/auth/csrf.py`) are built; lockouts, links, and re-entry follow in the next Phase 2 slices. Until lockouts (S4) exist, an account with `locked_until` in the future is refused, but failures are not counted yet.
+> **Status:** passwords (`app/auth/passwords.py`), sign-in with sessions (`app/auth/sessions.py`, the `sessions` endpoints, migration `0004`), and CSRF protection (`app/auth/csrf.py`) are built, and so are password re-entry and changing your own password (`app/auth/reauth.py`, #51); lockouts and links follow in the next Phase 2 slices. Until lockouts (S4) exist, an account with `locked_until` in the future is refused, but failures are not counted yet.
 
 ## Passwords
 
@@ -153,9 +153,18 @@ Sensitive actions ([list](authorization.md#sensitive-actions)) need the password
 
 1. The action's request fails with **403** and the problem type `reauth-required`.
 2. The interface asks for the password and sends `POST /api/sessions/current/reauth {password}`.
-3. On success the session's `reauth_at` is set, and the interface repeats the original request.
+3. On success (204) the session's `reauth_at` is set, and the interface repeats the original request. A wrong password answers 403 "That password is not right." and is recorded as `auth.reauth_failed`; the session stays signed in.
 
-This limits the damage from a session left open on a shared computer or stolen by an attacker who does not know the password (threat S2). Wrong passwords here count toward the lockout.
+This limits the damage from a session left open on a shared computer or stolen by an attacker who does not know the password (threat S2). Wrong passwords here count toward the lockout (once lockouts exist, #50).
+
+- **Per session:** a re-entry counts only in the session it was made in, so entering the password on one browser opens nothing on another.
+- **In code:** a sensitive action calls `require_reauth(current.session)` (`app/auth/reauth.py`) before it changes anything; it raises `ReauthRequired`, which the error handler turns into the `reauth-required` [problem type](../user/errors.md#problem-types).
+
+**Changing your own password** (`PUT /api/me/password {current_password, new_password}`):
+1. The current password is checked first (wrong: 403, `auth.reauth_failed`, nothing changes), so someone who only has the session learns nothing more, and cannot lock the real owner out.
+2. The new password must keep the [password rules](#passwords) (422 otherwise, nothing changes).
+3. Every session of the person ends, this one included. This browser gets a brand-new session in the same answer: a new token in the cookie and a new `csrf_token`, with the old session's end date (never longer), and the password counts as just entered. A copy of the old cookie stops working at once.
+4. Audited as `auth.password_changed` with how many other sessions ended.
 
 ## Endpoints
 
@@ -165,8 +174,8 @@ This limits the damage from a session left open on a shared computer or stolen b
 | `GET /api/sessions/current` | signed in | current user (with their home `department_id`), their company, their effective permissions (every permission they hold somewhere, read fresh on each request; for the menu only), CSRF token (`csrf_token`) |
 | `DELETE /api/sessions/current` | signed in | sign out |
 | `DELETE /api/sessions` | signed in | sign out everywhere (own sessions) |
-| `POST /api/sessions/current/reauth` | signed in | re-enter the password |
-| `PUT /api/me/password` | signed in | change your own password (current and new password) |
+| `POST /api/sessions/current/reauth` | signed in | re-enter the password (204; built, #51) |
+| `PUT /api/me/password` | signed in | change your own password (current and new password); answers like sign-in, with the new session (built, #51) |
 | `POST /api/users/{id}/setup-link`, `POST /api/users/{id}/reset-link` | `user.manage`, above the person | create a one-time link |
 | `POST /api/password-links/redeem` | anyone with a valid link | set a password with a link |
 | `POST /api/users/{id}/unlock` | `user.manage`, above the person | clear a lockout |
@@ -182,7 +191,7 @@ This limits the damage from a session left open on a shared computer or stolen b
 | `auth.password_changed` | a user changes their own password |
 | `auth.link_created`, `auth.link_used` | a setup or reset link is created or used |
 | `auth.sessions_ended` | an administrator signs someone out, or deactivation ends their sessions |
-| `auth.reauth_failed` | a wrong password at re-entry |
+| `auth.reauth_failed` | a wrong password at re-entry, or as the current password when changing it; `details.during` is `reauth` or `password_change`. The target is the session |
 
 Entries never contain passwords, tokens, or hashes. Failed sign-ins for emails that do not exist have no company, so they go to the application log and the security events, not an audit chain.
 
@@ -208,7 +217,8 @@ Entries never contain passwords, tokens, or hashes. Failed sign-ins for emails t
 | Password rules, hashing, blocklist | `app/auth/passwords.py` |
 | Sessions, cookie, idle and maximum limits, re-entry | `app/auth/sessions.py` (rules), `app/auth/models.py` (`UserSession`, the `sessions` table) |
 | Requiring a signed-in person in an endpoint | `app/auth/dependencies.py`: a parameter typed `SignedInPerson` loads the session (401 without one) and sets its company on the request's database session; `Database` is the request's database session |
-| The session endpoints | `app/modules/sessions/` (router and response shapes) |
+| The session endpoints | `app/modules/sessions/` (router and response shapes; also `PUT /api/me/password`) |
+| Re-entry, `require_reauth()`, and changing your own password | `app/auth/reauth.py`; tests in `tests/unit/test_reauth_api.py` and `tests/security/test_reauth.py` (AU8 password part, AU9, AU10) |
 | CSRF and Origin checks | `app/auth/csrf.py` |
 | Lockouts and rate limits | `app/auth/limits.py` |
 | Setup and reset links | `app/auth/links.py` |
