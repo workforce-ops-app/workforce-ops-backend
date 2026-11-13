@@ -1,6 +1,6 @@
 # Company structure, people, and access
 
-- **Status:** tables built (`app/modules/org/models.py`, migration `0002`); demo companies, structure, people, and their roles seeded by `scripts/seed_demo.py`; this module's permissions declared (`app/modules/org/permissions.py`); departments, teams, and team members built (Z3 part 1, #54); people endpoints planned (Z3 part 2, #54); remaining endpoints planned (core tier)
+- **Status:** tables built (`app/modules/org/models.py`, migration `0002`); demo companies, structure, people, and their roles seeded by `scripts/seed_demo.py`; this module's permissions declared (`app/modules/org/permissions.py`); departments, teams, and team members built (Z3 part 1, #54); people endpoints built (Z3 part 2, #54: `app/modules/org/people.py`); remaining endpoints planned (core tier)
 - **Related:** workforce-ops-app/workforce-ops-backend#8; frontend page: administration screens (workforce-ops-app/workforce-ops-frontend#3); design: [data model](../architecture/data-model.md), [authorization](../architecture/authorization.md), [authentication](../architecture/authentication.md)
 
 ## In short
@@ -74,8 +74,15 @@ stateDiagram-v2
 - **Deactivated:** cannot sign in; all sessions end and unused links are cancelled ([authentication](../architecture/authentication.md#sessions)). Upcoming shifts stay assigned and are listed for the administrator to reassign. Their records, roles, and reporting lines stay for history.
 - **Reactivating** puts the person back to *Invited*: they set a new password with a fresh setup link.
 - Every person has exactly one **home department** and may be on several **teams**. Changing the home department changes which department-scoped roles cover them.
-- **Email addresses** are unique across the platform and stored in lowercase. When an address is taken, the answer is "this email can't be used" without saying where ([0016](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0016-tenant-isolation.md)).
-- Nobody deactivates, unlocks, or signs out themselves through these actions, and the last owner cannot be deactivated.
+- **A new account names who the person reports to** (`manager_id`): the creator, or someone the creator is above. The reporting line is added in the same transaction as the account, so the creator is above the new person from the start and can go on to set up their account (AZ5). Only an Owner may leave it out, being above everyone anyway. This is the one reporting line someone may add while being part of it (an exception to AZ2): a brand-new account holds nothing, so it cannot be an escalation. Changing someone's managers afterwards is Z5 (#56).
+- A person is created in, or moved to, an **active** department (409) that the creator's own `user.manage` covers (403), so nobody places a person where they could not act on them afterwards.
+- **Email addresses** are unique across the platform and stored in lowercase. When an address is taken, the answer is 409 "This email can't be used." without saying where ([0016](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0016-tenant-isolation.md)): the same answer for an address in this company or another, because the database's unique key finds both alike, with no lookup across companies. Audit entries never contain an email, only the account's ID and which fields changed.
+- Nobody deactivates, unlocks, or signs out themselves through these actions.
+- **An owner cannot be deactivated** (409): owners leave through the owner change flow (#56), which needs the other owners' approval, and the last owner never leaves (AZ8, AZ15).
+- **Deactivating** ends every session of the person at once and answers with their upcoming shifts (`upcoming_shift_ids`), which stay assigned for the administrator to reassign. Their unused links are cancelled once links exist (#57). Deactivating someone who holds an admin-level role will need the password re-entered once re-entry exists (#51; [sensitive actions](../architecture/authorization.md#sensitive-actions)).
+- **Reactivating** clears the old password and any lockout; the person's home department must be active (409, move them first).
+- **Unlocking** clears a lockout and the count of wrong passwords. It is audited only when it changed something.
+- Changes to one account take turns: each locks the person's row (after the department they go into, when there is one) and then checks permission again on the fresh row, so a person moved out of the user's scope meanwhile is refused (403). Putting someone on a team locks them too, so nobody joins a team after being deactivated, and a person cannot be placed in a department at the moment it is archived. `scripts/check_migrations.py` tries these races on MySQL.
 
 **Changing your own name or email** ([0032](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md))
 - A person asks for the change; nothing changes until it is approved.
@@ -98,10 +105,11 @@ stateDiagram-v2
 | `POST /departments`, `PATCH /departments/{id}`, `POST /departments/{id}/archive` | `org.manage` | create, rename or set the time zone, archive |
 | `POST /teams`, `PATCH /teams/{id}`, `POST /teams/{id}/archive` | `org.manage` | create, rename, archive |
 | `POST /teams/{id}/members` `{user_id}`, `DELETE /teams/{id}/members/{user_id}` | `org.manage` | add (201) or remove (204) a team member |
-| `GET /users`, `GET /users/{id}` | `user.view` (scope filter) | list and view people |
-| `POST /users` | `user.manage` | create an account (name, email, home department) |
-| `PATCH /users/{id}` | `user.manage`, above the person | change name, email, or home department |
-| `POST /users/{id}/deactivate`, `POST /users/{id}/reactivate` | `user.manage`, above the person | change account state |
+| `GET /users?cursor=&limit=`, `GET /users/{id}` | `user.view` (scope filter); everyone may view their own account | page through people by name (deactivated and invited ones included), view one (built, Z3) |
+| `POST /users` `{display_name, email, department_id, manager_id}` | `user.manage` | create an account with no password yet; `manager_id` is who they report to, required unless Owner (built, Z3) |
+| `PATCH /users/{id}` | `user.manage`, above the person | change name, email, or home department (built, Z3) |
+| `POST /users/{id}/deactivate`, `POST /users/{id}/reactivate` | `user.manage`, above the person | change account state; deactivation answers with `upcoming_shift_ids` (built, Z3) |
+| `POST /users/{id}/unlock`, `DELETE /users/{id}/sessions` | `user.manage`, above the person | clear a lockout; sign the person out everywhere (204) (built, Z3; also on the authentication page) |
 | `GET /roles` | `role.view` (company) | list roles and everything each grants |
 | `POST /roles`, `PATCH /roles/{id}`, `POST /roles/{id}/archive` | `role.manage` (delegation limits) | create, change, archive |
 | `GET /role-assignments?user_id=` | `user.view`, the person in scope | a person's roles and scopes |
@@ -114,7 +122,9 @@ stateDiagram-v2
 | `GET /approval-requests` | signed in | requests you made and requests waiting for you |
 | `POST /approval-requests/{id}/approve`, `.../deny`, `.../cancel` | the eligible approver, or the requester for cancel | decide or withdraw |
 
-Setup links, reset links, unlocking, and signing someone out are on the [authentication](../architecture/authentication.md#endpoints) page.
+A person in an answer: `id`, `display_name`, `email`, `department_id`, `team_ids` (archived teams included), `status` (`invited`, `active`, or `deactivated`), and `locked`. Never the password hash or the count of wrong passwords.
+
+Setup and reset links are on the [authentication](../architecture/authentication.md#endpoints) page.
 
 **Tables:** `companies`, `departments`, `teams`, `users`, `team_members`, `roles`, `role_permissions`, `role_assignments`, `reporting_lines`, `approval_requests`, `approval_decisions` ([data model](../architecture/data-model.md)).
 
@@ -139,18 +149,22 @@ The seed script (`python -m scripts.seed_demo`) creates the demo data for local 
 **Threats** ([threat model](../security/threat-model.md)): I1 and T3 (other companies' people), I2 (people outside scope), I3 (email already taken), E1 to E6 and E9 (access changes).
 
 **Security tests:**
-- Every endpoint above, requested as a user of the other demo company, answers 404; a body that names another company's record (a team's department, a new member) answers 422, like any unknown ID (built for departments, teams, and members: `tests/security/test_org_structure.py`).
+- Every endpoint above, requested as a user of the other demo company, answers 404; a body that names another company's record (a team's department, a new member, a new account's department or manager) answers 422, like any unknown ID (built for departments, teams, and members: `tests/security/test_org_structure.py`; for people: `tests/security/test_people.py`).
 - Only `org.manage` changes departments, teams, and members: managers and employees get 403 on every one, and a request without the CSRF token changes nothing.
 - A role for an archived department or team grants nothing.
-- A manager cannot list or view people outside their scope (403).
+- A manager cannot list or view people outside their scope (403), nor page past them with a bookmark (built).
+- `user.manage` without a place above the person is refused (403) on every account action, and a new account cannot be put under someone the creator is not above (built).
+- Nobody moves a person, or creates one, in a department their own `user.manage` does not cover (built).
 - Every escalation rule AZ1 to AZ15 has a test.
-- Deactivation ends the person's sessions and cancels their links.
-- Creating an account with an email used by the other company gives the generic answer.
+- Deactivation ends the person's sessions (built) and cancels their links (#57).
+- Creating an account with an email used by the other company gives the generic answer, byte for byte the answer for an email used in this company (built).
 - A person's own name change does not take effect before approval; the approver must hold `user.manage` and be above them; nobody approves their own change.
 - (Next tier) An email change without a recent password re-entry is refused; an address taken between request and approval is refused at approval.
 
 ### Known limitations
 - No screen for creating companies or platform staff accounts yet; the seed script does it.
 - No bulk import of people.
+- Until reporting-line endpoints exist (Z5, #56), a person's managers are set only when their account is created (and by the seed script).
+- New and reactivated accounts can sign in only once setup links exist (#57): until then they stay invited.
 - Changing your own email arrives with the next tier; until then an administrator changes it.
 - A sole owner's name change waits for the platform operators' command-line tool until platform staff screens exist.

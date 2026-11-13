@@ -14,9 +14,20 @@ method says what to do with it, and the status code says how it went:
     POST   /api/teams/{id}/archive                            200  archive
     POST   /api/teams/{id}/members  {user_id}                 201  add someone
     DELETE /api/teams/{id}/members/{user_id}                  204  take someone off
+    GET    /api/users[?cursor=]                               200  list (paged)
+    GET    /api/users/{id}                                    200  one person
+    POST   /api/users  {display_name, email, department_id,  201  create an account
+                        manager_id?}
+    PATCH  /api/users/{id}  {display_name?, email?,           200  change details
+                             department_id?}
+    POST   /api/users/{id}/deactivate                         200  deactivate
+    POST   /api/users/{id}/reactivate                         200  back to invited
+    POST   /api/users/{id}/unlock                             200  clear a lockout
+    DELETE /api/users/{id}/sessions                           204  sign them out everywhere
 
-Archiving is a POST to an "archive" action rather than DELETE, because nothing is deleted:
-the record stays for history (decision 0020).
+Archiving and deactivating are POSTs to an action rather than DELETE, because nothing is
+deleted: the record stays for history (decision 0020). Signing someone out is a DELETE: it
+does delete their sessions.
 
 Errors: 401 not signed in, 403 not allowed, 404 not found (or another company's), 409 not
 allowed in the current state, 422 invalid input. Every change also needs the CSRF token.
@@ -28,9 +39,10 @@ from typing import Annotated
 from fastapi import APIRouter, Query, Response
 
 from app.auth.dependencies import Database, SignedInPerson
-from app.modules.org import service
-from app.modules.org.models import Department, Team
+from app.modules.org import people, service
+from app.modules.org.models import Department, Team, User
 from app.modules.org.schemas import (
+    DeactivatedOut,
     DepartmentCreate,
     DepartmentDetail,
     DepartmentOut,
@@ -42,10 +54,15 @@ from app.modules.org.schemas import (
     TeamOut,
     TeamPage,
     TeamUpdate,
+    UserCreate,
+    UserOut,
+    UserPage,
+    UserUpdate,
 )
 
 departments = APIRouter(prefix="/api/departments", tags=["departments"])
 teams = APIRouter(prefix="/api/teams", tags=["teams"])
+users = APIRouter(prefix="/api/users", tags=["users"])
 
 
 def _department(item: Department) -> DepartmentDetail:
@@ -154,8 +171,85 @@ def remove_member(
     return Response(status_code=204)
 
 
-# The app includes the one `router` of each module (app/main.py), so both collections go
-# into it. This comes last: include_router copies the routes defined above at this moment.
+# --- People ----------------------------------------------------------------------------
+
+
+def _person(item: User, team_ids: list[uuid.UUID]) -> UserOut:
+    """A person in the agreed answer shape (never the password hash or lockout counter)."""
+    return UserOut(
+        id=item.id,
+        display_name=item.display_name,
+        email=item.email,
+        department_id=item.department_id,
+        team_ids=team_ids,
+        status=people.status(item),
+        locked=people.is_locked(item),
+    )
+
+
+def _one_person(db: Database, item: User) -> UserOut:
+    """A single person in the answer shape, with their teams."""
+    return _person(item, people.teams_of(db, [item])[item.id])
+
+
+@users.get("")
+def list_people(
+    current: SignedInPerson,
+    db: Database,
+    cursor: Annotated[str | None, Query(max_length=200)] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> UserPage:
+    """The people the signed-in person may see (user.view, limited to its scope)."""
+    rows, next_cursor = people.list_people(db, current.user, cursor=cursor, limit=limit)
+    teams_by_person = people.teams_of(db, rows)
+    return UserPage(
+        items=[_person(row, teams_by_person[row.id]) for row in rows], next_cursor=next_cursor
+    )
+
+
+@users.get("/{user_id}")
+def view_person(user_id: uuid.UUID, current: SignedInPerson, db: Database) -> UserOut:
+    return _one_person(db, people.view_person(db, current.user, user_id))
+
+
+@users.post("", status_code=201)
+def create_person(body: UserCreate, current: SignedInPerson, db: Database) -> UserOut:
+    return _one_person(db, people.create_person(db, current.user, body))
+
+
+@users.patch("/{user_id}")
+def change_person(
+    user_id: uuid.UUID, body: UserUpdate, current: SignedInPerson, db: Database
+) -> UserOut:
+    return _one_person(db, people.change_person(db, current.user, user_id, body))
+
+
+@users.post("/{user_id}/deactivate")
+def deactivate(user_id: uuid.UUID, current: SignedInPerson, db: Database) -> DeactivatedOut:
+    done = people.deactivate(db, current.user, user_id)
+    shown = _one_person(db, done.person)
+    return DeactivatedOut(**shown.model_dump(), upcoming_shift_ids=done.upcoming_shift_ids)
+
+
+@users.post("/{user_id}/reactivate")
+def reactivate(user_id: uuid.UUID, current: SignedInPerson, db: Database) -> UserOut:
+    return _one_person(db, people.reactivate(db, current.user, user_id))
+
+
+@users.post("/{user_id}/unlock")
+def unlock(user_id: uuid.UUID, current: SignedInPerson, db: Database) -> UserOut:
+    return _one_person(db, people.unlock(db, current.user, user_id))
+
+
+@users.delete("/{user_id}/sessions", status_code=204)
+def sign_out_everywhere(user_id: uuid.UUID, current: SignedInPerson, db: Database) -> Response:
+    people.sign_out_everywhere(db, current.user, user_id)
+    return Response(status_code=204)
+
+
+# The app includes the one `router` of each module (app/main.py), so all three collections
+# go into it. This comes last: include_router copies the routes defined above at this moment.
 router = APIRouter()
 router.include_router(departments)
 router.include_router(teams)
+router.include_router(users)
