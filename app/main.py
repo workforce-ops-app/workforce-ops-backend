@@ -83,6 +83,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # (app/modules/sessions/router.py) always use the same one.
     app.state.csrf_key = settings.csrf_key.get_secret_value().encode("utf-8")
     app.add_middleware(CsrfMiddleware, key=app.state.csrf_key, origin=settings.app_origin)
+    # The application's own address, for the setup and reset links it hands out
+    # (app/modules/password_links/router.py). None: the address of each request.
+    app.state.app_origin = settings.app_origin
     register_error_handlers(app, log_full_errors=log_full_errors)
     # Added last, so it is the outermost layer: every answer, including the CSRF check's
     # 403 and the catch-all 500, is marked never to be stored (app/core/caching.py).

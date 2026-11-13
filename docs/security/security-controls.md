@@ -16,7 +16,7 @@ Tests are in `tests/security/` unless another folder is named.
 | Automatic company filter on every query and save; refuses bulk statements and raw table access it cannot make safe | I1, T3 | `app/tenancy/filter.py` | `test_cross_company.py` |
 | Last guard at the database connection: company data that skipped the filter is refused | I1, T3 | `app/tenancy/filter.py` (`_guard_connection`) | `test_cross_company.py::test_the_raw_connection_cannot_reach_company_data`, `test_legacy_bulk_methods_cannot_reach_another_company` |
 | The company comes from the session, never from the request | I1 | `app/tenancy/context.py`, `app/auth/sessions.py` | `test_cross_company.py::test_a_session_cannot_switch_companies`, `test_sign_in.py::test_a_session_works_only_for_its_own_company` |
-| Only sign-in may read across companies (finding a person by email, a session by token) | I1 | `cross_company_read` in `app/tenancy/filter.py` | `test_sign_in.py::test_only_sign_in_uses_the_cross_company_read`, `test_the_cross_company_read_is_only_a_select_before_a_company_is_set` |
+| Only sign-in and links may read across companies (finding a person by email, a session by token, a setup or reset link by token) | I1 | `cross_company_read` in `app/tenancy/filter.py` | `test_sign_in.py::test_only_sign_in_uses_the_cross_company_read`, `test_the_cross_company_read_is_only_a_select_before_a_company_is_set` |
 | Company-aware foreign keys: a row cannot point at another company's row | I1, T3 | the models and migrations (`company_id` in composite keys) | `test_org_company_links.py` |
 | Another company's record answers 404, exactly like a missing one | I1, I3 | `authorize()` step 1; the filter hides the row first | `test_shifts.py::test_another_companys_shift_does_not_exist_on_any_endpoint`, `test_departments.py` |
 
@@ -45,6 +45,8 @@ Tests are in `tests/security/` unless another folder is named.
 | `__Host-session` cookie: `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/` | S2, S4 | `_set_cookie()` in `app/modules/sessions/router.py` | `test_the_cookie_has_every_protective_attribute` |
 | Sessions end after 1 hour idle or 30 days; deactivation ends them; sign out deletes the row | S2 | `load_session()`, `sign_out()`, `sign_out_everywhere()` | `test_a_session_ends_after_an_hour_without_requests`, `test_activity_keeps_a_session_alive_but_never_past_30_days`, `test_deactivating_a_person_ends_their_session`, `test_signing_out_everywhere_cannot_reach_another_companys_sessions` |
 | Lockouts and rate limits | S1, D1 | not built yet (#50) | |
+| Setup and reset links: random 256-bit token after the `#`, only its SHA-256 stored, 48 hours, works once, a newer link cancels the older; one answer for every link that does not work; using one ends every session of the person | S5, I5 | `app/auth/links.py`, `app/modules/password_links/router.py` | `test_password_links.py` (AU7, AU8), `check_migrations.py` (`_link_race_problems`) |
+| Links only from someone with `user.manage` who is above the person, never for oneself | E3 | `create_link()` calls `authorize()` | `test_password_links.py::test_nobody_creates_a_link_for_themselves`, `test_an_administrator_creates_links_only_for_people_below_them` |
 
 ### Forged requests (CSRF)
 
