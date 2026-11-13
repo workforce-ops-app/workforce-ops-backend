@@ -50,7 +50,7 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 | `settings.manage` | company | change company settings, including security settings |
 | `audit.view` | company | read the company's audit log |
 | `audit.verify` | company | run verification of the company's audit chain |
-| `security.view` | company | see the company's security events on the security page (next tier, [detection](../features/detection.md)) |
+| `security.view` | company | see the company's security events on the security page (built, DT5: [detection](../features/detection.md#backend)) |
 | `company.transfer_ownership` | company | propose adding or removing an owner (Owner role only; other owners must agree) |
 
 Changing your own password and signing yourself out need no permission; every signed-in user can do both.
