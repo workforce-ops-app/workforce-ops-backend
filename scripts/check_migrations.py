@@ -277,7 +277,11 @@ def _race_problems(url: str) -> list[str]:
 
     engine = create_engine(url)
     try:
-        return _reporting_line_race_problems(engine) + _shift_race_problems(engine)
+        return (
+            _reporting_line_race_problems(engine)
+            + _shift_race_problems(engine)
+            + _org_race_problems(engine)
+        )
     finally:
         engine.dispose()
 
@@ -566,6 +570,164 @@ def _concurrent_assignment_problems(
             thread.join(timeout=60)
         if sorted(outcomes) != ["assigned", "refused"]:
             problems.append(f"concurrent assignments, round {number + 1}: {outcomes}")
+            break  # one failing round is enough to show the problem
+    return problems
+
+
+def _org_race_problems(engine: Engine) -> list[str]:
+    """Departments and teams changed by two requests at the same moment; return what failed.
+
+    1. Archiving a department checks, after locking it, that nobody still depends on it:
+       people, upcoming shifts, active teams. Each check is a locking read, so it sees a
+       row another request committed while this one waited (app/modules/org/repository.py).
+    2. A team change locks the team and reads it fresh, so a change that waited for an
+       archive is refused (app/modules/org/service.py, _changeable_team).
+    3. Two requests creating the same department name at the same moment: one is saved,
+       the other is refused with 409. The database refuses the second when its row is
+       sent, before the commit; that must still be a 409, never an error.
+    """
+    import threading
+    from datetime import timedelta
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    from app.audit import Actor
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.db.base import utcnow
+    from app.modules.org import repository, service
+    from app.modules.org.models import Company, Department, Team, User
+    from app.modules.org.schemas import DepartmentCreate
+    from app.modules.schedules.models import Shift
+    from app.tenancy.context import set_company
+
+    problems = []
+    # A company of its own, made by platform code (a session with no company).
+    with Session(engine) as platform:
+        company = Company(name="org race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # An owner, for the requests that go through the service's permission check.
+    with session() as db:
+        home = Department(name="Office")
+        db.add(home)
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        owner = User(
+            email="owner@org-race.example.com", display_name="owner", department_id=home.id
+        )
+        db.add(owner)
+        db.flush()
+        assign_role(db, Actor.system(), user_id=owner.id, role=roles["owner"], scope_type="company")
+        db.commit()
+        owner_id, home_id = owner.id, home.id
+
+    # 1. Each archive check, against a row committed by another request meanwhile.
+    tomorrow = utcnow() + timedelta(days=1)
+    late_rows = {
+        "team": lambda department_id: Team(department_id=department_id, name="Late"),
+        "person": lambda department_id: User(
+            email=f"late-{department_id}@org-race.example.com",
+            display_name="late",
+            department_id=department_id,
+        ),
+        "upcoming shift": lambda department_id: Shift(
+            department_id=department_id,
+            starts_at=tomorrow,
+            ends_at=tomorrow + timedelta(hours=6),
+            timezone="UTC",
+            status="open",
+        ),
+    }
+    checks = {
+        "team": lambda db, department_id: repository.has_active_teams(db, department_id),
+        "person": lambda db, department_id: repository.is_anyones_home(db, department_id),
+        "upcoming shift": lambda db, department_id: repository.has_upcoming_shifts(
+            db, department_id, utcnow()
+        ),
+    }
+    for kind, make_row in late_rows.items():
+        # A department of its own for each kind, empty to begin with.
+        with session() as db:
+            department = Department(name=f"Archive probe ({kind})")
+            db.add(department)
+            db.commit()
+            department_id = department.id
+        with session() as request_2:
+            # Request 2 has read something (as its session and permission checks do),
+            # which fixes what its ordinary SELECTs see under REPEATABLE READ.
+            request_2.scalars(select(Department)).all()
+            # Request 1 adds the row and commits.
+            with session() as request_1:
+                request_1.add(make_row(department_id))
+                request_1.commit()
+            # Request 2 locks the department, as archive_department() does, and checks.
+            repository.department(request_2, department_id, lock=True)
+            if not checks[kind](request_2, department_id):
+                problems.append(f"archiving a department missed this, committed meanwhile: {kind}")
+
+    # 2. A team archived while another request held an old copy of it.
+    with session() as db:
+        team = Team(department_id=home_id, name="Archive probe")
+        db.add(team)
+        db.commit()
+        team_id = team.id
+    with session() as request_2:
+        stale = repository.team(request_2, team_id)  # read while the team is active
+        with session() as request_1:
+            archived = request_1.get(Team, team_id)
+            if archived is None:  # made above, in this company
+                raise RuntimeError("the race probe's team is missing")
+            archived.archived_at = utcnow()
+            request_1.commit()
+        try:
+            service._changeable_team(request_2, team_id)
+        except service.Conflict:
+            pass  # refused: the archive committed meanwhile was seen
+        else:
+            problems.append("a team archived meanwhile could still be changed")
+        del stale
+
+    # 3. Two requests creating the same department name at the same moment, several
+    #    rounds (the timing differs each time). Exactly one is saved, the other refused.
+    for number in range(5):
+        start_together = threading.Barrier(2)
+        outcomes: list[str] = []
+
+        def request(name: str, start_together: threading.Barrier, outcomes: list[str]) -> None:
+            with session() as db:
+                acting = db.get(User, owner_id)
+                if acting is None:  # made above, in this company
+                    outcomes.append("error: the owner is missing")
+                    return
+                start_together.wait()
+                try:
+                    service.create_department(db, acting, DepartmentCreate(name=name))
+                    outcomes.append("created")
+                except service.Conflict:
+                    outcomes.append("refused")
+                except Exception as error:  # a 500 in the app: reported below
+                    outcomes.append(f"error: {error!r}"[:300])
+
+        name = f"Same name {number + 1}"
+        threads = [
+            threading.Thread(target=request, args=(name, start_together, outcomes))
+            for _ in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        if sorted(outcomes) != ["created", "refused"]:
+            problems.append(f"two departments with one name, round {number + 1}: {outcomes}")
             break  # one failing round is enough to show the problem
     return problems
 
