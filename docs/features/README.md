@@ -16,6 +16,6 @@ New pages start from the [feature template](https://github.com/workforce-ops-app
 | Announcements | not yet | next | planned |
 | Notifications | not yet | next | planned |
 | Company settings, display name, and logo | not yet | next | planned |
-| Audit log viewer and verification | not yet | next | planned |
+| Audit log viewer and verification | verification built (#58); viewer not yet | next | planned |
 | Security page and detection | [detection](detection.md), including the detection study | next | design |
 | Platform support access | not yet | stretch | planned |

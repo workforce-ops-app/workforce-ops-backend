@@ -74,7 +74,10 @@ Tests are in `tests/security/` unless another folder is named.
 | HMAC-signed chain per company; the key is outside the database | T4, R2 | `app/audit/signing.py` | `test_audit_log.py::test_editing_an_entry_in_the_database_is_detected`, `test_removing_an_entry_is_detected`, `test_a_plain_hash_cannot_repair_an_edited_chain` |
 | The chain comes from the session's company, never from the caller | T4, I1 | `record()` | `test_audit_log.py::test_a_company_cannot_write_into_another_companys_chain` |
 | No passwords, tokens, secrets, or hashes in entries | I5 | `_check_details()` | `test_audit_log.py::test_no_entry_can_contain_a_password_token_or_hash` |
-| Insert-only database rights and verification | T4, R2 | not built yet (#43, #58) | |
+| Verification: numbering, links, signatures, and the chain's end against its head; the first bad entry is named | T4, R2 | `verify_chain()` in `app/audit/verify.py` | `tests/unit/test_audit_verify.py` (edited, removed, inserted, cut-off entries; older keys) |
+| On-demand check of one's own company's chain only, with `audit.verify`; a failure becomes a security event | T4, I1 | `POST /api/audit/verify`, `app/modules/audit_log/service.py` | `tests/security/test_audit_verify.py` |
+| Nightly check of every chain, and each head copied to the application log | T4, R2 | `scripts/verify_audit_log.py` (scheduled on the host) | `test_audit_verify.py::test_the_nightly_check_covers_every_chain_and_copies_the_heads` |
+| Insert-only database rights | T4, R2 | not built yet (#43) | |
 
 ## Cryptography
 

@@ -125,7 +125,7 @@ Events with a company and events without one are kept in **separate tables**, so
 | `id` | `BINARY(16)` | primary key (UUIDv7) |
 | `company_id` | `BINARY(16)` | required; the session's company (DE9) |
 | `user_id` | `BINARY(16)` | required; the person whose session sent the request; company-aware foreign key to `users` |
-| `kind` | `VARCHAR(50)` | `detection.<type>` (for example `detection.xss`), `detection.summary` (DE6); later `authz.denied` and `csrf.refused` (#92) |
+| `kind` | `VARCHAR(50)` | `detection.<type>` (for example `detection.xss`), `detection.summary` (DE6), `audit.chain_broken` (an audit chain failed its check, [audit log](../architecture/audit-log.md#verification)); later `authz.denied` and `csrf.refused` (#92) |
 | `pattern_id` | `VARCHAR(20)` | which pattern matched; null for non-detection kinds |
 | `field` | `VARCHAR(100)` | where the value was, for example `query.search` or `body.note` |
 | `method`, `route` | `VARCHAR(10)`, `VARCHAR(200)` | the route template (`/api/shifts/{shift_id}`), not the raw path |
@@ -135,7 +135,7 @@ Events with a company and events without one are kept in **separate tables**, so
 | `count` | `INT` | 1, or how many events a summary row stands for |
 | `occurred_at` | `DATETIME(6)` | UTC |
 
-**`platform_security_events`:** events from requests without a valid session, which belong to no company. The same columns **without `company_id` and `user_id`**, so a row cannot point at a company or a person even by mistake. Its kinds are the detection kinds, `detection.dropped` (DE11), and later `auth.lockout` (#92): a lockout happens before anyone is signed in, so it is a platform event too.
+**`platform_security_events`:** events from requests without a valid session, which belong to no company. The same columns **without `company_id` and `user_id`**, so a row cannot point at a company or a person even by mistake. Its kinds are the detection kinds, `detection.dropped` (DE11), `audit.chain_broken` (the nightly audit check found a broken chain; which one is only in the application log), and later `auth.lockout` (#92): a lockout happens before anyone is signed in, so it is a platform event too.
 - It is **not** `CompanyOwned`, so the tenancy coverage test lists it as a stated exception, next to the audit tables, with the reason.
 - Only the detection writer inserts into it, in a database session with no company. No endpoint reads it: the platform view is a stretch goal and gets its own permission and checks when it is designed.
 - A company's session can never see these rows, because no company query touches this table, and the table has no company column a mistaken filter could match.
