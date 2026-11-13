@@ -9,6 +9,8 @@ means editing this file (decisions 0004 and 0012).
 
 import importlib
 import pkgutil
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, FastAPI
 
@@ -19,6 +21,10 @@ from app.core.config import Settings, get_settings
 from app.core.errors import register_error_handlers
 from app.core.logging import configure_logging
 from app.core.swagger import add_development_swagger
+from app.db.session import get_engine
+from app.modules.security.layer import DetectionMiddleware
+from app.modules.security.worker import DetectionWorker
+from app.modules.security.writer import EventWriter
 
 
 def discover_routers() -> list[APIRouter]:
@@ -40,6 +46,15 @@ def discover_routers() -> list[APIRouter]:
         if isinstance(router, APIRouter):
             routers.append(router)
     return routers
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """While the server runs: the detection worker thread inspects request copies
+    (app/modules/security/worker.py). On a clean stop it writes every count it holds."""
+    app.state.detection.start()
+    yield
+    app.state.detection.stop()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -65,7 +80,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         docs_url=docs_url,
         redoc_url=None,
         openapi_url=openapi_url,
+        lifespan=lifespan,
     )
+    # Detection (docs/features/detection.md): one worker and one queue for the whole API.
+    # The writer, and so the database connection, is made on first use.
+    app.state.detection = DetectionWorker(lambda: EventWriter(get_engine()))
     log_full_errors = settings.is_development
     # Forged requests are refused before they reach any endpoint (app/auth/csrf.py). The
     # API does not start without the key: every change to data depends on it. Added before
@@ -87,6 +106,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Added last, so it is the outermost layer: every answer, including the CSRF check's
     # 403 and the catch-all 500, is marked never to be stored (app/core/caching.py).
     app.add_middleware(NoStoreMiddleware)
+    # The detection layer goes around all of them, so it also sees requests the CSRF check
+    # refuses. It never changes a request or its answer (rule DE1): it only keeps a copy
+    # of what was sent and inspects it after the answer is out
+    # (app/modules/security/layer.py).
+    app.add_middleware(
+        DetectionMiddleware, routes=app.router.routes, submit=app.state.detection.submit
+    )
     for router in discover_routers():
         app.include_router(router)
     if settings.is_development:
