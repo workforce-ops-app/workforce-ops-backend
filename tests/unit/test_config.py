@@ -12,7 +12,14 @@ from app.core.config import get_settings
 def isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # Run in an empty folder so a developer's own .env cannot affect the result.
     monkeypatch.chdir(tmp_path)
-    for name in ("APP_ENV", "LOG_LEVEL", "DATABASE_URL", "DATABASE_PASSWORD"):
+    for name in (
+        "APP_ENV",
+        "LOG_LEVEL",
+        "DATABASE_URL",
+        "DATABASE_PASSWORD",
+        "MIGRATIONS_DATABASE_URL",
+        "MIGRATIONS_DATABASE_PASSWORD",
+    ):
         monkeypatch.delenv(name, raising=False)
     get_settings.cache_clear()
 
@@ -87,3 +94,34 @@ def test_the_password_never_shows_when_printed(monkeypatch: pytest.MonkeyPatch) 
 
     assert RESERVED_PASSWORD not in repr(settings)
     assert RESERVED_PASSWORD not in str(settings.sqlalchemy_url)
+
+
+def test_migrations_use_their_own_user_and_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Alembic connects as the migrations user (#43), with its own password, also kept
+    # out of the URL; the app's user and password are untouched.
+    monkeypatch.setenv("DATABASE_URL", "mysql+pymysql://workforce_app@db:3306/workforce_ops")
+    monkeypatch.setenv("DATABASE_PASSWORD", "the app's password")
+    monkeypatch.setenv(
+        "MIGRATIONS_DATABASE_URL", "mysql+pymysql://workforce_migrations@db:3306/workforce_ops"
+    )
+    monkeypatch.setenv("MIGRATIONS_DATABASE_PASSWORD", RESERVED_PASSWORD)
+
+    settings = get_settings()
+
+    assert settings.migrations_sqlalchemy_url.username == "workforce_migrations"
+    assert settings.migrations_sqlalchemy_url.password == RESERVED_PASSWORD
+    assert settings.sqlalchemy_url.username == "workforce_app"
+    assert settings.sqlalchemy_url.password == "the app's password"
+    assert RESERVED_PASSWORD not in repr(settings)
+
+
+def test_migrations_without_their_own_url_use_database_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Only for a throwaway database where one user may do both. In the real setup the app
+    # user cannot change the structure, so this way an upgrade fails loudly instead.
+    monkeypatch.setenv("DATABASE_URL", "mysql+pymysql://app:secret@db:3306/workforce_ops")
+
+    settings = get_settings()
+
+    assert settings.migrations_sqlalchemy_url == settings.sqlalchemy_url

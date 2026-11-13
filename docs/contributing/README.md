@@ -42,7 +42,7 @@ pre-commit install
 
 ## Database and migrations
 
-How the database layer is built is in [layers and modules](../architecture/layers-and-modules.md#the-database-layer). The Alembic commands below use `DATABASE_URL` and `DATABASE_PASSWORD` from `.env` and need a running MySQL 8.4: start it with `docker compose up -d db` ([running with Docker](#running-with-docker)).
+How the database layer is built is in [layers and modules](../architecture/layers-and-modules.md#the-database-layer). The Alembic commands below use `MIGRATIONS_DATABASE_URL` and `MIGRATIONS_DATABASE_PASSWORD` from `.env` (the migrations user, see [database users](#database-users)) and need a running MySQL 8.4: start it with `docker compose up -d db` ([running with Docker](#running-with-docker)). Or run them in Docker, with nothing installed: `docker compose run --rm migrate` applies all migrations.
 
 | Task | Command |
 |---|---|
@@ -53,8 +53,9 @@ How the database layer is built is in [layers and modules](../architecture/layer
 | Show the SQL without running it | `alembic upgrade head --sql` |
 
 - **Read every generated migration** before committing it, and write types out (`sa.BINARY(16)`, not the app's `UUIDBinary`), so the migration does not depend on app code that may change later. Autogenerate compares the models with the database and can miss or misread changes (renamed columns look like a drop plus an add, which would lose data). Fill in `downgrade()` so it undoes `upgrade()` exactly.
+- **A new table needs its rights:** add it to `APP_RIGHTS` in `app/db/grants.py` in the same pull request, with only what the app needs (an insert-only table gets `SELECT` and `INSERT`). `tests/unit/test_grants.py` fails until it is there, and an upgrade refuses to finish with a table that has no entry. Never grant rights by hand: the next upgrade takes away anything the list does not say.
 - **One migration per pull request.** If another pull request's migration merges first, set your migration's `down_revision` to that one. The migration check fails when the history has two heads ([modularity](https://github.com/workforce-ops-app/.github/blob/main/docs/contributing/modularity.md)).
-- **The migration check** (`python -m scripts.check_migrations`, also run by CI) confirms there is one head, then runs upgrade, downgrade, and upgrade again on a throwaway MySQL 8.4 container that it removes afterwards. Finally it compares the migrated tables with the models (as autogenerate would) and fails on any difference, so a hand-written or edited migration cannot drift from its models. Last, it tries the database's own rules on the migrated MySQL (a cross-company link, a mixed-case email, two addresses that differ only by an accent) and fails if MySQL lets one through: tests run on SQLite, which compares text differently, so these rules are proven on the real database. It also tries races that only MySQL's row locks can settle, through the app's own code: two reporting-line changes at once, two bookings of one person, archiving a department or team while another request changes it, and two departments with one name. To use an existing empty database instead, set `MIGRATION_CHECK_DATABASE_URL`.
+- **The migration check** (`python -m scripts.check_migrations`, also run by CI) confirms there is one head, then runs upgrade, downgrade, and upgrade again on a throwaway MySQL 8.4 container that it removes afterwards. Finally it compares the migrated tables with the models (as autogenerate would) and fails on any difference, so a hand-written or edited migration cannot drift from its models. Last, it tries the database's own rules on the migrated MySQL (a cross-company link, a mixed-case email, two addresses that differ only by an accent) and fails if MySQL lets one through: tests run on SQLite, which compares text differently, so these rules are proven on the real database. It also tries races that only MySQL's row locks can settle, through the app's own code: two reporting-line changes at once, two bookings of one person, archiving a department or team while another request changes it, and two departments with one name. The container gets the same first-start script as Docker Compose, so it has the two [database users](#database-users): the migrations run as the migrations user, the races as the application user, and last it tries what the application user must never do (create, change, or drop a table; change or remove audit entries; change security events; read MySQL's own users; grant itself rights) and fails if MySQL allows one, or refuses for any reason other than a missing right. To use an existing empty database instead, set `MIGRATION_CHECK_DATABASE_URL`; with one user for everything, that last part is skipped.
 
 **Queries go in `repository.py` only**, written with SQLAlchemy, never by building SQL strings:
 
@@ -83,7 +84,7 @@ SQLAlchemy sends `note_id` and `title` as bound parameters (`WHERE notes.id = %(
 
 ## Running with Docker
 
-`docker-compose.yml` runs the API and MySQL 8.4 together ([0034](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0034-database-driver-ids-and-local-layout.md)). Needs Docker Desktop running, and `MYSQL_ROOT_PASSWORD`, `MYSQL_APP_PASSWORD`, `AUDIT_SIGNING_KEY`, and `CSRF_KEY` set in `.env` (Compose refuses to start without them, so there is never a blank database password, an unsigned audit log, or unprotected changes).
+`docker-compose.yml` runs the API and MySQL 8.4 together ([0034](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0034-database-driver-ids-and-local-layout.md)). Needs Docker Desktop running, and `MYSQL_ROOT_PASSWORD`, `MYSQL_APP_PASSWORD`, `MYSQL_MIGRATIONS_PASSWORD`, `AUDIT_SIGNING_KEY`, and `CSRF_KEY` set in `.env` (Compose refuses to start without them, so there is never a blank database password, an unsigned audit log, or unprotected changes).
 
 | Task | Command |
 |---|---|
@@ -91,14 +92,15 @@ SQLAlchemy sends `note_id` and `title` as bound parameters (`WHERE notes.id = %(
 | Start only MySQL (to run the API with uvicorn instead) | `docker compose up -d db` |
 | See whether both are healthy | `docker compose ps` |
 | Follow the API's log lines | `docker compose logs -f api` |
-| Apply the migrations | `docker compose run --rm api alembic upgrade head` |
+| Apply the migrations (as the migrations user) | `docker compose run --rm migrate` |
 | Stop (data is kept) | `docker compose down` |
 | Reset the database (**deletes all local data**) | `docker compose down --volumes` |
 
 - **Addresses:** the API is at http://localhost:8000/api/health and MySQL at `localhost:3307` (next to XAMPP's 3306). Both listen on `127.0.0.1` only, so other computers on your network cannot reach them.
 - **Swagger:** in development, open `/api/docs` from `APP_ORIGIN` (normally http://localhost:8080/api/docs through the frontend; when running the API directly with `APP_ORIGIN` unset, http://localhost:8000/api/docs). Sign in through `POST /api/sessions`; Swagger keeps the returned CSRF token only in that page's memory and automatically includes it on same-origin POST, PUT, PATCH, and DELETE requests. A successful sign-out or any 401 response clears it. The helper does not bypass Origin, session, permission, or CSRF checks, and neither Swagger nor its helper is available in production.
-- **Passwords:** MySQL creates the `workforce_app` user with `MYSQL_APP_PASSWORD` the first time it starts. `DATABASE_PASSWORD` in `.env` must be the same password (it is kept out of `DATABASE_URL`, so any characters work, including `@`, `:`, `/`, and `%`). Changing either later needs a database reset, because MySQL only reads them when the data volume is new. Everyone picks their own passwords (for example `python -c "import secrets; print(secrets.token_hex(16))"`); they are never shared or committed, and CI generates throwaway ones.
+- **Passwords:** MySQL creates the two [database users](#database-users) the first time it starts: `workforce_app` with `MYSQL_APP_PASSWORD` and `workforce_migrations` with `MYSQL_MIGRATIONS_PASSWORD`. `DATABASE_PASSWORD` and `MIGRATIONS_DATABASE_PASSWORD` in `.env` must be the same passwords (they are kept out of the URLs, so any characters work, including `@`, `:`, `/`, and `%`). Changing them later needs a database reset, because MySQL only reads them when the data volume is new. Everyone picks their own passwords (for example `python -c "import secrets; print(secrets.token_hex(16))"`); they are never shared or committed, and CI generates throwaway ones.
 - **Networks:** MySQL is only on a private network with the API. The API also joins the shared `workforce-ops` network, where the frontend's nginx reaches it; nginx can never reach the database directly.
+- **The migrate tool** (`docker compose run --rm migrate`) is the API's image in its own short-lived container, with the migrations user's password. The running API never gets that password.
 - **The image** runs as an ordinary user (not root), and `.env` is never copied into it (`.dockerignore`); settings arrive as environment variables when the container starts.
 - **The integration test** (`python -m scripts.integration_test`, also run by CI) starts a separate copy with throwaway passwords and free ports, so it never touches your own running copy or its data, then removes it.
 
@@ -106,14 +108,34 @@ SQLAlchemy sends `note_id` and `title` as bound parameters (`WHERE notes.id = %(
 
 Each contributor has their own database; GitHub carries its **structure**, never its **data**.
 
-- **Structure** travels as migrations in `migrations/versions/`. After `git pull`, apply any you do not have yet with `docker compose run --rm api alembic upgrade head` (add `--build` to `docker compose up` too, so the API image has the new code). Alembic records the last migration it applied in the `alembic_version` table, so only new ones run, whoever pulls first.
+- **Structure** travels as migrations in `migrations/versions/`. After `git pull`, apply any you do not have yet with `docker compose run --rm --build migrate` (`--build` so the image has the new migrations; add `--build` to `docker compose up` too, so the API has the new code). Alembic records the last migration it applied in the `alembic_version` table, so only new ones run, whoever pulls first.
 - **Data** stays on each computer and is never committed. To see the same data as everyone else, start from an empty database and load the demo data:
 
   ```
   docker compose down --volumes                      # deletes your local data
   docker compose up -d --build
-  docker compose run --rm api alembic upgrade head
+  docker compose run --rm migrate
   python -m scripts.seed_demo                        # the two demo companies
+  ```
+
+### Database users
+
+The database has two users (T2, #43), so a break-in through the API cannot change the structure or the audit log ([audit log: protection in the database](../architecture/audit-log.md#protection-in-the-database)):
+
+| User | Used by | May |
+|---|---|---|
+| `workforce_app` (`DATABASE_URL`) | the API, the seed script, the clean-up job | read and write data, table by table as `app/db/grants.py` lists: no structure changes; only add and read audit entries; add, read, and remove (never change) security events |
+| `workforce_migrations` (`MIGRATIONS_DATABASE_URL`) | Alembic only (`alembic upgrade head`, `docker compose run --rm migrate`) | everything on this one database, including handing out rights there |
+
+- `docker/mysql/init/01-users.sh` creates both the first time MySQL starts. The application user starts with no rights; every upgrade gives it exactly what `app/db/grants.py` lists and takes away anything else.
+- **Rights per table, not one grant for the whole database:** MySQL cannot take a right away from one table once it was granted for the whole database, and the audit tables must not allow `UPDATE` or `DELETE`.
+- **Coming from an older setup** (one `workforce_app` user that could do everything): add `MIGRATIONS_DATABASE_URL`, `MIGRATIONS_DATABASE_PASSWORD`, and `MYSQL_MIGRATIONS_PASSWORD` to `.env` (see `.env.example`), then reset the database once, since MySQL only creates users on an empty volume. Your local data is lost; the demo data comes back with the seed script:
+
+  ```
+  docker compose down --volumes                      # deletes your local data
+  docker compose up -d --build
+  docker compose run --rm migrate
+  python -m scripts.seed_demo
   ```
 
 ## Demo data

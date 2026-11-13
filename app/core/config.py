@@ -30,6 +30,13 @@ class Settings(BaseSettings):
     # hides it when the settings are printed or logged. Optional, so a password already
     # written inside DATABASE_URL keeps working.
     database_password: SecretStr | None = None
+    # The migrations user (#43): the only one allowed to change the structure, used by
+    # Alembic and never by the running API, e.g.
+    # mysql+pymysql://workforce_migrations@localhost:3307/workforce_ops. Its password is
+    # kept apart in the same way. Unset: Alembic uses DATABASE_URL, which only works where
+    # one user may do both (a throwaway test database).
+    migrations_database_url: str | None = None
+    migrations_database_password: SecretStr | None = None
     # The password the demo seed script (scripts/seed_demo.py) gives every demo account,
     # so the demo can sign in. Local and demo use only; never in production.
     demo_password: SecretStr | None = None
@@ -66,6 +73,16 @@ class Settings(BaseSettings):
         if self.database_password is not None:
             url = url.set(password=self.database_password.get_secret_value())
 
+        return url
+
+    @property
+    def migrations_sqlalchemy_url(self) -> URL:
+        """The migrations user's address, built the same way; DATABASE_URL when unset."""
+        if self.migrations_database_url is None:
+            return self.sqlalchemy_url
+        url = make_url(self.migrations_database_url)
+        if self.migrations_database_password is not None:
+            url = url.set(password=self.migrations_database_password.get_secret_value())
         return url
 
     @property
