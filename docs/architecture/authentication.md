@@ -99,7 +99,7 @@ Three defenses, so one mistake is not enough:
 
 **How it is built** (`app/auth/csrf.py`): a middleware checks every `POST`, `PUT`, `PATCH`, and `DELETE` before any endpoint runs, so no endpoint can forget it.
 - **The application's own address** is the `APP_ORIGIN` setting (for example `http://localhost:8080` under Docker Compose, where the frontend's nginx serves pages and API). Unset, it is the address the request was sent to, which is right when the API runs directly (`uvicorn`). The comparison ignores case and a trailing slash; a missing `Origin`, or `null`, is refused.
-- **The token** is required whenever the browser sends a session cookie, with one exception: **sign-in** (`POST /api/sessions`) is checked for `Origin` only. It starts a session rather than acting in one, and a browser may still carry the cookie of a session that already ended; demanding that dead session's token would lock the person out. A forged sign-in (signing the victim into the attacker's account) is still refused by the `Origin` check.
+- **The token** is required whenever the browser sends a session cookie, with two exceptions: **sign-in** (`POST /api/sessions`) and **company sign-up** (`POST /api/sign-up`) are checked for `Origin` only. It starts a session rather than acting in one, and a browser may still carry the cookie of a session that already ended; demanding that dead session's token would lock the person out. A forged sign-in (signing the victim into the attacker's account) is still refused by the `Origin` check.
 - The token is returned as `csrf_token` by `POST /api/sessions` and `GET /api/sessions/current`, and compared in constant time (`hmac.compare_digest`).
 - **Every refusal** is a 403 with the same message, whichever check failed, so an attacker learns nothing about which part was wrong.
 - The API does not start without `CSRF_KEY` (at least 32 characters), or when it is the same as `AUDIT_SIGNING_KEY`: one leaked secret must not weaken the other protection.
@@ -113,7 +113,9 @@ Three defenses, so one mistake is not enough:
 |---|---|---|
 | Wrong passwords for one account | 5 → locked 15 min; 10 → 30 min; 15 or more → 1 hour each time (the maximum) | `users.failed_sign_ins`, `users.locked_until` |
 | Counter reset | after a successful sign-in, or 24 hours without failures | `users` |
-| Sign-in attempts per address | 20 per minute | memory of the API process |
+| Sign-in attempts per address | 20 per minute (sign-up requests count too) | memory of the API process |
+| Company sign-ups per address | 5 per hour | memory of the API process |
+| Company sign-ups on the platform | 200 per hour | memory of the API process |
 | Requests per session | 300 per minute | memory of the API process |
 
 - A locked account gets the same answer as any failed sign-in (see [signing in](#signing-in)), so a lock does not reveal that the account exists. Only the per-address and per-session rate limits answer **429**, since they do not depend on which account was tried.
@@ -162,6 +164,7 @@ This limits the damage from a session left open on a shared computer or stolen b
 | Method and path | Who | Does |
 |---|---|---|
 | `POST /api/sessions` | anyone | sign in |
+| `POST /api/sign-up` | anyone not signed in | create a company and its owner, and sign the owner in ([organization](../features/organization.md#company-sign-up)) |
 | `GET /api/sessions/current` | signed in | current user (with their home `department_id`), their company, their effective permissions (every permission they hold somewhere, read fresh on each request; for the menu only), CSRF token (`csrf_token`) |
 | `DELETE /api/sessions/current` | signed in | sign out |
 | `DELETE /api/sessions` | signed in | sign out everywhere (own sessions) |
