@@ -15,7 +15,7 @@ New pages start from the [feature template](https://github.com/workforce-ops-app
 | Shift tasks, with photos on task notes (secure file uploads) | not yet | next | planned |
 | Announcements | not yet | next | planned |
 | Notifications | not yet | next | planned |
-| Company settings, display name, and logo | not yet | next | planned |
+| Company settings, display name, and logo | the settings table and its rules: [data model](../architecture/data-model.md#company_settings); a settings screen, display name, and logo not yet | next | settings built (no API yet); the rest planned |
 | Audit log viewer and verification | not yet | next | planned |
 | Security page and detection | [detection](detection.md), including the detection study | next | design |
 | Platform support access | not yet | stretch | planned |

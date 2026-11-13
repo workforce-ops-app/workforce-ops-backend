@@ -440,7 +440,16 @@ Details, notes, and event text are written by users, so they are shown as plain 
 | `setting_key` | `VARCHAR(80)` | setting name within the module |
 | `value` | `JSON` | validated against the module's declared type |
 
-Primary key: `(company_id, module, setting_key)`. A missing row means "use the default".
+Primary key: `(company_id, module, setting_key)`. A missing row means "use the default". Migration `0009` creates the table; existing companies need no rows.
+
+**The registry** (`app/settings/registry.py`): each module declares its settings in `app/modules/<feature>/settings.py` as a list named `SETTINGS`, and the shared layers declare theirs in the registry itself, as permissions are declared. Each declaration has a type (whole numbers for now), a platform **default**, a platform **limit**, and which direction is **stricter**. A company may only choose a value from the default to the limit: stricter than the platform, never weaker (rule AZ10, threat E7). The value is checked against the declaration both when it is chosen and every time it is read, so a weaker value written straight into the table is ignored (the default applies, and the application log says so). Settings are read with `setting_value()` and changed with `change_setting()` (`app/settings/service.py`), only in a session for one company; each change is audited as `settings.changed`. Changing settings through the API is next tier; that endpoint will need `settings.manage` and the password re-entered ([0025](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md)).
+
+| Setting | Declared in | Default | Companies may choose | Used by |
+|---|---|---|---|---|
+| `auth.password_min_length` | `app/settings/registry.py` | 15 | 15 to 64 (longer is stricter) | every password a person sets (`check_password(min_length=password_min_length(db))`); so far the demo seed |
+| `time_off.required_approvals` | `app/modules/time_off/settings.py` | 1 | 1 to 5 (more is stricter) | time-off approval ([time off](../features/time-off.md)), when it is built |
+
+"From the default to the limit" means a company that chose 20 may later go back to 16, but never below 15. Two changes of the same setting at the same moment take turns on an existing row; the very first change of a setting by two requests at once would make one of them fail on the primary key, which matters only once the settings endpoint exists.
 
 ### audit_chain_heads
 

@@ -204,7 +204,7 @@ Each rule becomes a security test in `tests/security/` when the code is built. T
 | AZ7 | Nobody reviews their own request. | E5 |
 | AZ8 | The last owner cannot be removed, demoted, or deactivated; owners are added and removed only through the owner approval flow. | E6 |
 | AZ9 | The Owner role's permissions cannot be changed. | E6 |
-| AZ10 | Security settings can only be made stricter, within platform limits. | E7 |
+| AZ10 | Security settings can only be made stricter, within platform limits. Enforced for every company setting by the settings registry (`app/settings/registry.py`): a value must lie between the platform default and the platform limit ([company settings](data-model.md#company_settings)). | E7 |
 | AZ11 | Every endpoint enforces its permission on the server, whatever the interface shows. | E8 |
 | AZ12 | Every role, permission, assignment, reporting line, ownership, and approval change writes an audit entry. | R1 |
 | AZ13 | A role can be changed, renamed, or archived only by someone above every current holder (or the Owner). | E9 |
@@ -233,6 +233,7 @@ Schedule changes affecting 10 or more shifts show a confirmation with the count 
 | `reporting_line.added`, `reporting_line.ended` | a reporting line starts or ends |
 | `ownership.owner_added`, `ownership.owner_removed` | an owner change takes effect |
 | `approval.requested`, `approval.approved`, `approval.denied`, `approval.not_reviewed`, `approval.cancelled` | a same-level grant or owner change is requested, decided, or lapses (details: kind, who) |
+| `settings.changed` | a company setting changes (details: `setting`, `old`, `new`); written by `change_setting()` in `app/settings/service.py` |
 
 Refused requests (403) are not audit entries: they are recorded as security events for detection (next tier), with the permission and the kind of target, never the record's contents.
 
