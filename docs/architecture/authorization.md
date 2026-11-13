@@ -221,6 +221,8 @@ These need the password re-entered shortly before, as set out in [0025](https://
 - adding or ending a reporting line;
 - changing security settings.
 
+Each of these actions calls `require_reauth()` (`app/auth/reauth.py`) before it changes anything, as its endpoint is built: deactivating an admin-level holder once #138 merges, the role, line, and owner actions with Z4 and Z5, security settings with #59.
+
 Schedule changes affecting 10 or more shifts show a confirmation with the count (no password re-entry). Companies may add actions to the re-entry list but never remove them.
 
 ## Audit events
