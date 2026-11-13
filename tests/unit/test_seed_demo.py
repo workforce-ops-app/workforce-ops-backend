@@ -22,15 +22,17 @@ from app.authz.check import Forbidden, authorize
 from app.authz.models import Permission, ReportingLine, Role, RoleAssignment, RolePermission
 from app.core.config import get_settings
 from app.db.base import Base
+from app.detection.patterns import KINDS
 from app.modules.org.models import Company, Department, Team, TeamMember, User
 from app.modules.schedules import service as shift_service
 from app.modules.schedules.models import Shift
+from app.modules.security.models import PlatformSecurityEvent, SecurityEvent
 from app.tenancy.context import set_company
 from scripts import seed_demo
 from tests.audit_data import TEST_KEY, use_key
 
-# The tables the seed fills: the company's structure and people, its roles, its shifts, and
-# the audit log their creation is written to.
+# The tables the seed fills: the company's structure and people, its roles, its shifts, its
+# security events, and the audit log their creation is written to.
 ORG_TABLES = [
     model.__table__
     for model in (
@@ -47,6 +49,8 @@ ORG_TABLES = [
         AuditChainHead,
         AuditEvent,
         Shift,
+        SecurityEvent,
+        PlatformSecurityEvent,
     )
 ]
 
@@ -59,6 +63,21 @@ SHIFTS_PER_COMPANY = 2 * len(seed_demo.WEEK_PATTERN)
 ADDED = f"{SHIFTS_PER_COMPANY} shifts added"
 NO_PASSWORD = "no DEMO_PASSWORD, so no one can sign in"
 WAITING = "shifts wait for passwords"
+# The demo security events (DT6): one per pattern the detector finds in each spread-out
+# attack, the burst's rows up to the rate cap, and the burst's one summary row.
+EVENTS_PER_COMPANY = (
+    sum(len(seed_demo.inspect([(a.field, a.value)])) for a in seed_demo.DEMO_ATTACKS)
+    + seed_demo.PER_MINUTE
+    + 1
+)
+EVENTS = f"{EVENTS_PER_COMPANY} security events added"
+NO_EVENTS = "0 security events added"
+# The platform's line: its events of people not signed in, plus one drop count.
+PLATFORM_EVENTS = (
+    sum(len(seed_demo.inspect([(a[3], a[4])])) for a in seed_demo.PLATFORM_ATTACKS) + 1
+)
+PLATFORM = f"Platform: {PLATFORM_EVENTS} security events added"
+PLATFORM_NOTHING = "Platform: 0 security events added"
 
 DEMO_PASSWORD = "a calm river bends at dusk"
 # People in each demo company.
@@ -66,7 +85,10 @@ PEOPLE = 10
 # The reporting lines each company gets (Z2).
 LINES = len(seed_demo.REPORTING_LINES)
 # The end of a company's line when a rerun has nothing left to add.
-NOTHING_NEW = "0 reporting lines added; demo password set for 0 accounts; 0 shifts added"
+NOTHING_NEW = (
+    "0 reporting lines added; demo password set for 0 accounts; 0 shifts added; "
+    "0 security events added"
+)
 # Every account given the demo password.
 ALL_PASSWORDS = f"demo password set for {PEOPLE} accounts"
 
@@ -132,8 +154,11 @@ def test_it_creates_two_alike_companies(engine: Engine) -> None:
     lines = seed_demo.seed(engine, now=NOW)
 
     assert lines == [
-        f"Northwind Cafe: created; {LINES} reporting lines added; {NO_PASSWORD}; {WAITING}",
-        f"Summit Outfitters: created; {LINES} reporting lines added; {NO_PASSWORD}; {WAITING}",
+        f"Northwind Cafe: created; {LINES} reporting lines added; {NO_PASSWORD}; {WAITING}; "
+        f"{EVENTS}",
+        f"Summit Outfitters: created; {LINES} reporting lines added; {NO_PASSWORD}; {WAITING}; "
+        f"{EVENTS}",
+        PLATFORM,
     ]
     ids = company_ids(engine)
     assert set(ids) == {"Northwind Cafe", "Summit Outfitters"}
@@ -161,6 +186,7 @@ def test_running_it_twice_changes_nothing(engine: Engine) -> None:
     assert lines == [
         f"Northwind Cafe: already there; {NOTHING_NEW}",
         f"Summit Outfitters: already there; {NOTHING_NEW}",
+        PLATFORM_NOTHING,
     ]
     assert len(company_ids(engine)) == 2
     for company_id in company_ids(engine).values():
@@ -192,6 +218,7 @@ def test_a_failure_part_way_leaves_nothing_behind_and_a_rerun_completes(
     assert [line.split(";")[0] for line in lines] == [
         "Northwind Cafe: created",
         "Summit Outfitters: created",
+        PLATFORM,
     ]
     for company_id in company_ids(engine).values():
         assert count(engine, company_id, Department) == 3
@@ -230,8 +257,11 @@ def test_a_demo_password_is_hashed_for_every_account(engine: Engine) -> None:
     lines = seed_demo.seed(engine, DEMO_PASSWORD, NOW)
 
     assert lines == [
-        f"Northwind Cafe: created; {LINES} reporting lines added; {ALL_PASSWORDS}; {ADDED}",
-        f"Summit Outfitters: created; {LINES} reporting lines added; {ALL_PASSWORDS}; {ADDED}",
+        f"Northwind Cafe: created; {LINES} reporting lines added; {ALL_PASSWORDS}; {ADDED}; "
+        f"{EVENTS}",
+        f"Summit Outfitters: created; {LINES} reporting lines added; {ALL_PASSWORDS}; {ADDED}; "
+        f"{EVENTS}",
+        PLATFORM,
     ]
     users = all_users(engine)
     # Stored as hashes that verify, each with its own salt, never as the password itself.
@@ -248,7 +278,7 @@ def test_a_rerun_only_fills_in_missing_passwords(engine: Engine) -> None:
 
     assert lines[0] == (
         "Northwind Cafe: already there; 0 reporting lines added; "
-        f"demo password set for {PEOPLE} accounts; {ADDED}"
+        f"demo password set for {PEOPLE} accounts; {ADDED}; {NO_EVENTS}"
     )
     # A third run changes nothing: everyone already has a password, and the shifts exist.
     assert seed_demo.seed(engine, DEMO_PASSWORD, NOW)[0] == (
@@ -587,7 +617,7 @@ def test_a_company_seeded_before_shifts_gets_them_on_the_next_run(engine: Engine
 
     assert lines[0] == (
         f"Northwind Cafe: already there; {LINES} reporting lines added; "
-        f"demo password set for {PEOPLE} accounts; {ADDED}"
+        f"demo password set for {PEOPLE} accounts; {ADDED}; {EVENTS}"
     )
     for company_id in company_ids(engine).values():
         assert count(engine, company_id, Shift) == SHIFTS_PER_COMPANY
@@ -602,7 +632,7 @@ def test_shifts_wait_until_everyone_on_them_has_a_password(engine: Engine) -> No
 
     # Once DEMO_PASSWORD is set, the next run adds them.
     lines = seed_demo.seed(engine, DEMO_PASSWORD, NOW)
-    assert all(line.endswith(ADDED) for line in lines)
+    assert all(f"; {ADDED};" in line for line in lines[:2])
 
 
 @pytest.mark.parametrize("who", [seed_demo.KITCHEN_A, seed_demo.CREW_LEAD])
@@ -727,3 +757,101 @@ def test_a_company_seeded_before_the_second_administrator_must_be_reset(engine: 
     assert "seeded before Sofia Reyes joined the demo data" in str(refused.value)
     # Nothing was kept.
     assert count(engine, company_ids(engine)[plan.name], ReportingLine) == 0
+
+
+# --- Demo security events (DT6) --------------------------------------------------------
+
+
+def events_of(engine: Engine, company_id: uuid.UUID) -> list[SecurityEvent]:
+    """A company's security events, in its own session."""
+    with Session(engine) as session:
+        set_company(session, company_id)
+        rows = list(session.scalars(select(SecurityEvent)))
+        session.expunge_all()
+        return rows
+
+
+def test_each_company_gets_every_attack_type_from_several_people(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    for company_id in company_ids(engine).values():
+        rows = events_of(engine, company_id)
+        assert len(rows) == EVENTS_PER_COMPANY
+        kinds = {row.kind for row in rows}
+        assert kinds == {f"detection.{kind}" for kind in KINDS} | {"detection.summary"}
+        assert len({row.user_id for row in rows}) >= 4
+        # Every detection row carries the pattern the real detector found.
+        assert all(row.pattern_id for row in rows if row.kind != "detection.summary")
+
+
+def test_the_two_summary_windows_show_different_counts(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    now = NOW.replace(tzinfo=None)
+    for company_id in company_ids(engine).values():
+        rows = events_of(engine, company_id)
+        week = [r for r in rows if r.occurred_at >= now - timedelta(days=7)]
+        month = [r for r in rows if r.occurred_at >= now - timedelta(days=30)]
+        assert len(month) == len(rows)  # everything is within the last 30 days
+        assert 0 < len(week) < len(month)
+        assert all(r.occurred_at <= now for r in rows)  # nothing in the future
+
+
+def test_the_burst_is_cut_short_by_the_rate_cap(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    for company_id in company_ids(engine).values():
+        rows = events_of(engine, company_id)
+        summaries = [r for r in rows if r.kind == "detection.summary"]
+        # One summary row standing for the burst's events past the cap, from the burst's
+        # sender, dated at the end of the burst's minute.
+        assert [s.count for s in summaries] == [seed_demo.BURST_SIZE - seed_demo.PER_MINUTE]
+        burst_rows = [r for r in rows if r.user_id == summaries[0].user_id and r.count == 1]
+        assert len([r for r in burst_rows if r.excerpt == seed_demo.BURST.value]) == (
+            seed_demo.PER_MINUTE
+        )
+
+
+def test_an_excerpt_shows_text_that_would_run_if_shown_unsafely(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    for company_id in company_ids(engine).values():
+        excerpts = {row.excerpt for row in events_of(engine, company_id)}
+        assert "<img src=x onerror=alert(1)>" in excerpts
+
+
+def test_no_demo_event_crosses_companies(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    ids = company_ids(engine)
+    for name, company_id in ids.items():
+        with Session(engine) as session:
+            set_company(session, company_id)
+            own_people = set(session.scalars(select(User.id)))
+        rows = events_of(engine, company_id)
+        assert rows and {row.company_id for row in rows} == {company_id}, name
+        assert {row.user_id for row in rows} <= own_people, name
+
+
+def test_people_not_signed_in_and_dropped_copies_go_to_the_platform(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    with Session(engine) as platform:
+        rows = list(platform.scalars(select(PlatformSecurityEvent)))
+    assert len(rows) == PLATFORM_EVENTS
+    dropped = [r for r in rows if r.kind == "detection.dropped"]
+    assert [r.count for r in dropped] == [seed_demo.DEMO_DROPPED[1]]
+    assert any(r.kind.startswith("detection.") and r.pattern_id for r in rows)
+
+
+def test_security_events_are_added_once(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    lines = seed_demo.seed(engine, now=NOW)
+    assert lines[0].endswith(NO_EVENTS) and lines[-1] == PLATFORM_NOTHING
+    for company_id in company_ids(engine).values():
+        assert len(events_of(engine, company_id)) == EVENTS_PER_COMPANY
+
+
+def test_a_demo_value_the_detector_does_not_flag_stops_the_seed(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harmless = seed_demo.DemoAttack(
+        seed_demo.KITCHEN_A, 1, 9, "POST", "/api/shifts", "body.notes", "Bring the menus"
+    )
+    monkeypatch.setattr(seed_demo, "DEMO_ATTACKS", (harmless,))
+    with pytest.raises(seed_demo.SeedRefused, match="does not flag"):
+        seed_demo.seed(engine, now=NOW)
