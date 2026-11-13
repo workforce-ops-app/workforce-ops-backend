@@ -5,6 +5,7 @@
 | Term | Meaning |
 |---|---|
 | **Company / tenant** | One customer organization. Its data is isolated from every other company. |
+| **Sign-up** | The public form that creates a new company together with its owner account. |
 | **Role** | A named set of permissions, defined per company. |
 | **Permission** | A single allowed action, for example `schedule.edit`. |
 | **Scope** | The employees, departments, or teams a permission applies to for a given user. |

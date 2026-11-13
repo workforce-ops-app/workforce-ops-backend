@@ -4,7 +4,7 @@
 - **Related:** workforce-ops-app/workforce-ops-backend#8; frontend page: administration screens (workforce-ops-app/workforce-ops-frontend#3); design: [data model](../architecture/data-model.md), [authorization](../architecture/authorization.md), [authentication](../architecture/authentication.md)
 
 ## In short
-Administrators set up their company in the application: its departments and teams, the people who work there, what role each person has and where it applies, and who reports to whom. People are never deleted, only deactivated, so the history stays complete. For testing and the demos, a seed script creates two made-up companies with everything already filled in.
+Administrators set up their company in the application: its departments and teams, the people who work there, what role each person has and where it applies, and who reports to whom. People are never deleted, only deactivated, so the history stays complete. A company signs up on a public page, which creates the company and its owner account. For testing and the demos, a seed script creates two made-up companies with everything already filled in.
 
 ## Who can use it
 
@@ -34,7 +34,7 @@ flowchart LR
     U --> RL["Adds reporting lines"]
 ```
 
-1. The company and its first owner exist already: in the core tier, only the seed script creates companies.
+1. The company and its first owner are created together, by the company's own [sign-up](#company-sign-up) (or, for the demo companies, by the seed script).
 2. An administrator creates departments (for example Kitchen, Front of House) and teams inside them (Weekend Crew).
 3. They create an account for each person: name, email, and **home department**. The account has no password yet.
 4. They create a **setup link** and give it to the person, who opens it and chooses a password ([authentication](../architecture/authentication.md#setup-and-reset-links)).
@@ -94,12 +94,70 @@ stateDiagram-v2
 
 **Roles, assignments, reporting lines, and owners** follow the [authorization](../architecture/authorization.md) page: rules AZ1 to AZ15, the delegation limits, and the approval requests for same-level grants and owner changes. Actions marked *sensitive* there need the password re-entered.
 
+### Company sign-up
+
+A company signs itself up on a public page: one form creates the company and its owner account, and the owner is signed in at once ([0038](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0038-final-demo-scope.md), which replaces "companies created by platform staff" in [0027](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md)). It is open to anyone, so it is limited per address and for the whole platform, and it reveals as little as it can. The seed script still creates the demo companies.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant A as API
+    participant DB as MySQL
+    B->>A: POST /api/sign-up {company_name, timezone, display_name, email, password}
+    A->>A: Origin check; rate limits per address and for the platform
+    A->>A: check the fields and the password rules; hash the password
+    A->>DB: one transaction: company, its starting roles, a first department, the owner, their roles, audit entries
+    A-->>B: 201, session cookie and CSRF token (signed in as the owner)
+```
+
+**Fields**
+- `company_name`: 1 to 200 characters, surrounding spaces removed. Not unique: two businesses may share a name, and a unique name would let anyone test which companies use the platform.
+- `timezone`: an IANA name such as `America/Chicago` ([0021](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md)); the form suggests the browser's own.
+- `display_name`: the owner's name, 1 to 120 characters.
+- `email`: as for any account (one `@`, at most 254 characters, stored in lowercase, unique across the platform).
+- `password`: the password rules of [authentication](../architecture/authentication.md#passwords): 15 to 128 characters, not on the blocklist, and not containing the company's name, the person's name, or their email.
+- Any other field: 422, as for every request ([threat T2](../security/threat-model.md)).
+
+**What the new company gets**, all in one transaction, so a failure leaves nothing behind:
+1. The company row, inserted by the sign-up code in a database session with no company: the only place besides the seed script that creates companies ([tenancy](../architecture/tenancy.md)). Everything after this runs in a session for the new company.
+2. The four starting roles ([authorization](../architecture/authorization.md#starting-roles)).
+3. One department, **General**, as everyone needs a home department. The owner renames it or adds others afterwards.
+4. The owner's account with the hashed password: Owner for the whole company and Employee for General, as the seed script gives its owners. No reporting lines: the Owner is above everyone.
+5. A new session for the owner, exactly as at sign-in (a new token, `__Host-session` cookie, `csrf_token` in the answer), so the next screen is the company's setup.
+
+**Rules**
+- **Signed out only.** A request that carries a valid session is refused (409, sign out first), so a signed-in person cannot use sign-up to start a second company by accident.
+- **CSRF:** like sign-in, sign-up starts a session rather than acting in one, so it needs the `Origin` check but no CSRF token ([authentication](../architecture/authentication.md#forged-requests-csrf)).
+- **Taken email:** 409 "This email can't be used.", the same answer as everywhere else. The password is checked and hashed before the email is tried, so a taken email takes as long as a new one. This answer does say that the address has an account somewhere on the platform; without email delivery there is no way to avoid that, so the rate limits below are what keep anyone from testing addresses in bulk (threat I3, known limitations).
+- **Rate limits** (memory of the API process, like the sign-in limits; built with `app/auth/limits.py`, #50): at most **5 sign-ups per hour per address** and **200 per hour for the whole platform**. Every sign-up request counts, successful or not, and also counts toward the sign-in limit of 20 per minute per address, so switching between the two forms gains nothing. A limited request answers 429 with `Retry-After`. The address is taken from nginx's header only when the request came through nginx (as DE8 in [detection](detection.md)).
+- Sign-up never reads or changes another company's data, and it never checks an existing account's password, so it cannot be used to guess passwords.
+
+**Endpoint:** `POST /api/sign-up` `{company_name, timezone, display_name, email, password}`, for anyone not signed in; answers 201 with the same body as `POST /api/sessions` (the owner, their company, their permissions, `expires_at`, `csrf_token`). The password field is a `SecretStr`, so it is never logged, echoed, or copied by detection ([detection](detection.md)).
+
+**Audit events:** in the new company's chain, `company.created` (actor: the new owner; details: name and time zone), `department.created`, the role events of the starting roles, `user.created` (details: `{"via": "sign_up"}`), the owner's role assignments, and `auth.signed_in`. In the platform chain, `platform.company_signed_up` (details: the company's ID), so platform operators can count and review sign-ups without reading company data. A refused sign-up writes no audit entry (there is no company); it goes to the application log without the email, and counts toward the limits.
+
+**Security tests:**
+- The 6th sign-up in an hour from one address, and the 201st on the platform, answer 429 and create nothing.
+- A taken email (in any company, any case) answers exactly like every other taken email, and creates nothing; a weak password is refused before the email is tried.
+- Extra fields (`company_id`, `role`, `password_hash`) answer 422.
+- A request with a valid session is refused, and a request from a foreign `Origin` is refused.
+- The new owner sees only the new company: every cross-company test passes for a company made by sign-up.
+- No answer, log line, or audit entry contains the password or its hash (AU10).
+
+**Slices** (under tracker workforce-ops-app/.github#86; each is one pull request, no migration):
+
+| ID | Repository | Slice | Depends on |
+|---|---|---|---|
+| SU1 | backend | `POST /api/sign-up`, its limits, and the security tests above (workforce-ops-app/workforce-ops-backend#122) | this design; the rate limiter from #50 |
+| SU2 | frontend | the sign-up page (workforce-ops-app/workforce-ops-frontend#67) | SU1 |
+
 ### Backend
 
 **Endpoints** (all under `/api`, following [0026](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0026-api-conventions.md)):
 
 | Method and path | Permission | Does |
 |---|---|---|
+| `POST /sign-up` | anyone not signed in (rate limited) | create a company and its owner account, and sign the owner in ([sign-up](#company-sign-up)) |
 | `GET /departments?cursor=&limit=` | signed in | page through active departments by name (built early in #88) |
 | `GET /teams?department_id=&cursor=&limit=` | signed in | page through active teams by name, optionally of one department |
 | `POST /departments`, `PATCH /departments/{id}`, `POST /departments/{id}/archive` | `org.manage` | create, rename or set the time zone, archive |
@@ -162,7 +220,9 @@ The seed script (`python -m scripts.seed_demo`) creates the demo data for local 
 - (Next tier) An email change without a recent password re-entry is refused; an address taken between request and approval is refused at approval.
 
 ### Known limitations
-- No screen for creating companies or platform staff accounts yet; the seed script does it.
+- Companies sign up themselves (#122); there is no screen for platform staff accounts yet.
+- Sign-up says when an email already has an account somewhere on the platform (409). Email confirmation would hide that, but email delivery is stretch; until then the per-address and platform limits keep anyone from testing addresses in bulk.
+- No check that a signing-up business is real: anyone can create a company. The platform limit caps how many, and `platform.company_signed_up` lets operators review them.
 - No bulk import of people.
 - Until reporting-line endpoints exist (Z5, #56), a person's managers are set only when their account is created (and by the seed script).
 - New and reactivated accounts can sign in only once setup links exist (#57): until then they stay invited.
