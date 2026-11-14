@@ -39,6 +39,8 @@ DATA = frozenset({"SELECT", "INSERT", "UPDATE", "DELETE"})
 # Every table the application uses, with exactly the rights it gets. Keep it in the
 # order of the migrations that created the tables.
 APP_RIGHTS: dict[str, frozenset[str]] = {
+    # Company sign-up (organization.md) inserts companies and counts the ones created in
+    # the last hour (SELECT); the seed script inserts them too.
     "companies": DATA,
     "departments": DATA,
     "users": DATA,
@@ -52,7 +54,8 @@ APP_RIGHTS: dict[str, frozenset[str]] = {
     # The audit log: entries are only added and read, never changed or removed.
     "audit_events": frozenset({"SELECT", "INSERT"}),
     # A chain's head is added with its first entry, then moved on with each new entry
-    # (UPDATE; also needed to lock it with SELECT ... FOR UPDATE). Never removed.
+    # (UPDATE; also needed to lock it with SELECT ... FOR UPDATE, as sign-up does with
+    # the platform chain's head). Never removed.
     "audit_chain_heads": frozenset({"SELECT", "INSERT", "UPDATE"}),
     "shifts": DATA,
     "reporting_lines": DATA,
