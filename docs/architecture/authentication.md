@@ -4,7 +4,7 @@
 
 Decisions: [0027 authentication and sessions](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md) · [0025 sensitive actions and security settings](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md) · [0003 one address for pages and API](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0003-same-origin-deployment.md) · Threats: S1 to S5, I3, D1 in the [threat model](../security/threat-model.md)
 
-> **Status:** passwords (`app/auth/passwords.py`), sign-in with sessions (`app/auth/sessions.py`, the `sessions` endpoints, migration `0004`), and CSRF protection (`app/auth/csrf.py`) are built, and so are password re-entry and changing your own password (`app/auth/reauth.py`, #51) and lockouts and rate limits (`app/auth/limits.py`, #50); links follow in the next Phase 2 slice.
+> **Status:** passwords (`app/auth/passwords.py`), sign-in with sessions (`app/auth/sessions.py`, the `sessions` endpoints, migration `0004`), CSRF protection (`app/auth/csrf.py`), password re-entry and changing your own password (`app/auth/reauth.py`, #51), lockouts and rate limits (`app/auth/limits.py`, #50), and administrators unlocking and signing people out (`POST /api/users/{id}/unlock`, `DELETE /api/users/{id}/sessions`, in `app/modules/org/people.py`, Z3) are built; links follow in the next Phase 2 slice, and company sign-up and its limits in SU1.
 
 ## Passwords
 
@@ -99,7 +99,7 @@ Three defenses, so one mistake is not enough:
 
 **How it is built** (`app/auth/csrf.py`): a middleware checks every `POST`, `PUT`, `PATCH`, and `DELETE` before any endpoint runs, so no endpoint can forget it.
 - **The application's own address** is the `APP_ORIGIN` setting (for example `http://localhost:8080` under Docker Compose, where the frontend's nginx serves pages and API). Unset, it is the address the request was sent to, which is right when the API runs directly (`uvicorn`). The comparison ignores case and a trailing slash; a missing `Origin`, or `null`, is refused.
-- **The token** is required whenever the browser sends a session cookie, with one exception: **sign-in** (`POST /api/sessions`) is checked for `Origin` only. It starts a session rather than acting in one, and a browser may still carry the cookie of a session that already ended; demanding that dead session's token would lock the person out. A forged sign-in (signing the victim into the attacker's account) is still refused by the `Origin` check.
+- **The token** is required whenever the browser sends a session cookie, with two exceptions: **sign-in** (`POST /api/sessions`) and **company sign-up** (`POST /api/sign-up`) are checked for `Origin` only. It starts a session rather than acting in one, and a browser may still carry the cookie of a session that already ended; demanding that dead session's token would lock the person out. A forged sign-in (signing the victim into the attacker's account) is still refused by the `Origin` check.
 - The token is returned as `csrf_token` by `POST /api/sessions` and `GET /api/sessions/current`, and compared in constant time (`hmac.compare_digest`).
 - **Every refusal** is a 403 with the same message, whichever check failed, so an attacker learns nothing about which part was wrong.
 - The API does not start without `CSRF_KEY` (at least 32 characters), or when it is the same as `AUDIT_SIGNING_KEY`: one leaked secret must not weaken the other protection.
@@ -113,10 +113,12 @@ Three defenses, so one mistake is not enough:
 |---|---|---|
 | Wrong passwords for one account | 5 → locked 15 min; 10 → 30 min; 15 or more → 1 hour each time (the maximum) | `users.failed_sign_ins`, `users.locked_until` |
 | Counter reset | after a successful sign-in, or 24 hours without failures | `users` |
-| Sign-in attempts per address | 20 per minute | memory of the API process |
+| Sign-in attempts per address | 20 per minute (sign-up requests count too) | memory of the API process |
+| Company sign-ups per address | 5 per hour | memory of the API process |
+| Company sign-ups on the platform | 200 new companies per hour | database: companies created in the last hour, counted under the platform audit chain's lock ([sign-up](../features/organization.md#company-sign-up)) |
 | Requests per session | 300 per minute | memory of the API process |
 
-- A locked account gets the same answer as any failed sign-in (see [signing in](#signing-in)), so a lock does not reveal that the account exists. Only the per-address and per-session rate limits answer **429**, since they do not depend on which account was tried.
+- A locked account gets the same answer as any failed sign-in (see [signing in](#signing-in)), so a lock does not reveal that the account exists. Only the rate limits (per address, per session, and the platform sign-up limit) answer **429**, since they do not depend on which account was tried.
 - **What counts:** every wrong password for an existing account: at sign-in, at re-entry, and as the current password when changing it. Attempts on accounts without a password or deactivated ones are refused but not counted (there is no password to guess).
 - **While locked**, the password is not tried at all, not even the right one: the dummy hash takes the real one's place, so the answer takes the same time, and guesses made during a lock are neither tried nor counted. Re-entry while locked answers 403 "Too many wrong passwords" (the person is signed in, so this reveals nothing new).
 - **Locks are at the 5th, 10th, and each failure from the 15th on**; failures between those steps are counted but do not lock again.
@@ -127,7 +129,7 @@ Three defenses, so one mistake is not enough:
 - An administrator can unlock an account (`user.manage`, above the person); it is audited.
 - Repeated lockouts are recorded as security events for detection (next tier).
 - The 1 hour maximum means an attacker can delay a real user, but never lock them out for good (threat D1).
-- Rate limits are kept in memory, which is correct for one API server; they reset if it restarts. Several servers would need a shared store ([0012](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0012-extensibility-patterns.md)).
+- Rate limits are kept in memory, which is correct for one API process (the `Dockerfile` starts `uvicorn` without `--workers`); they reset if it restarts. Several processes or servers would need a shared store; the platform sign-up limit already counts in the database for that reason ([0012](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0012-extensibility-patterns.md)).
 - Failed password re-entries (below) count toward the same lockout.
 
 ## Setup and reset links
@@ -178,6 +180,7 @@ This limits the damage from a session left open on a shared computer or stolen b
 | Method and path | Who | Does |
 |---|---|---|
 | `POST /api/sessions` | anyone | sign in |
+| `POST /api/sign-up` | anyone not signed in | create a company and its owner, and sign the owner in ([organization](../features/organization.md#company-sign-up)) |
 | `GET /api/sessions/current` | signed in | current user (with their home `department_id`), their company, their effective permissions (every permission they hold somewhere, read fresh on each request; for the menu only), CSRF token (`csrf_token`) |
 | `DELETE /api/sessions/current` | signed in | sign out |
 | `DELETE /api/sessions` | signed in | sign out everywhere (own sessions) |
@@ -226,6 +229,7 @@ Entries never contain passwords, tokens, or hashes. Failed sign-ins for emails t
 | Requiring a signed-in person in an endpoint | `app/auth/dependencies.py`: a parameter typed `SignedInPerson` loads the session (401 without one) and sets its company on the request's database session; `Database` is the request's database session |
 | The session endpoints | `app/modules/sessions/` (router and response shapes; also `PUT /api/me/password`) |
 | Re-entry, `require_reauth()`, and changing your own password | `app/auth/reauth.py`; tests in `tests/unit/test_reauth_api.py` and `tests/security/test_reauth.py` (AU8 password part, AU9, AU10) |
+| Unlocking and signing someone out, deactivation ending sessions | `app/modules/org/people.py` (with the other account actions); tests in `tests/unit/test_users_api.py` and `tests/security/test_people.py` |
 | CSRF and Origin checks | `app/auth/csrf.py` |
 | Lockouts and rate limits | `app/auth/limits.py`; the per-address limit in `app/modules/sessions/router.py`, the per-session limit in `app/auth/dependencies.py`; tests in `tests/unit/test_limits.py` and `tests/security/test_lockouts.py` (AU2) |
 | Setup and reset links | `app/auth/links.py` |
