@@ -196,7 +196,7 @@ Each rule becomes a security test in `tests/security/` when the code is built. T
 | # | Rule | Threat |
 |---|---|---|
 | AZ1 | Nobody changes their own role assignments. | E1 |
-| AZ2 | Nobody adds or ends a reporting line they are part of. | E1, E4 |
+| AZ2 | Nobody adds or ends a reporting line they are part of. One exception: a new account may report to the person creating it, added with the account ([organization](../features/organization.md#states-and-rules)); a brand-new account holds nothing, so it cannot be an escalation. | E1, E4 |
 | AZ3 | Nobody grants a permission they do not hold themselves, whether by editing a role or by assigning one. | E2 |
 | AZ4 | Nobody assigns a role with a scope wider than their own for that role's permissions (a department manager cannot assign a company-wide role). | E2 |
 | AZ5 | Acting on a person (roles, account, requests) needs a position above them; peers and superiors are refused, even with the permission. | E3 |
@@ -253,4 +253,4 @@ The session endpoint returns the signed-in user's effective permissions, so the 
 | A module's scope resolver | `@scope_resolver(Model)` in the module (people: `app/authz/scope.py`) |
 | The `reporting_lines` table | `app/authz/models.py`, migration `0007` |
 | Reporting chain queries, and adding a line with its data rules (audited) | `app/authz/chain.py`; the endpoints that add and end lines are Z5 |
-| Tests | `tests/unit/test_authz.py`, `tests/security/test_authorization.py`, `tests/security/test_reporting_chain.py` (E3, E4, AZ5, AZ6); escalation tests AZ1 to AZ15 arrive with the endpoints that make those changes (Z3 to Z5) |
+| Tests | `tests/unit/test_authz.py`, `tests/security/test_authorization.py`, `tests/security/test_reporting_chain.py` (E3, E4, AZ5, AZ6), `tests/security/test_people.py` (AZ5 and AZ8 on account actions); the other escalation tests arrive with the endpoints that make those changes (Z4, Z5) |

@@ -6,7 +6,7 @@ New pages start from the [feature template](https://github.com/workforce-ops-app
 
 | Feature | Page | Tier | Status |
 |---|---|---|---|
-| Companies, departments, teams, users; demo data | [organization](organization.md) | core | design |
+| Companies, departments, teams, users; demo data | [organization](organization.md) | core | built (Z3) |
 | Roles, role assignments, reporting lines, owners, account changes | [organization](organization.md), rules in [authorization](../architecture/authorization.md) | core | design |
 | Schedules and shifts | [schedules](schedules.md) | core | design |
 | Time-off requests | [time off](time-off.md) | core | design |

@@ -38,7 +38,7 @@ from sqlalchemy.orm import Session
 from app.authz.chain import is_above_in_chain, people_below
 from app.authz.models import Role, RoleAssignment, RolePermission
 from app.authz.registry import Kind, all_permissions, get_permission
-from app.authz.scope import Grant, ScopeColumns, condition_for, covers, resolve
+from app.authz.scope import Grant, Scope, ScopeColumns, condition_for, covers, resolve
 from app.modules.org.models import Department, Team, User
 
 
@@ -205,6 +205,19 @@ def authorize(db: Session, user: User, code: str, target: object | None = None) 
         scope = resolve(db, target)
         if not any(covers(grant, scope) for grant in found) or not is_above(db, user, target):
             raise Forbidden()
+
+
+def covers_department(db: Session, user: User, code: str, department_id: uuid.UUID) -> bool:
+    """Whether the user holds the permission for people whose home is this department.
+
+    For a person who is about to be placed there: a new account, or someone moved to
+    another home department. authorize() checks the person as they are now; this checks
+    where they are going, so nobody can create or move a person into a department they
+    could not act on afterwards. A team or one-person grant cannot cover somebody who is
+    not on the team (or not that person) yet, so only company and department grants count.
+    """
+    home = Scope(frozenset({department_id}), frozenset(), None)
+    return any(covers(grant, home) for grant in grants(db, user, code))
 
 
 def scope_filter(db: Session, user: User, code: str, columns: ScopeColumns) -> ColumnElement[bool]:
