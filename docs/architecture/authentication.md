@@ -4,7 +4,7 @@
 
 Decisions: [0027 authentication and sessions](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md) · [0025 sensitive actions and security settings](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md) · [0003 one address for pages and API](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0003-same-origin-deployment.md) · Threats: S1 to S5, I3, D1 in the [threat model](../security/threat-model.md)
 
-> **Status:** passwords (`app/auth/passwords.py`), sign-in with sessions (`app/auth/sessions.py`, the `sessions` endpoints, migration `0004`), and CSRF protection (`app/auth/csrf.py`) are built, and so are password re-entry and changing your own password (`app/auth/reauth.py`, #51); lockouts and links follow in the next Phase 2 slices. Until lockouts (S4) exist, an account with `locked_until` in the future is refused, but failures are not counted yet.
+> **Status:** passwords (`app/auth/passwords.py`), sign-in with sessions (`app/auth/sessions.py`, the `sessions` endpoints, migration `0004`), CSRF protection (`app/auth/csrf.py`), administrators unlocking and signing people out (`POST /api/users/{id}/unlock`, `DELETE /api/users/{id}/sessions`, in `app/modules/org/people.py`, Z3), and password re-entry and changing your own password (`app/auth/reauth.py`, #51) are built; lockouts and links follow in the next Phase 2 slices. Until lockouts (S4) exist, an account with `locked_until` in the future is refused, but failures are not counted yet.
 
 ## Passwords
 
@@ -219,6 +219,7 @@ Entries never contain passwords, tokens, or hashes. Failed sign-ins for emails t
 | Requiring a signed-in person in an endpoint | `app/auth/dependencies.py`: a parameter typed `SignedInPerson` loads the session (401 without one) and sets its company on the request's database session; `Database` is the request's database session |
 | The session endpoints | `app/modules/sessions/` (router and response shapes; also `PUT /api/me/password`) |
 | Re-entry, `require_reauth()`, and changing your own password | `app/auth/reauth.py`; tests in `tests/unit/test_reauth_api.py` and `tests/security/test_reauth.py` (AU8 password part, AU9, AU10) |
+| Unlocking and signing someone out, deactivation ending sessions | `app/modules/org/people.py` (with the other account actions); tests in `tests/unit/test_users_api.py` and `tests/security/test_people.py` |
 | CSRF and Origin checks | `app/auth/csrf.py` |
 | Lockouts and rate limits | `app/auth/limits.py` |
 | Setup and reset links | `app/auth/links.py` |

@@ -51,6 +51,7 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 | `audit.view` | company | read the company's audit log |
 | `audit.verify` | company | run verification of the company's audit chain |
 | `security.view` | company | see the company's security events on the security page (next tier, [detection](../features/detection.md)) |
+| `announcement.create` | record | post, edit, and archive announcements for an audience in scope; see who has read them ([announcements](../features/announcements.md)) |
 | `company.transfer_ownership` | company | propose adding or removing an owner (Owner role only; other owners must agree) |
 
 Changing your own password and signing yourself out need no permission; every signed-in user can do both.
@@ -76,6 +77,7 @@ Every new company gets four roles ([0024](https://github.com/workforce-ops-app/.
 | `settings.manage` | yes | yes | | |
 | `audit.view`, `audit.verify` | yes | yes | | |
 | `security.view` | yes | yes | | |
+| `announcement.create` | yes | yes | yes | |
 | `company.transfer_ownership` | yes | | | |
 
 - **Typical scopes:** Owner and Administrator are assigned for the whole company; a Manager for their department or team; everyone gets the Employee role scoped to their **home department**, which is what lets employees see their department's schedule. An administrator can remove `schedule.view` from the Employee role to turn that off.
@@ -137,6 +139,8 @@ query.where(
 
 The filter follows exactly the rules of `authorize()` for each kind: self permissions list the user's own rows; company permissions list everything, but only with a company-wide assignment; person permissions list only people the user is above, never the user. A department's people and a team's members are looked up first (in the company's session, so the company filter applies), and the condition names their IDs; so are the people below the user in the reporting chain, for the same reason (the company filter does not accept a recursive query nested inside a query on another table). Security tests check that the filter and `authorize()` agree for every pair of people, for a record permission and two person permissions, and again along a chain with several levels, two managers, and peers (`tests/security/test_reporting_chain.py`).
 
+`ScopeColumns` names a department column and an employee column. Announcements, whose audience can be a team, add an optional `team` column (planned, AN1 in [announcements](../features/announcements.md#backend)): a team assignment then also matches its team's rows, and a department assignment its teams' rows, with the team IDs looked up first like a department's people.
+
 ## The reporting chain
 
 A `reporting_lines` row says that one person reports to another ([data model](data-model.md#reporting_lines)). Following the lines upwards gives everyone a person is **below**; the **Owner counts as above everyone**.
@@ -196,7 +200,7 @@ Each rule becomes a security test in `tests/security/` when the code is built. T
 | # | Rule | Threat |
 |---|---|---|
 | AZ1 | Nobody changes their own role assignments. | E1 |
-| AZ2 | Nobody adds or ends a reporting line they are part of. | E1, E4 |
+| AZ2 | Nobody adds or ends a reporting line they are part of. One exception: a new account may report to the person creating it, added with the account ([organization](../features/organization.md#states-and-rules)); a brand-new account holds nothing, so it cannot be an escalation. | E1, E4 |
 | AZ3 | Nobody grants a permission they do not hold themselves, whether by editing a role or by assigning one. | E2 |
 | AZ4 | Nobody assigns a role with a scope wider than their own for that role's permissions (a department manager cannot assign a company-wide role). | E2 |
 | AZ5 | Acting on a person (roles, account, requests) needs a position above them; peers and superiors are refused, even with the permission. | E3 |
@@ -255,4 +259,4 @@ The session endpoint returns the signed-in user's effective permissions, so the 
 | A module's scope resolver | `@scope_resolver(Model)` in the module (people: `app/authz/scope.py`) |
 | The `reporting_lines` table | `app/authz/models.py`, migration `0007` |
 | Reporting chain queries, and adding a line with its data rules (audited) | `app/authz/chain.py`; the endpoints that add and end lines are Z5 |
-| Tests | `tests/unit/test_authz.py`, `tests/security/test_authorization.py`, `tests/security/test_reporting_chain.py` (E3, E4, AZ5, AZ6); escalation tests AZ1 to AZ15 arrive with the endpoints that make those changes (Z3 to Z5) |
+| Tests | `tests/unit/test_authz.py`, `tests/security/test_authorization.py`, `tests/security/test_reporting_chain.py` (E3, E4, AZ5, AZ6), `tests/security/test_people.py` (AZ5 and AZ8 on account actions); the other escalation tests arrive with the endpoints that make those changes (Z4, Z5) |
