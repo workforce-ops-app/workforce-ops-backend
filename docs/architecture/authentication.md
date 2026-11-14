@@ -115,14 +115,14 @@ Three defenses, so one mistake is not enough:
 | Counter reset | after a successful sign-in, or 24 hours without failures | `users` |
 | Sign-in attempts per address | 20 per minute (sign-up requests count too) | memory of the API process |
 | Company sign-ups per address | 5 per hour | memory of the API process |
-| Company sign-ups on the platform | 200 per hour | memory of the API process |
+| Company sign-ups on the platform | 200 new companies per hour | database: companies created in the last hour, counted under the platform audit chain's lock ([sign-up](../features/organization.md#company-sign-up)) |
 | Requests per session | 300 per minute | memory of the API process |
 
-- A locked account gets the same answer as any failed sign-in (see [signing in](#signing-in)), so a lock does not reveal that the account exists. Only the per-address and per-session rate limits answer **429**, since they do not depend on which account was tried.
+- A locked account gets the same answer as any failed sign-in (see [signing in](#signing-in)), so a lock does not reveal that the account exists. Only the rate limits (per address, per session, and the platform sign-up limit) answer **429**, since they do not depend on which account was tried.
 - An administrator can unlock an account (`user.manage`, above the person); it is audited.
 - Repeated lockouts are recorded as security events for detection (next tier).
 - The 1 hour maximum means an attacker can delay a real user, but never lock them out for good (threat D1).
-- Rate limits are kept in memory, which is correct for one API server; they reset if it restarts. Several servers would need a shared store ([0012](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0012-extensibility-patterns.md)).
+- Rate limits are kept in memory, which is correct for one API process (the `Dockerfile` starts `uvicorn` without `--workers`); they reset if it restarts. Several processes or servers would need a shared store; the platform sign-up limit already counts in the database for that reason ([0012](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0012-extensibility-patterns.md)).
 - Failed password re-entries (below) count toward the same lockout.
 
 ## Setup and reset links

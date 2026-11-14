@@ -119,17 +119,28 @@ sequenceDiagram
 - Any other field: 422, as for every request ([threat T2](../security/threat-model.md)).
 
 **What the new company gets**, all in one transaction, so a failure leaves nothing behind:
-1. The company row, inserted by the sign-up code in a database session with no company: the only place besides the seed script that creates companies ([tenancy](../architecture/tenancy.md)). Everything after this runs in a session for the new company.
+1. The company row, inserted by the sign-up code in a database session with no company: the only place besides the seed script that creates companies ([tenancy](../architecture/tenancy.md)). Everything after this runs in a session for the new company, except the platform audit entry (below).
 2. The four starting roles ([authorization](../architecture/authorization.md#starting-roles)).
 3. One department, **General**, as everyone needs a home department. The owner renames it or adds others afterwards.
 4. The owner's account with the hashed password: Owner for the whole company and Employee for General, as the seed script gives its owners. No reporting lines: the Owner is above everyone.
 5. A new session for the owner, exactly as at sign-in (a new token, `__Host-session` cookie, `csrf_token` in the answer), so the next screen is the company's setup.
 
+**One transaction across sessions.** The company row must be inserted by a session with no company, and everything inside the company by a session for it, so sign-up follows `seed_company()` in `scripts/seed_demo.py`: one connection opened with `engine.begin()`, and each session created on that connection. A session given a connection that is already in a transaction only flushes; it never commits or rolls back, so the whole block commits at its end or rolls back if anything inside raises. In order:
+1. **Before the transaction:** check the fields and the password rules, and hash the password (the slow part, kept outside any lock), and apply the per-address limit.
+2. **Platform session** (no company): lock the platform audit chain's head (`SELECT ... FOR UPDATE`, as `record()` does), count the companies created in the last hour, and refuse the sign-up (429) at 200; then insert the company and flush to get its ID. Sign-ups wait for one another here, one short transaction at a time, which is also what makes the platform limit exact (below).
+3. **Company session** (`set_company` to the new ID): the starting roles, General, the owner, their role assignments, the session row, and the company chain's entries. A taken email fails here on the unique key, and the whole block rolls back.
+4. **Platform session again**: `record()` adds `platform.company_signed_up`, last, so it is written only once everything else has been flushed. Its actor is `system` (the platform chain refuses a person as actor); the new owner is in the company chain's entries.
+5. **Commit**, at the end of the block. Only then is the session cookie set and the answer sent, so a sign-up that rolled back never hands out a cookie.
+
+Lock order: the platform chain's head first, then the new company's rows (which no other transaction can see yet), so sign-ups cannot deadlock with each other. If the platform chain has no head yet, two first sign-ups can race to create it; the head's primary key lets one through, and the other rolls back completely and is retried once.
+
 **Rules**
 - **Signed out only.** A request that carries a valid session is refused (409, sign out first), so a signed-in person cannot use sign-up to start a second company by accident.
 - **CSRF:** like sign-in, sign-up starts a session rather than acting in one, so it needs the `Origin` check but no CSRF token ([authentication](../architecture/authentication.md#forged-requests-csrf)).
 - **Taken email:** 409 "This email can't be used.", the same answer as everywhere else. The password is checked and hashed before the email is tried, so a taken email takes as long as a new one. This answer does say that the address has an account somewhere on the platform; without email delivery there is no way to avoid that, so the rate limits below are what keep anyone from testing addresses in bulk (threat I3, known limitations).
-- **Rate limits** (memory of the API process, like the sign-in limits; built with `app/auth/limits.py`, #50): at most **5 sign-ups per hour per address** and **200 per hour for the whole platform**. Every sign-up request counts, successful or not, and also counts toward the sign-in limit of 20 per minute per address, so switching between the two forms gains nothing. A limited request answers 429 with `Retry-After`. The address is taken from nginx's header only when the request came through nginx (as DE8 in [detection](detection.md)).
+- **Rate limits:** at most **5 sign-ups per hour per address** and **200 new companies per hour for the whole platform**. A limited request answers 429 with `Retry-After`.
+  - **Per address** (memory of the API process, like the sign-in limits; built with `app/auth/limits.py`, #50): every sign-up request counts, successful or not, and also counts toward the sign-in limit of 20 per minute per address, so switching between the two forms gains nothing. Memory counters are per process: the limits hold because the API runs as **one process** (`uvicorn` without `--workers` in the `Dockerfile`, one container in Docker Compose). Running several would give each its own counters, so the limits per address would multiply by the number of processes (known limitations).
+  - **Platform** (database, so it holds however many processes run): the companies created in the last hour, counted inside the sign-up transaction while it holds the platform audit chain's lock (step 2 above), so two sign-ups can never both take the 200th place. It counts companies, not requests: refused requests are already capped per address. The address is taken from nginx's header only when the request came through nginx (as DE8 in [detection](detection.md)).
 - Sign-up never reads or changes another company's data, and it never checks an existing account's password, so it cannot be used to guess passwords.
 
 **Endpoint:** `POST /api/sign-up` `{company_name, timezone, display_name, email, password}`, for anyone not signed in; answers 201 with the same body as `POST /api/sessions` (the owner, their company, their permissions, `expires_at`, `csrf_token`). The password field is a `SecretStr`, so it is never logged, echoed, or copied by detection ([detection](detection.md)).
@@ -137,7 +148,9 @@ sequenceDiagram
 **Audit events:** in the new company's chain, `company.created` (actor: the new owner; details: name and time zone), `department.created`, the role events of the starting roles, `user.created` (details: `{"via": "sign_up"}`), the owner's role assignments, and `auth.signed_in`. In the platform chain, `platform.company_signed_up` (details: the company's ID), so platform operators can count and review sign-ups without reading company data. A refused sign-up writes no audit entry (there is no company); it goes to the application log without the email, and counts toward the limits.
 
 **Security tests:**
-- The 6th sign-up in an hour from one address, and the 201st on the platform, answer 429 and create nothing.
+- The 6th sign-up in an hour from one address, and the 201st company on the platform, answer 429 and create nothing.
+- Two sign-ups racing for the 200th place on MySQL: exactly one succeeds (a race check in `scripts/check_migrations.py`, like the other MySQL races).
+- **Rollback:** a sign-up that fails after part of the setup (a fault injected after the owner is added, and one in the platform audit entry), and one with a taken email, leave nothing behind: no company, role, department, account, session, or audit entry in either chain, both chain heads unchanged, and no cookie in the answer.
 - A taken email (in any company, any case) answers exactly like every other taken email, and creates nothing; a weak password is refused before the email is tried.
 - Extra fields (`company_id`, `role`, `password_hash`) answer 422.
 - A request with a valid session is refused, and a request from a foreign `Origin` is refused.
@@ -148,7 +161,7 @@ sequenceDiagram
 
 | ID | Repository | Slice | Depends on |
 |---|---|---|---|
-| SU1 | backend | `POST /api/sign-up`, its limits, and the security tests above (workforce-ops-app/workforce-ops-backend#122) | this design; the rate limiter from #50 |
+| SU1 | backend | `POST /api/sign-up` in one transaction as above, its limits, and the security tests above (workforce-ops-app/workforce-ops-backend#122) | this design; the rate limiter from #50 |
 | SU2 | frontend | the sign-up page (workforce-ops-app/workforce-ops-frontend#67) | SU1 |
 
 ### Backend
@@ -222,6 +235,8 @@ The seed script (`python -m scripts.seed_demo`) creates the demo data for local 
 ### Known limitations
 - Companies sign up themselves (#122); there is no screen for platform staff accounts yet.
 - Sign-up says when an email already has an account somewhere on the platform (409). Email confirmation would hide that, but email delivery is stretch; until then the per-address and platform limits keep anyone from testing addresses in bulk.
+- No email confirmation, so anyone can sign up with an address they do not own. The real owner of that address then cannot sign up with it (409) until platform staff free it; there is no screen for that yet. Confirmation by email would prevent it, but email delivery is stretch (0038).
+- The per-address limits are kept in the API process's memory, so they assume one API process. Running several processes or containers would need them in shared storage (for example a database table, as the platform limit already is).
 - No check that a signing-up business is real: anyone can create a company. The platform limit caps how many, and `platform.company_signed_up` lets operators review them.
 - No bulk import of people.
 - Until reporting-line endpoints exist (Z5, #56), a person's managers are set only when their account is created (and by the seed script).

@@ -62,7 +62,7 @@ flowchart LR
 
 - Never pass a company ID from the request into a query. Use the current company from the request context.
 - Never disable the filter in feature code. Platform code that must read across companies lives in a separate, clearly named module, requires platform permissions, and writes to the platform audit chain.
-- Sign-up is the one feature that runs without a company, and only for inserting the new company row: it reads nothing across companies (a taken email is found by the unique key, not by a lookup) and records the sign-up in the platform audit chain.
+- Sign-up is the one feature that runs without a company, and only for inserting the new company row: it reads no company's data (a taken email is found by the unique key, not by a lookup; the platform limit only counts the company rows created in the last hour) and records the sign-up in the platform audit chain.
 - Every new company-owned model inherits `CompanyOwned` and follows the [data model conventions](data-model.md#conventions-for-every-table); the coverage test fails for any model with a `company_id` column that does not.
 - Every new endpoint that takes an ID gets a cross-company test in `tests/security/`.
 - Return 404 for records outside the user's company, and 403 only for records **inside** the company that the user's scope does not cover.
