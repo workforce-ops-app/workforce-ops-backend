@@ -13,7 +13,7 @@ New pages start from the [feature template](https://github.com/workforce-ops-app
 | Shift coverage and swaps | not yet | next | planned |
 | Draft-and-publish schedules | not yet | next | planned |
 | Shift tasks, with photos on task notes (secure file uploads) | not yet | next | planned |
-| Announcements | not yet | next | planned |
+| Announcements | [announcements](announcements.md) | final demo | design |
 | Notifications | not yet | next | planned |
 | Company settings, display name, and logo | not yet | next | planned |
 | Audit log viewer and verification | not yet | next | planned |

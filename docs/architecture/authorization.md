@@ -51,6 +51,7 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 | `audit.view` | company | read the company's audit log |
 | `audit.verify` | company | run verification of the company's audit chain |
 | `security.view` | company | see the company's security events on the security page (built, DT5: [detection](../features/detection.md#backend)) |
+| `announcement.create` | record | post, edit, and archive announcements for an audience in scope; see who has read them ([announcements](../features/announcements.md)) |
 | `company.transfer_ownership` | company | propose adding or removing an owner (Owner role only; other owners must agree) |
 
 Changing your own password and signing yourself out need no permission; every signed-in user can do both.
@@ -76,6 +77,7 @@ Every new company gets four roles ([0024](https://github.com/workforce-ops-app/.
 | `settings.manage` | yes | yes | | |
 | `audit.view`, `audit.verify` | yes | yes | | |
 | `security.view` | yes | yes | | |
+| `announcement.create` | yes | yes | yes | |
 | `company.transfer_ownership` | yes | | | |
 
 - **Typical scopes:** Owner and Administrator are assigned for the whole company; a Manager for their department or team; everyone gets the Employee role scoped to their **home department**, which is what lets employees see their department's schedule. An administrator can remove `schedule.view` from the Employee role to turn that off.
@@ -136,6 +138,8 @@ query.where(
 ```
 
 The filter follows exactly the rules of `authorize()` for each kind: self permissions list the user's own rows; company permissions list everything, but only with a company-wide assignment; person permissions list only people the user is above, never the user. A department's people and a team's members are looked up first (in the company's session, so the company filter applies), and the condition names their IDs; so are the people below the user in the reporting chain, for the same reason (the company filter does not accept a recursive query nested inside a query on another table). Security tests check that the filter and `authorize()` agree for every pair of people, for a record permission and two person permissions, and again along a chain with several levels, two managers, and peers (`tests/security/test_reporting_chain.py`).
+
+`ScopeColumns` names a department column and an employee column. Announcements, whose audience can be a team, add an optional `team` column (planned, AN1 in [announcements](../features/announcements.md#backend)): a team assignment then also matches its team's rows, and a department assignment its teams' rows, with the team IDs looked up first like a department's people.
 
 ## The reporting chain
 
