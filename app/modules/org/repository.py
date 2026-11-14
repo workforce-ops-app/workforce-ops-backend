@@ -11,7 +11,7 @@ import json
 import uuid
 from datetime import datetime
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import ColumnElement, and_, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.modules.org.models import Department, Team, TeamMember, User
@@ -215,11 +215,87 @@ def active_team(db: Session, team_id: uuid.UUID) -> Team | None:
 # --- Team members ----------------------------------------------------------------------
 
 
-def person(db: Session, user_id: uuid.UUID) -> User | None:
-    """A person of the session's company (another company's looks like none: 404)."""
-    return db.get(User, user_id)
+def person(db: Session, user_id: uuid.UUID, *, lock: bool = False) -> User | None:
+    """A person of the session's company (another company's looks like none: 404).
+
+    lock=True locks their row until the transaction ends (SELECT ... FOR UPDATE) and reads
+    its newest committed version, replacing any copy this session already holds. Every
+    change to a person's account locks it, and so do putting someone on a team and giving
+    someone a shift: so a deactivation and a new team or shift take turns, and whichever
+    waited sees the person as the other left them.
+    """
+    return db.get(User, user_id, with_for_update=lock, populate_existing=lock)
 
 
 def membership(db: Session, team_id: uuid.UUID, user_id: uuid.UUID) -> TeamMember | None:
     """The person's membership of the team, if they are on it."""
     return db.get(TeamMember, (team_id, user_id))
+
+
+# --- People ----------------------------------------------------------------------------
+
+
+def list_people(
+    db: Session,
+    *,
+    visible: ColumnElement[bool],
+    after: tuple[str, uuid.UUID] | None,
+    limit: int,
+) -> list[User]:
+    """One page of the company's people in name order, deactivated ones included.
+
+    `visible` is the scope filter's condition (check.scope_filter): only the people the
+    user may see are ever loaded, never a whole list that is then trimmed.
+    """
+    statement = (
+        select(User)
+        .where(visible)
+        .order_by(User.display_name, User.id)
+        .limit(limit + 1)  # one more than asked: tells whether another page exists
+    )
+    if after is not None:
+        name, last_id = after
+        statement = statement.where(
+            or_(User.display_name > name, and_(User.display_name == name, User.id > last_id))
+        )
+    return list(db.scalars(statement))
+
+
+def team_ids_by_person(db: Session, user_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[uuid.UUID]]:
+    """The teams each of these people is on, in one query for a whole page of people."""
+    found: dict[uuid.UUID, list[uuid.UUID]] = {user_id: [] for user_id in user_ids}
+    if not user_ids:
+        return found
+    rows = db.execute(
+        select(TeamMember.user_id, TeamMember.team_id)
+        .where(TeamMember.user_id.in_(user_ids))
+        .order_by(TeamMember.team_id)
+    )
+    for user_id, team_id in rows:
+        found[user_id].append(team_id)
+    return found
+
+
+def upcoming_shift_ids(db: Session, user_id: uuid.UUID, now: datetime) -> list[uuid.UUID]:
+    """The person's shifts that have not ended and are not cancelled, soonest first."""
+    # Imported here for the same reason as in has_upcoming_shifts() above.
+    from app.modules.schedules.models import Shift
+
+    return list(
+        db.scalars(
+            select(Shift.id)
+            .where(Shift.employee_id == user_id, Shift.status != "cancelled", Shift.ends_at > now)
+            .order_by(Shift.starts_at, Shift.id)
+        )
+    )
+
+
+def end_sessions(db: Session, user_id: uuid.UUID) -> int:
+    """Delete every session of the person, so each of their browsers is signed out at
+    once; return how many there were. A delete with a where clause: the company filter
+    adds the company condition too, so it can only reach this company's sessions."""
+    # The sessions table belongs to the sign-in code (app/auth/); imported here, as above.
+    from app.auth.models import UserSession
+
+    result = db.execute(delete(UserSession).where(UserSession.user_id == user_id))
+    return int(result.rowcount or 0)  # type: ignore[attr-defined]
