@@ -15,8 +15,9 @@
    here on the real thing.
 5. Changes that must take turns do so in MySQL (_race_problems): two requests adding
    reporting lines at the same moment cannot add a duplicate or a loop, and two requests
-   booking one person at the same moment cannot double-book them. SQLite has no row
-   locks, so this too can only be tried on MySQL.
+   booking one person at the same moment cannot double-book them, and account changes
+   take turns with team and department changes. SQLite has no row locks, so this too
+   can only be tried on MySQL.
 
 The database is a throwaway Docker container (removed afterwards), unless
 MIGRATION_CHECK_DATABASE_URL points at an empty database to use instead.
@@ -281,6 +282,7 @@ def _race_problems(url: str) -> list[str]:
             _reporting_line_race_problems(engine)
             + _shift_race_problems(engine)
             + _org_race_problems(engine)
+            + _people_race_problems(engine)
         )
     finally:
         engine.dispose()
@@ -728,6 +730,206 @@ def _org_race_problems(engine: Engine) -> list[str]:
             thread.join(timeout=60)
         if sorted(outcomes) != ["created", "refused"]:
             problems.append(f"two departments with one name, round {number + 1}: {outcomes}")
+            break  # one failing round is enough to show the problem
+    return problems
+
+
+def _people_race_problems(engine: Engine) -> list[str]:
+    """Account changes meeting other changes at the same moment; return what failed.
+
+    Each race runs two real requests in two threads, started together, several rounds
+    (the timing differs each time). Whichever goes first, the result must keep the rules,
+    and neither request may fail with an error (a deadlock would show up here as one):
+
+    1. Two accounts with the same email: one is created, the other refused with 409.
+    2. A deactivation and putting the same person on a team: nobody joins a team after
+       being deactivated (both lock the person's row, app/modules/org/people.py). Joining
+       just before is fine: a deactivation keeps team memberships for history.
+    3. Moving a person to a department and archiving that department: never an archived
+       department that is an active person's home. Both lock the department, so they
+       take turns: the archive then sees the person who moved in, or the move sees the
+       department archived. (Without the move's lock, both succeed: tried.)
+    """
+    import threading
+
+    from sqlalchemy import or_, select
+    from sqlalchemy.orm import Session
+
+    from app.audit import Actor
+    from app.audit.models import AuditEvent
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.modules.org import people, service
+    from app.modules.org.models import Company, Department, Team, User
+    from app.modules.org.schemas import UserCreate, UserUpdate
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    with Session(engine) as platform:
+        company = Company(name="people race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # An owner, who is above everyone, so every request passes the permission checks and
+    # only the races decide the outcome.
+    with session() as db:
+        home = Department(name="Office")
+        db.add(home)
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        owner = User(
+            email="owner@people-race.example.com", display_name="owner", department_id=home.id
+        )
+        db.add(owner)
+        db.flush()
+        assign_role(db, Actor.system(), user_id=owner.id, role=roles["owner"], scope_type="company")
+        db.commit()
+        owner_id, home_id = owner.id, home.id
+
+    def together(*requests: Callable[[Session, User], str]) -> list[str]:
+        """Run the requests at the same moment, each in its own thread and session, as the
+        owner; return each one's outcome ("ok", "refused", or the error)."""
+        start = threading.Barrier(len(requests))
+        outcomes: list[str] = ["not run"] * len(requests)
+
+        def run(index: int, request: Callable[[Session, User], str]) -> None:
+            with session() as db:
+                acting = db.get(User, owner_id)
+                if acting is None:  # made above, in this company
+                    outcomes[index] = "error: the owner is missing"
+                    return
+                start.wait()
+                try:
+                    outcomes[index] = request(db, acting)
+                except service.Conflict:
+                    outcomes[index] = "refused"
+                except Exception as error:  # a 500 in the app: reported by the caller
+                    outcomes[index] = f"error: {error!r}"[:300]
+
+        threads = [threading.Thread(target=run, args=pair) for pair in enumerate(requests)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        return outcomes
+
+    def new_person(name: str) -> uuid.UUID:
+        """Someone in the owner's department, committed, for one race."""
+        with session() as db:
+            made = User(
+                email=f"{name}@people-race.example.com", display_name=name, department_id=home_id
+            )
+            db.add(made)
+            db.commit()
+            return made.id
+
+    for number in range(1, 6):
+        # 1. The same email twice.
+        def create(db: Session, acting: User, number: int = number) -> str:
+            body = UserCreate(
+                display_name="twin",
+                email=f"twin-{number}@people-race.example.com",
+                department_id=home_id,
+            )
+            people.create_person(db, acting, body)
+            return "ok"
+
+        outcomes = together(create, create)
+        if sorted(outcomes) != ["ok", "refused"]:
+            problems.append(f"two accounts with one email, round {number}: {outcomes}")
+
+        # 2. Deactivate someone while putting them on a team.
+        with session() as db:
+            team = Team(department_id=home_id, name=f"Race team {number}")
+            db.add(team)
+            db.commit()
+            team_id = team.id
+        joiner_id = new_person(f"joiner-{number}")
+
+        def deactivate(db: Session, acting: User, person_id: uuid.UUID = joiner_id) -> str:
+            people.deactivate(db, acting, person_id)
+            return "ok"
+
+        def join(
+            db: Session,
+            acting: User,
+            team_id: uuid.UUID = team_id,
+            person_id: uuid.UUID = joiner_id,
+        ) -> str:
+            service.add_member(db, acting, team_id, person_id)
+            return "ok"
+
+        outcomes = together(deactivate, join)
+        # Both may succeed, if the join went first: deactivating keeps team memberships
+        # for history. What must never happen is a join AFTER the deactivation, so the
+        # order of the two audit entries (their place in the company's chain) decides.
+        with session() as db:
+            order = {
+                action: seq
+                for action, seq in db.execute(
+                    select(AuditEvent.action, AuditEvent.seq).where(
+                        AuditEvent.chain_id == company_id,
+                        AuditEvent.action.in_(["user.deactivated", "team_member.added"]),
+                        or_(
+                            AuditEvent.target_id == joiner_id,
+                            AuditEvent.target_id == team_id,
+                        ),
+                    )
+                )
+            }
+        joined_late = (
+            "user.deactivated" in order
+            and "team_member.added" in order
+            and order["team_member.added"] > order["user.deactivated"]
+        )
+        if any(outcome.startswith("error") for outcome in outcomes) or joined_late:
+            problems.append(
+                f"deactivation and joining a team at once, round {number}: {outcomes}, "
+                f"joined after deactivation={joined_late}"
+            )
+
+        # 3. Move someone into a department while it is archived.
+        with session() as db:
+            target = Department(name=f"Race department {number}")
+            db.add(target)
+            db.commit()
+            target_id = target.id
+        mover_id = new_person(f"mover-{number}")
+
+        def move(
+            db: Session,
+            acting: User,
+            mover_id: uuid.UUID = mover_id,
+            target_id: uuid.UUID = target_id,
+        ) -> str:
+            people.change_person(db, acting, mover_id, UserUpdate(department_id=target_id))
+            return "ok"
+
+        def archive(db: Session, acting: User, target_id: uuid.UUID = target_id) -> str:
+            service.archive_department(db, acting, target_id)
+            return "ok"
+
+        outcomes = together(move, archive)
+        with session() as db:
+            moved = db.get(User, mover_id)
+            archived = db.get(Department, target_id)
+            broken = (
+                moved is not None
+                and archived is not None
+                and moved.department_id == target_id
+                and archived.archived_at is not None
+            )
+        if any(outcome.startswith("error") for outcome in outcomes) or broken:
+            problems.append(
+                f"moving into a department while it is archived, round {number}: {outcomes}"
+            )
+        if problems:
             break  # one failing round is enough to show the problem
     return problems
 
