@@ -6,14 +6,14 @@ New pages start from the [feature template](https://github.com/workforce-ops-app
 
 | Feature | Page | Tier | Status |
 |---|---|---|---|
-| Companies, departments, teams, users; demo data | [organization](organization.md) | core | design |
+| Companies, departments, teams, users; demo data | [organization](organization.md) | core | built (Z3) |
 | Roles, role assignments, reporting lines, owners, account changes | [organization](organization.md), rules in [authorization](../architecture/authorization.md) | core | design |
 | Schedules and shifts | [schedules](schedules.md) | core | design |
 | Time-off requests | [time off](time-off.md) | core | design |
 | Shift coverage and swaps | not yet | next | planned |
 | Draft-and-publish schedules | not yet | next | planned |
 | Shift tasks, with photos on task notes (secure file uploads) | not yet | next | planned |
-| Announcements | not yet | next | planned |
+| Announcements | [announcements](announcements.md) | final demo | design |
 | Notifications | not yet | next | planned |
 | Company settings, display name, and logo | the settings table and its rules: [data model](../architecture/data-model.md#company_settings); a settings screen, display name, and logo not yet | next | settings built (no API yet); the rest planned |
 | Audit log viewer and verification | not yet | next | planned |
