@@ -13,6 +13,7 @@ from collections.abc import Callable
 import pytest
 
 from app.audit import Actor
+from app.auth.models import UserSession
 from app.authz.check import Forbidden
 from app.authz.models import Role, RolePermission
 from app.authz.roles import assign_role
@@ -110,11 +111,13 @@ def test_deactivating_twice_at_once_is_refused_the_second_time(
         with people.db() as other:
             admin = other.get(User, people.ids["admin"])
             assert admin is not None
-            people_service.deactivate(other, admin, people.ids["cara"])
+            people_service.deactivate(other, admin, people.ids["cara"], session=UserSession())
 
+    # Cara holds no admin-level permission, so no password re-entry is needed: an empty
+    # session (never re-entered) is enough for both administrators.
     with people.db() as db:
         admin = db.get(User, people.ids["admin"])
         assert admin is not None
         _meanwhile(monkeypatch, other_admin_deactivates_cara)
         with pytest.raises(service.Conflict):
-            people_service.deactivate(db, admin, people.ids["cara"])
+            people_service.deactivate(db, admin, people.ids["cara"], session=UserSession())
