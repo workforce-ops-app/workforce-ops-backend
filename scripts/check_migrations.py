@@ -15,9 +15,10 @@
    here on the real thing.
 5. Changes that must take turns do so in MySQL (_race_problems): two requests adding
    reporting lines at the same moment cannot add a duplicate or a loop, and two requests
-   booking one person at the same moment cannot double-book them, and account changes
-   take turns with team and department changes. SQLite has no row locks, so this too
-   can only be tried on MySQL.
+   booking one person at the same moment cannot double-book them, account changes
+   take turns with team and department changes, and wrong passwords sent together are
+   each counted toward the lockout. SQLite has no row locks, so this too can only be
+   tried on MySQL.
 
 The database is a throwaway Docker container (removed afterwards), unless
 MIGRATION_CHECK_DATABASE_URL points at an empty database to use instead.
@@ -283,6 +284,7 @@ def _race_problems(url: str) -> list[str]:
             + _shift_race_problems(engine)
             + _org_race_problems(engine)
             + _people_race_problems(engine)
+            + _lockout_race_problems(engine)
         )
     finally:
         engine.dispose()

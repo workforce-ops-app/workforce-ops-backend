@@ -19,13 +19,17 @@ Two separate defenses:
 
 2. RATE LIMITS, per address and per session, kept in the API process's memory:
 
-       sign-in attempts per address   20 per minute
+       sign-in attempts per address   20 per minute (company sign-up requests count too)
        requests per session           300 per minute
 
    Over the limit, the answer is 429 Too Many Requests with Retry-After (seconds until
-   the minute ends). These do not depend on which account was tried, so a 429 reveals
-   nothing about accounts. The counts are for one API process, which is how the app runs;
-   they reset when it restarts (several servers would need a shared store, 0012).
+   the limit's window ends). These do not depend on which account was tried, so a 429
+   reveals nothing about accounts. Company sign-up (features/organization.md) hits the
+   per-address limit above as well, so switching between the two forms gains nothing; its
+   own limit of 5 per hour per address is a RateLimit with an hour window, and its
+   platform limit is counted in the database by the sign-up itself, not here. The counts
+   are for one API process, which is how the app runs; they reset when it restarts
+   (several servers would need a shared store, 0012).
 
 "24 hours without a failure" is read from users.updated_at: a failure writes the count,
 so updated_at is the moment of the last failure, unless something else about the account
@@ -104,7 +108,7 @@ def register_success(user: User) -> None:
 
 
 class TooManyRequests(HTTPException):
-    """429 with Retry-After: the number of seconds until the limit's minute ends."""
+    """429 with Retry-After: the number of seconds until the limit's window ends."""
 
     def __init__(self, retry_after: int) -> None:
         super().__init__(
@@ -116,41 +120,46 @@ class TooManyRequests(HTTPException):
 
 @dataclass
 class RateLimit:
-    """At most `limit` hits per key in each minute (a fixed one-minute window).
+    """At most `limit` hits per key in each window of `window` seconds (a fixed window:
+    one minute unless set otherwise, such as an hour for company sign-up).
 
-    Only the current minute's counts are kept: when a new minute starts, the old counts
-    are dropped in one go, so memory holds at most one minute of keys. A flood of new keys
-    (every request from a new address) is still bounded: past `max_keys` in one minute,
+    Only the current window's counts are kept: when a new window starts, the old counts
+    are dropped in one go, so memory holds at most one window of keys. A flood of new keys
+    (every request from a new address) is still bounded: past `max_keys` in one window,
     new keys share one overflow count with the same limit, so memory stays small and the
     flood is slowed as a whole.
 
-    A fixed window allows up to twice the limit across the moment one minute turns into
+    A fixed window allows up to twice the limit across the moment one window turns into
     the next; for slowing guessing that is fine, and it needs no per-request history.
     """
 
     limit: int
+    # The window's length in seconds; windows start at multiples of it.
+    window: int = 60
     max_keys: int = 100_000
     # Where "now" comes from, in seconds: replaceable in tests.
     clock: object = field(default=time.time)
-    _minute: int = -1
+    # Which window the counts belong to (its number since the clock's start).
+    _window_number: int = -1
     _counts: dict[object, int] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def hit(self, key: object) -> None:
         """Count one request for the key, or raise TooManyRequests (429) over the limit."""
         now = self.clock()  # type: ignore[operator]
-        minute = math.floor(now / 60)
+        number = math.floor(now / self.window)
         # One lock for the counts: requests run in several threads at once.
         with self._lock:
-            if minute != self._minute:
-                self._minute, self._counts = minute, {}
+            # A new window starts every count again.
+            if number != self._window_number:
+                self._window_number, self._counts = number, {}
             if key not in self._counts and len(self._counts) >= self.max_keys:
                 key = "overflow"
             count = self._counts.get(key, 0) + 1
             self._counts[key] = count
         if count > self.limit:
-            # Seconds left in this minute, at least 1.
-            raise TooManyRequests(max(1, math.ceil((minute + 1) * 60 - now)))
+            # Seconds left in this window, at least 1.
+            raise TooManyRequests(max(1, math.ceil((number + 1) * self.window - now)))
 
 
 def client_address(request: Request) -> str:
@@ -168,7 +177,8 @@ def client_address(request: Request) -> str:
 
 @dataclass
 class Limits:
-    """The API's rate limits, one set per app (create_app puts it in app.state.limits)."""
+    """The API's rate limits, one set per app (create_app puts it in app.state.limits).
+    Sign-in and company sign-up both hit sign_in_per_address for the request's address."""
 
     sign_in_per_address: RateLimit = field(default_factory=lambda: RateLimit(limit=20))
     requests_per_session: RateLimit = field(default_factory=lambda: RateLimit(limit=300))

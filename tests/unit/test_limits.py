@@ -68,6 +68,23 @@ def test_retry_after_is_never_zero() -> None:
     assert refused.value.headers == {"Retry-After": "1"}
 
 
+def test_a_longer_window_counts_for_its_whole_length() -> None:
+    # An hour window, as company sign-up uses for its 5 per hour per address.
+    clock = Clock(3600.0 + 600)  # 10 minutes into an hour
+    limit = RateLimit(limit=5, window=3600, clock=clock)
+    for _ in range(5):
+        limit.hit("a")
+    # A new minute is not a new window: the 6th is still refused.
+    clock.now += 120
+    with pytest.raises(TooManyRequests) as refused:
+        limit.hit("a")
+    # 48 minutes are left in this hour.
+    assert refused.value.headers == {"Retry-After": str(48 * 60)}
+    # The next hour starts every count again.
+    clock.now = 7200.0
+    limit.hit("a")
+
+
 def test_a_flood_of_new_keys_shares_one_count_and_memory_stays_bounded() -> None:
     clock = Clock(0.0)
     limit = RateLimit(limit=2, max_keys=3, clock=clock)
