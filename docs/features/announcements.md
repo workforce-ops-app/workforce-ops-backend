@@ -72,6 +72,7 @@ stateDiagram-v2
 **Read marks**
 - `POST /announcements/{id}/read` records that the signed-in person has read it. Doing it again changes nothing (still 204). Only people in the audience can mark it (otherwise 404, as if it did not exist for them).
 - The read list (`GET /announcements/{id}/reads`) shows the people in the audience now, each with when they read it, or not yet. Only people whose `announcement.create` covers the audience may see it.
+- The read list is paged like every other list ([0026](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0026-api-conventions.md)): `?cursor=&limit=`, `limit` 1 to 200 (default 50), in name order (display name, then ID), so a company-wide announcement never answers with everyone at once. The cursor is the last person's ID; if that person is no longer in the audience, the cursor is refused (422), so a cursor cannot be used to learn where someone outside the audience sorts. The totals come from `read_count` and `audience_count` on the announcement, not from counting pages.
 - Reads are not audited: they are a record of the feature, not a security action, and every page view would otherwise grow the audit chain.
 
 ### Backend
@@ -87,7 +88,7 @@ stateDiagram-v2
 | `PATCH /announcements/{id}` `{title?, body?}` | `announcement.create` covering the audience | correct the text |
 | `POST /announcements/{id}/archive` | `announcement.create` covering the audience | archive |
 | `POST /announcements/{id}/read` | in the audience | mark read (204) |
-| `GET /announcements/{id}/reads` | `announcement.create` covering the audience | who in the audience has read it, and when |
+| `GET /announcements/{id}/reads?cursor=&limit=` | `announcement.create` covering the audience | page through the people in the audience by name, each with when they read it, or not yet |
 
 An announcement in an answer: `id`, `audience` (`{type, department_id, team_id}` with names), `title`, `body`, `author` (`{id, display_name}`), `posted_at`, `edited_at`, `archived`, and for readers `read`, for managers `read_count` and `audience_count`.
 
@@ -126,6 +127,15 @@ A `CHECK` keeps the audience columns consistent: exactly the ID its type needs, 
 
 **Scope resolver:** an announcement belongs to its audience: a department audience to that department; a team audience to the team and its department; a company audience to no department, so only a company-wide assignment covers it. It belongs to no employee, so no self permission applies to it.
 
+**Managed list filter:** the managed list uses the scope filter (`scope_filter()`, [authorization](../architecture/authorization.md#lists-the-scope-filter)) so it shows exactly the announcements a direct request would allow. Today `ScopeColumns` only knows a department column and an employee column, and `condition_for()` only matches team assignments through team members' IDs, so a team audience could not be matched. AN1 extends the helper rather than writing a filter of its own:
+- `ScopeColumns` gets a third, optional `team` column. Announcements are listed with `ScopeColumns(department=Announcement.department_id, team=Announcement.team_id)` and no employee column.
+- A **team** assignment matches rows whose team column is its team (as well as, for tables that have an employee column, the team's members, as now).
+- A **department** assignment matches rows whose department column is its department, and also rows whose team column is one of the department's teams. Those team IDs are looked up first in the company's session, like a department's people today, because the company filter refuses subqueries.
+- A **company** assignment matches every row, so only it reaches company audiences (both columns are null, so no department or team assignment can match them).
+- Existing callers pass no team column and keep their current conditions.
+
+Scope tests for the filter, added with AN1: for every pair of an assignment (company, each department, each team) and an announcement (company, department, team, team of another department), the managed list contains the announcement exactly when `authorize()` allows it; a department assignment lists its teams' announcements; a team assignment lists neither its department's announcements nor another team's; a team audience whose team or department is archived is listed for nobody below company scope ([organization](organization.md#states-and-rules)).
+
 **Audience filter:** the reader's list is limited in the database to the company, the reader's home department, and the teams they are on, with the same tenancy filter as every other query ([tenancy](../architecture/tenancy.md)); announcements for other audiences are never loaded.
 
 ### Demo data
@@ -150,6 +160,8 @@ The seed script adds, in each demo company, through the same service the applica
 - Text with `<script>`, `<img onerror=...>`, and `{0.__class__}` is stored and returned exactly as typed (the frontend test checks it is shown as text).
 - The author, audience, and dates cannot be set or changed through the request body (422).
 - An archived department's announcements reach nobody.
+- The managed list agrees with `authorize()` for every assignment and audience pair (the scope tests under Managed list filter).
+- The read list answers at most 200 people per page, refuses a larger `limit` (422), and refuses a cursor naming someone outside the audience (422).
 
 ### Slices
 
@@ -157,8 +169,8 @@ Filed under tracker workforce-ops-app/.github#84 once this design merges: the ba
 
 | ID | Repository | Slice | Depends on |
 |---|---|---|---|
-| AN1 | backend | `announcements` and `announcement_reads` tables (one migration), `announcement.create` with the starting roles, the scope resolver, posting, editing, archiving, and the managed list | this design |
-| AN2 | backend | reading: the audience filter, one announcement, read marks, and the read list | AN1 |
+| AN1 | backend | `announcements` and `announcement_reads` tables (one migration), `announcement.create` with the starting roles, the scope resolver, the `team` column in `ScopeColumns` with its scope tests, posting, editing, archiving, and the managed list | this design |
+| AN2 | backend | reading: the audience filter, one announcement, read marks, and the paged read list | AN1 |
 | AN3 | backend | announcements in the demo data | AN2 |
 | AN4 | frontend | reading announcements on the home screen and the announcements page, with the bold display built safely | AN2 |
 | AN5 | frontend | posting, editing, and archiving, and the read list | AN1, AN4 |
