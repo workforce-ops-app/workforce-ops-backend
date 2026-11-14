@@ -203,7 +203,7 @@ Every table also has `created_at` and `updated_at` (`DATETIME(6)`, UTC); they ar
 | `timezone` | `VARCHAR(64)` | required; IANA zone name, e.g. `America/Chicago` |
 | `archived_at` | `DATETIME(6)` | null = active |
 
-Not itself company-owned, but protected by the company filter (`CompanyRecord`): a session working for a company sees and changes only its own row. Only platform code (a session with no company, such as the seed script) creates or archives companies.
+Not itself company-owned, but protected by the company filter (`CompanyRecord`): a session working for a company sees and changes only its own row. Only platform code (a session with no company: company sign-up and the seed script) creates or archives companies ([organization](../features/organization.md#company-sign-up)).
 
 ### departments
 
@@ -239,7 +239,7 @@ Not itself company-owned, but protected by the company filter (`CompanyRecord`):
 | `company_id` | `BINARY(16)` | required |
 | `department_id` | `BINARY(16)` | required; company-aware foreign key to `departments` (home department) |
 | `email` | `VARCHAR(254)` | required; stored in lowercase (`CHECK`); **unique across the whole platform**, so sign-in needs only an email and a password; compared exactly in MySQL (`utf8mb4_bin`), since the default comparison ignores case and accents |
-| `password_hash` | `VARCHAR(255)` | Argon2id ([0027](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md)); null until the person sets a password with their setup link |
+| `password_hash` | `VARCHAR(255)` | Argon2id ([0027](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md)); null until the person sets a password with their setup link; a company's first owner chooses one at sign-up, so it is never null for them |
 | `display_name` | `VARCHAR(120)` | required |
 | `password_changed_at` | `DATETIME(6)` | when the password was last set |
 | `failed_sign_ins` | `SMALLINT` | wrong passwords since the last success; reset after a success or 24 hours without failures |

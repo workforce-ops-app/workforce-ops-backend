@@ -244,7 +244,9 @@ def redeem(db: Session, token: str, new_password: str) -> None:
     link.used_at = now
 
     # 6. End every session of the person, on every browser: after a reset, nobody stays
-    #    signed in with the old password (threat S5, test AU8).
+    #    signed in with the old password (threat S5, test AU8). The same delete as
+    #    end_sessions() in app/modules/org/repository.py (an administrator's "sign out
+    #    everywhere"); the two could share one helper later.
     ended = db.execute(delete(UserSession).where(UserSession.user_id == person.id))
 
     # 7. Audited in the same transaction. The person acts on their own account, though no
