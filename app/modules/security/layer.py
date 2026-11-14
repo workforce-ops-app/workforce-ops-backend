@@ -100,6 +100,19 @@ def is_skipped(route: BaseRoute | RouteContext | None) -> bool:
     return bool(getattr(endpoint, _SKIP_MARK, False))
 
 
+def client_address(scope: Scope) -> str | None:
+    """The address that sent a request (rule DE8), cut to the column's length.
+
+    It is the peer uvicorn reports in scope["client"]. uvicorn replaces that with the
+    address in nginx's X-Forwarded-For header only when the connection came from an
+    allowed proxy, so a client that sends the header itself cannot change it (threat S6).
+    This is the one place the address is read: the sign-up limit per address (SU1, #122)
+    is meant to use it too, so detection and the limits always agree on who sent what.
+    """
+    client = scope.get("client")
+    return client[0][:MAX_ADDRESS_CHARS] if client else None
+
+
 def is_secret_name(name: str) -> bool:
     """Collection rule 3: whether a field's name looks like it holds a secret."""
     simple = name.lower().replace("_", "").replace("-", "")
@@ -309,13 +322,11 @@ class DetectionMiddleware:
             # 3. and 4. The answer has been sent (or the app failed): copy and hand over.
             try:
                 body = b"".join(chunks) if keep_body and body_complete and not too_big else None
-                client = scope.get("client")
-                address = client[0][:MAX_ADDRESS_CHARS] if client else None
                 copy = RequestCopy(
                     values=collect(path_params, scope.get("query_string", b""), body),
                     method=scope["method"],
                     route=getattr(route, "path", None),
-                    client_address=address,
+                    client_address=client_address(scope),
                     request_id=request_id,
                     occurred_at=occurred_at,
                     identity=state.get(IDENTITY_KEY),
