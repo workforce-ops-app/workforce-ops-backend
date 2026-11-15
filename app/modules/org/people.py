@@ -50,11 +50,14 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session
 
 from app.audit import Actor, record
+from app.auth.models import UserSession
+from app.auth.reauth import require_reauth
 from app.authz.chain import add_reporting_line, lock_reporting_lines
 from app.authz.check import (
     Forbidden,
     authorize,
     covers_department,
+    holds_admin_level,
     is_above,
     is_owner,
     scope_filter,
@@ -282,12 +285,15 @@ class Deactivated:
     upcoming_shift_ids: list[uuid.UUID]
 
 
-def deactivate(db: Session, user: User, person_id: uuid.UUID) -> Deactivated:
+def deactivate(
+    db: Session, user: User, person_id: uuid.UUID, *, session: UserSession
+) -> Deactivated:
     """Deactivate a person: they cannot sign in, and every session of theirs ends now.
 
     Their unused setup and reset links are cancelled too once links exist (#57).
-    Deactivating someone who holds an admin-level role will need the password re-entered
-    once re-entry exists (#51; authorization.md, sensitive actions).
+    Deactivating someone who holds an admin-level permission is a sensitive action: it
+    needs the password re-entered in `session` (the user's own) within the last 5 minutes
+    (authorization.md, sensitive actions).
     """
     person = _person_to_change(db, user, person_id)
     if person.deactivated_at is not None:
@@ -296,6 +302,12 @@ def deactivate(db: Session, user: User, person_id: uuid.UUID) -> Deactivated:
     # owners' approval, and the last owner never.
     if is_owner(db, person):
         raise Conflict("An owner cannot be deactivated. Remove them as an owner first.")
+    # Sensitive when the person holds an admin-level permission (by what their roles grant,
+    # custom roles included): refused with reauth-required unless the password was entered
+    # again recently in this session. Checked before anything changes; deactivating anyone
+    # else needs no re-entry.
+    if holds_admin_level(db, person):
+        require_reauth(session)
 
     person.deactivated_at = utcnow()
     # Every browser of theirs is signed out at once (load_session would also refuse a
