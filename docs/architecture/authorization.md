@@ -225,6 +225,8 @@ These need the password re-entered shortly before, as set out in [0025](https://
 - adding or ending a reporting line;
 - changing security settings.
 
+Each of these actions calls `require_reauth()` (`app/auth/reauth.py`) before it changes anything, as its endpoint is built. Deactivating an admin-level holder does so now (`deactivate()` in `app/modules/org/people.py`): "holds such a role" is read from the permissions the person's active roles grant (`holds_admin_level()` in `app/authz/check.py`), so a company's own roles count too. Still to come: the role, line, and owner actions with Z4 and Z5, security settings with #59.
+
 Schedule changes affecting 10 or more shifts show a confirmation with the count (no password re-entry). Companies may add actions to the re-entry list but never remove them.
 
 ## Audit events
