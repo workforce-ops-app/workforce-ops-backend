@@ -1,6 +1,6 @@
 # Detection and the security page
 
-- **Status:** the detector (DT3, #129: `app/detection/`) and the security event tables and their writer (DT2, #128: `app/modules/security/`) are built; the detection layer, the endpoints, and the page follow in the other slices
+- **Status:** the detector (DT3, #129: `app/detection/`), the security event tables and their writer (DT2, #128: `app/modules/security/`), and the `security.view` permission with the two read-only endpoints (DT5, #131: `app/modules/security/router.py`) are built; the detection layer and the page follow in the other slices
 - **Related:** design workforce-ops-app/workforce-ops-backend#115, detection workforce-ops-app/workforce-ops-backend#116, security page workforce-ops-app/workforce-ops-frontend#61, tracker workforce-ops-app/.github#91; refused requests workforce-ops-app/workforce-ops-backend#92; method [decision 0030](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0030-security-study-method.md); results go to the [research repository](https://github.com/workforce-ops-app/workforce-ops-research)
 
 ## In short
@@ -14,7 +14,9 @@ The API looks at the text people send it and notes anything that looks like an a
 | Manager, Employee | nothing; they never see security events, including their own | | |
 | Platform staff | events from people who were not signed in (stretch: a cross-company view) | | platform |
 
-`security.view` is a company-kind permission, so it needs a company-wide role assignment. The Owner and Administrator starting roles grant it; Manager and Employee do not ([authorization](../architecture/authorization.md#starting-roles)).
+`security.view` is a company-kind permission, so it needs a company-wide role assignment. The Owner and Administrator starting roles grant it; Manager and Employee do not ([authorization](../architecture/authorization.md#starting-roles)). It is declared in `app/modules/security/permissions.py`.
+
+Companies whose roles were created before `security.view` existed: the Owner sees the page at once (an Owner holds every registered permission), but their Administrator role does not grant it until an owner adds it through role management (Z4, #55), as for any permission a later module adds ([authorization](../architecture/authorization.md#permissions)). No data migration adds it: a role's grants change only through the audited role rules (AZ12). A local demo database gets it by being reset and seeded again.
 
 ## How it works
 
@@ -151,6 +153,11 @@ Both tables are kept for **1 year**, then removed by a nightly job (data model, 
 
 There is no endpoint to change or remove events. Both endpoints read only `security_events`, filtered to the session's company by the tenancy layer like every other table; `platform_security_events` has no endpoint.
 
+- **List filters:** `kind` is one of `detection.sql_injection`, `detection.xss`, `detection.path_traversal`, `detection.command_injection`, `detection.format_string`, or `detection.summary` (anything else: 422); `user_id` is a person (another company's person matches nothing, an empty page); `from` and `to` are days in the company's time zone, both included. Paged with `cursor` (the last event's ID, looked up in the company) and `limit` (1 to 200, default 50).
+- **An event in an answer:** `id`, `kind`, `pattern_id`, `field`, `method`, `route`, `user_id`, `user_name`, `client_address`, `request_id`, `excerpt` (exactly as stored), `count`, `occurred_at` (UTC).
+- **The summary:** `{"kinds": [{"kind", "last_7_days", "last_30_days"}]}` for every kind above, zero included, counted back from now. A summary row adds its `count` (the events the rate cap held back), not 1.
+- Reads are not audited. Errors: 401 not signed in, 403 without `security.view`, 422 invalid filters.
+
 ### Frontend
 
 The security page (workforce-ops-app/workforce-ops-frontend#61): counts per type at the top, then the event list with filters. Each row shows the time, type, pattern, field, route, person (or "not signed in"), address, and excerpt. Every value is set with `textContent`.
@@ -164,7 +171,7 @@ The security page (workforce-ops-app/workforce-ops-frontend#61): counts per type
   - the caps hold (DE4, DE6): after 20 events a source gets exactly one summary row with the right count, and no row is ever updated;
   - a full queue never slows a request (DE11): with the worker paused, requests still answer at normal speed and the drops are counted;
   - the excerpt survives as plain text (DE7);
-  - company separation (DE9): another company's events answer 404, and a Manager gets 403; a sign-in attempt with an attack string in the email, for an account of a real company, writes nothing to that company's `security_events`; a request without a session writes only to `platform_security_events`.
+  - company separation (DE9): another company's events never appear in the list, under any filter, or in the summary, and a bookmark naming one is refused; a Manager and an Employee get 403 on both endpoints, their own events included; `platform_security_events` is never read (built, `tests/security/test_security_events_api.py`); a sign-in attempt with an attack string in the email, for an account of a real company, writes nothing to that company's `security_events`; a request without a session writes only to `platform_security_events`.
 - Reading the security page is not audited, like other reads.
 
 ### Known limitations
