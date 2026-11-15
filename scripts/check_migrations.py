@@ -757,6 +757,7 @@ def _people_race_problems(engine: Engine) -> list[str]:
 
     from app.audit import Actor
     from app.audit.models import AuditEvent
+    from app.auth.models import UserSession
     from app.authz.roles import assign_role, create_starting_roles
     from app.modules.org import people, service
     from app.modules.org.models import Company, Department, Team, User
@@ -853,7 +854,9 @@ def _people_race_problems(engine: Engine) -> list[str]:
         joiner_id = new_person(f"joiner-{number}")
 
         def deactivate(db: Session, acting: User, person_id: uuid.UUID = joiner_id) -> str:
-            people.deactivate(db, acting, person_id)
+            # The joiner holds no admin-level permission, so no password re-entry is
+            # needed: an empty session (never re-entered) is enough.
+            people.deactivate(db, acting, person_id, session=UserSession())
             return "ok"
 
         def join(
