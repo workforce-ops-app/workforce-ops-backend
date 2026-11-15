@@ -26,12 +26,18 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import UTC_DATETIME, Base
 from app.db.types import UUIDBinary, new_id
+from app.detection.patterns import KINDS
 from app.tenancy.filter import CompanyOwned
 
 # The kinds of rows (the `kind` column). detection.<type> for each attack type the
 # detector knows (app/detection/patterns.py); later authz.denied and csrf.refused (#92).
 SUMMARY = "detection.summary"  # how many events the rate cap held back (DE6)
 DROPPED = "detection.dropped"  # how many request copies a full queue dropped (DE11)
+
+# The kinds a company's security_events can hold, in the order the security page shows
+# them: one per attack type, then the rate cap's summary rows. detection.dropped is never
+# here: drops belong to no company, so they are only in platform_security_events.
+COMPANY_KINDS = (*(f"detection.{kind}" for kind in KINDS), SUMMARY)
 
 
 class _EventColumns:

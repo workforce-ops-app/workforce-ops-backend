@@ -226,7 +226,7 @@ def change_person(
 
 @users.post("/{user_id}/deactivate")
 def deactivate(user_id: uuid.UUID, current: SignedInPerson, db: Database) -> DeactivatedOut:
-    done = people.deactivate(db, current.user, user_id)
+    done = people.deactivate(db, current.user, user_id, session=current.session)
     shown = _one_person(db, done.person)
     return DeactivatedOut(**shown.model_dump(), upcoming_shift_ids=done.upcoming_shift_ids)
 

