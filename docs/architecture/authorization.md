@@ -50,7 +50,7 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 | `settings.manage` | company | change company settings, including security settings |
 | `audit.view` | company | read the company's audit log |
 | `audit.verify` | company | run verification of the company's audit chain |
-| `security.view` | company | see the company's security events on the security page (next tier, [detection](../features/detection.md)) |
+| `security.view` | company | see the company's security events on the security page (built, DT5: [detection](../features/detection.md#backend)) |
 | `announcement.create` | record | post, edit, and archive announcements for an audience in scope; see who has read them ([announcements](../features/announcements.md)) |
 | `company.transfer_ownership` | company | propose adding or removing an owner (Owner role only; other owners must agree) |
 
@@ -225,7 +225,7 @@ These need the password re-entered shortly before, as set out in [0025](https://
 - adding or ending a reporting line;
 - changing security settings.
 
-Each of these actions calls `require_reauth()` (`app/auth/reauth.py`) before it changes anything, as its endpoint is built: deactivating an admin-level holder once #138 merges, the role, line, and owner actions with Z4 and Z5, security settings with #59.
+Each of these actions calls `require_reauth()` (`app/auth/reauth.py`) before it changes anything, as its endpoint is built. Deactivating an admin-level holder does so now (`deactivate()` in `app/modules/org/people.py`): "holds such a role" is read from the permissions the person's active roles grant (`holds_admin_level()` in `app/authz/check.py`), so a company's own roles count too. Still to come: the role, line, and owner actions with Z4 and Z5, security settings with #59.
 
 Schedule changes affecting 10 or more shifts show a confirmation with the count (no password re-entry). Companies may add actions to the re-entry list but never remove them.
 

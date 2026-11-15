@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from app.audit.models import AuditEvent
 from app.auth.models import UserSession
-from app.authz.models import ReportingLine, Role, RoleAssignment
+from app.authz.models import ReportingLine, Role, RoleAssignment, RolePermission
 from app.db.base import utcnow
 from app.modules.org.models import User
 from tests.people_data import actions, people, person
@@ -318,6 +318,54 @@ def test_an_owner_cannot_be_deactivated(people: ShiftSetup) -> None:
     response = people.browser("owner").post(f"/api/users/{people.ids['dana']}/deactivate")
     assert response.status_code == 409 and "owner" in response.json()["detail"]
     assert person(people, "dana").deactivated_at is None
+
+
+def test_deactivating_an_admin_level_holder_needs_the_password_again(people: ShiftSetup) -> None:
+    """A sensitive action (authorization.md): the Administrator holds user.manage and the
+    other admin-level permissions, so the owner must re-enter the password first."""
+    owner = people.browser("owner")
+    url = f"/api/users/{people.ids['admin']}/deactivate"
+
+    # 1. No re-entry in this session yet: refused, with the type the interface looks for,
+    #    and nothing changed.
+    refused = owner.post(url)
+    assert refused.status_code == 403
+    assert refused.json()["type"] == "reauth-required"
+    assert person(people, "admin").deactivated_at is None
+    assert actions(people, "user.deactivated") == []
+
+    # 2. The password entered again on this browser: the same request now works.
+    assert (
+        owner.post("/api/sessions/current/reauth", json={"password": PASSWORD}).status_code == 204
+    )
+    done = owner.post(url)
+    assert done.status_code == 200 and done.json()["status"] == "deactivated"
+    assert actions(people, "user.deactivated") == ["user.deactivated"]
+
+
+def test_a_custom_role_with_an_admin_level_permission_counts_too(people: ShiftSetup) -> None:
+    """Admin-level is read from what a person's roles grant, not from the role's name: a
+    company's own role that includes settings.manage makes deactivating its holder
+    sensitive, just like the built-in Administrator role."""
+    with people.db() as db:
+        custom = Role(name="Office lead")
+        db.add(custom)
+        db.flush()
+        db.add(RolePermission(role_id=custom.id, permission_code="settings.manage"))
+        db.add(RoleAssignment(user_id=people.ids["cara"], role_id=custom.id, scope_type="company"))
+        db.commit()
+    owner = people.browser("owner")
+    url = f"/api/users/{people.ids['cara']}/deactivate"
+    assert owner.post(url).json()["type"] == "reauth-required"
+    owner.post("/api/sessions/current/reauth", json={"password": PASSWORD})
+    assert owner.post(url).status_code == 200
+
+
+def test_deactivating_an_ordinary_employee_needs_no_reentry(people: ShiftSetup) -> None:
+    # Ana holds only the Employee role: the administrator, who has not re-entered the
+    # password in this session, deactivates her straight away.
+    done = people.browser("admin").post(f"/api/users/{people.ids['ana']}/deactivate")
+    assert done.status_code == 200
 
 
 def test_reactivating_goes_back_to_invited(people: ShiftSetup) -> None:

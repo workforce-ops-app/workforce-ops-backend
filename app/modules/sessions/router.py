@@ -94,7 +94,7 @@ def create_session(
     minute from one address, successful or not; past that the answer is 429 before any
     password is checked (app/auth/limits.py)."""
     request.app.state.limits.sign_in_per_address.hit(client_address(request))
-    result = sign_in(db, body.email, body.password)
+    result = sign_in(db, body.email, body.password.get_secret_value())
     if result is None:
         raise HTTPException(status_code=401, detail=SIGN_IN_FAILED)
     # The browser's previous session, if any, ends now: it gets only the new token.
@@ -127,7 +127,7 @@ def delete_all_sessions(response: Response, current: SignedInPerson, db: Databas
 def reauth(body: ReauthRequest, current: SignedInPerson, db: Database) -> None:
     """Enter the password again: sensitive actions are allowed for 5 minutes on this
     browser. A wrong password is 403 (and recorded); the session itself stays."""
-    reauthenticate(db, current, body.password)
+    reauthenticate(db, current, body.password.get_secret_value())
 
 
 @me.put("/password")
@@ -141,7 +141,12 @@ def put_password(
     """Change your own password. Every other browser is signed out, and this one gets a new
     session (a new cookie and a new CSRF token, both in this answer)."""
     try:
-        changed = change_password(db, current, body.current_password, body.new_password)
+        changed = change_password(
+            db,
+            current,
+            body.current_password.get_secret_value(),
+            body.new_password.get_secret_value(),
+        )
     except PasswordRejected as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     new = changed.signed_in

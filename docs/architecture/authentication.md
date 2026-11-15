@@ -164,7 +164,7 @@ Sensitive actions ([list](authorization.md#sensitive-actions)) need the password
 2. The interface asks for the password and sends `POST /api/sessions/current/reauth {password}`.
 3. On success (204) the session's `reauth_at` is set, and the interface repeats the original request. A wrong password answers 403 "That password is not right." and is recorded as `auth.reauth_failed`; the session stays signed in.
 
-This limits the damage from a session left open on a shared computer or stolen by an attacker who does not know the password (threat S2). Wrong passwords here count toward the lockout (once lockouts exist, #50).
+This limits the damage from a session left open on a shared computer or stolen by an attacker who does not know the password (threat S2). Wrong passwords here count toward the lockout, and no password is tried while the account is locked (`app/auth/limits.py`, #50).
 
 - **Per session:** a re-entry counts only in the session it was made in, so entering the password on one browser opens nothing on another.
 - **In code:** a sensitive action calls `require_reauth(current.session)` (`app/auth/reauth.py`) before it changes anything; it raises `ReauthRequired`, which the error handler turns into the `reauth-required` [problem type](../user/errors.md#problem-types).
