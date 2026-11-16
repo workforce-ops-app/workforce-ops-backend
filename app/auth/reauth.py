@@ -15,8 +15,10 @@ How it works, step by step:
 3. The interface repeats the original request, which now passes.
 
 The re-entry belongs to one session: entering the password on one browser does not count
-on another. A wrong password is recorded as auth.reauth_failed; once lockouts exist (#50)
-it also counts toward the account's lockout, like a wrong password at sign-in.
+on another. A wrong password is recorded as auth.reauth_failed and counts toward the
+account's lockout, like a wrong password at sign-in (app/auth/limits.py). While the
+account is locked, no password is tried here at all: someone holding the session cannot
+keep guessing through re-entry once sign-in has locked them out.
 
 Changing your own password needs the current password too (an open session must not be
 enough to lock the real owner out). It ends every session of the person and gives this
@@ -32,12 +34,13 @@ from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from app.audit import Actor, record
+from app.auth.limits import is_locked, register_failure, register_success
 from app.auth.models import UserSession
 from app.auth.passwords import check_password, hash_password, needs_rehash, verify_password
 from app.auth.sessions import Current, SignedIn, new_token
 from app.db.base import utcnow
 from app.db.types import new_id
-from app.modules.org.models import Company
+from app.modules.org.models import Company, User
 
 # How long a re-entry counts (decision 0025).
 REAUTH_WINDOW = timedelta(minutes=5)
@@ -66,6 +69,16 @@ class WrongPassword(HTTPException):
         super().__init__(status_code=403, detail=WRONG_PASSWORD)
 
 
+class Locked(HTTPException):
+    """403: too many wrong passwords; the account is locked for now. The person is
+    signed in, so saying so reveals nothing they do not know."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=403, detail="Too many wrong passwords. Wait a while and try again."
+        )
+
+
 def require_reauth(session: UserSession) -> None:
     """Refuse (ReauthRequired) unless the password was entered in this session within the
     last 5 minutes. Sensitive actions call this before changing anything."""
@@ -73,11 +86,23 @@ def require_reauth(session: UserSession) -> None:
         raise ReauthRequired()
 
 
-def _matches(current: Current, password: str) -> bool:
-    """Whether the password is the signed-in person's own. Someone signed in always has a
-    password (no session starts without one); the check is there for safety."""
+def _matches(db: Session, current: Current, password: str) -> bool:
+    """Whether the password is the signed-in person's own, counted for the lockout: a
+    wrong one counts as a failure, a right one starts the count again. Refuses (Locked)
+    without trying the password while the account is locked. Someone signed in always
+    has a password (no session starts without one); the None check is there for safety."""
+    # The person's row, locked and read fresh, so wrong passwords sent at the same moment
+    # are each counted (the same reason as at sign-in, app/auth/sessions.py).
+    db.get(User, current.user.id, with_for_update=True, populate_existing=True)
+    now = utcnow()
+    if is_locked(current.user, now):
+        raise Locked()
     stored = current.user.password_hash
-    return stored is not None and verify_password(stored, password)
+    if stored is not None and verify_password(stored, password):
+        register_success(current.user)
+        return True
+    register_failure(db, current.user, now)
+    return False
 
 
 def _record_failure(db: Session, current: Current, during: str) -> None:
@@ -97,7 +122,7 @@ def _record_failure(db: Session, current: Current, during: str) -> None:
 def reauthenticate(db: Session, current: Current, password: str) -> None:
     """Check the password again; on success, sensitive actions are allowed for 5 minutes in
     this session. Raises WrongPassword (403) if it is not right."""
-    if not _matches(current, password):
+    if not _matches(db, current, password):
         _record_failure(db, current, "reauth")
         raise WrongPassword()
     # Right. As at sign-in, a hash made with older, weaker settings is renewed now, while
@@ -127,7 +152,7 @@ def change_password(
     user = current.user
     # 1. The current password first: someone who only has the session learns nothing more,
     #    not even whether a new password would pass the rules.
-    if not _matches(current, current_password):
+    if not _matches(db, current, current_password):
         _record_failure(db, current, "password_change")
         raise WrongPassword()
     # 2. The same rules as every password (app/auth/passwords.py): length, the blocklist,
