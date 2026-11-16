@@ -113,7 +113,7 @@ How the layer applies these rules (`app/modules/security/layer.py`):
 - **The request ID** is made by the layer and kept in the request's state, so the log line for the same request (#92) can use the same one.
 - **A failure in the layer** is logged without any of the request's values and never reaches the request (DE1). The copy is made after the answer has been sent; only if the application failed unexpectedly is it made before the 500 goes out, which costs a few microseconds.
 
-The worker (`app/modules/security/worker.py`) runs in one thread started with the application. It takes one copy at a time, waking at least every 10 seconds. Events the writer could not save are written again with the next copy, at most 1,000 of them (the oldest beyond that are let go, and the loss is logged), so a long database outage cannot grow memory without bound. On a clean stop it handles what is still queued and writes every count it holds.
+The worker (`app/modules/security/worker.py`) runs in one thread started with the application. It takes one copy at a time, waking at least every 10 seconds. Events the writer could not save are written again with the next copy, at most 1,000 of them (the oldest beyond that are let go, and the loss is logged), so a long database outage cannot grow memory without bound. On a clean stop it handles what is still queued, tries the unsaved events once more (even when no copy is left to carry them), and writes every count it holds.
 
 ### Rate cap and queue
 

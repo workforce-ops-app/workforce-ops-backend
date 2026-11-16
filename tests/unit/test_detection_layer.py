@@ -426,6 +426,29 @@ def test_stop_handles_the_queue_and_writes_what_is_held() -> None:
     assert writer.closed
 
 
+def test_stop_saves_unsaved_events_when_the_database_is_back() -> None:
+    """Unsaved events normally go again with the next copy. If the database recovers
+    and the application stops before another copy arrives, stop() still saves them."""
+    writer = FakeWriter(fail_next=1)
+    worker = _worker(writer)
+    worker.submit(_copy([("a", XSS)]))
+    worker.drain()
+    assert writer.written == []  # the write failed; the event is held for later
+    worker.stop()  # the database is back, and no other copy came
+    [batch] = writer.written
+    assert [event.field for event in batch] == ["a"]
+    assert writer.closed
+
+
+def test_stop_still_closes_when_the_unsaved_events_fail_again() -> None:
+    writer = FakeWriter(fail_next=2)
+    worker = _worker(writer)
+    worker.submit(_copy([("a", XSS)]))
+    worker.drain()
+    worker.stop()  # still failing: logged and let go, but the summaries are written
+    assert writer.written == [] and writer.closed
+
+
 def test_an_idle_worker_never_opens_a_connection() -> None:
     def no_writer() -> Any:
         raise AssertionError("the writer was made")

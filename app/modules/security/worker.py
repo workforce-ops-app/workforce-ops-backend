@@ -17,7 +17,8 @@ gone out (rule DE2), so detection never makes a request slower:
    names exactly those events (EventWriteError.unsaved); they are written again with the
    next copy, so nothing saved is written twice and nothing unsaved is lost, up to
    MAX_RETRY events (beyond that the oldest are let go and the loss is logged, so a long
-   database outage cannot grow memory without bound).
+   database outage cannot grow memory without bound). A clean stop tries them once more
+   even when no copy is left, so a database that recovered before the stop loses nothing.
 4. Each time it takes a copy, and at least every 10 seconds, ask the writer to write the
    summary rows of minutes that have ended, and once a minute write the drop count.
 
@@ -215,8 +216,8 @@ class DetectionWorker:
                 logger.error("Detection worker step failed")
 
     def stop(self) -> None:
-        """Stop the thread, handle what is still queued, and write every count still
-        held (the application is stopping), so a clean stop loses nothing."""
+        """Stop the thread, handle what is still queued, and write every event and count
+        still held (the application is stopping), so a clean stop loses nothing."""
         if self._thread is not None:
             self._stopping.set()
             # Wake the thread at once. If the queue is full, it is busy with the queue
@@ -227,6 +228,10 @@ class DetectionWorker:
             self._thread = None
         try:
             self.drain()
+            # Events that failed earlier are only tried again with the next copy, and
+            # there may be none left: try them once more (an empty list sends just them).
+            # If they fail again, _write() logs it and they are lost with the process.
+            self._write([])
             self._write_drops()
             if self._writer is not None:
                 self._writer.close()
