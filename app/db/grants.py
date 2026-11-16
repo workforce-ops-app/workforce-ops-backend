@@ -63,6 +63,10 @@ APP_RIGHTS: dict[str, frozenset[str]] = {
     # (scripts/remove_old_security_events.py); never changed.
     "security_events": frozenset({"SELECT", "INSERT", "DELETE"}),
     "platform_security_events": frozenset({"SELECT", "INSERT", "DELETE"}),
+    # A company's chosen settings (app/settings/): added the first time a setting is
+    # changed, then changed in place (UPDATE; also needed to lock the row with SELECT ...
+    # FOR UPDATE while it changes). Never removed: no setting goes back to "no row".
+    "company_settings": frozenset({"SELECT", "INSERT", "UPDATE"}),
 }
 
 # Alembic's own bookkeeping: only the migrations user needs it.
