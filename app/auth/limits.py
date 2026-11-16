@@ -146,20 +146,29 @@ class RateLimit:
 
     def hit(self, key: object) -> None:
         """Count one request for the key, or raise TooManyRequests (429) over the limit."""
-        now = self.clock()  # type: ignore[operator]
-        number = math.floor(now / self.window)
-        # One lock for the counts: requests run in several threads at once.
+        # One lock for the counts: requests run in several threads at once. The clock is
+        # read inside it too: read outside, a thread delayed between reading the clock and
+        # taking the lock could arrive after another thread had moved on to the next
+        # window, and turn the window back, dropping that window's counts.
         with self._lock:
-            # A new window starts every count again.
-            if number != self._window_number:
+            now = self.clock()  # type: ignore[operator]
+            number = math.floor(now / self.window)
+            if number > self._window_number:
+                # A new window starts every count again.
                 self._window_number, self._counts = number, {}
+            else:
+                # The same window, or a clock that stepped back (the system time was
+                # corrected): windows only ever move forward, so count in the current one.
+                number = self._window_number
             if key not in self._counts and len(self._counts) >= self.max_keys:
                 key = "overflow"
             count = self._counts.get(key, 0) + 1
             self._counts[key] = count
         if count > self.limit:
-            # Seconds left in this window, at least 1.
-            raise TooManyRequests(max(1, math.ceil((number + 1) * self.window - now)))
+            # Seconds left in this window, at least 1 and at most the window's length (a
+            # clock that stepped back could otherwise make it longer).
+            left = math.ceil((number + 1) * self.window - now)
+            raise TooManyRequests(min(self.window, max(1, left)))
 
 
 def client_address(request: Request) -> str:

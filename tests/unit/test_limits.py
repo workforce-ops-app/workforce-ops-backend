@@ -1,5 +1,6 @@
 """The lockout schedule and the rate limiter on their own (app/auth/limits.py)."""
 
+import threading
 from datetime import timedelta
 
 import pytest
@@ -98,3 +99,59 @@ def test_a_flood_of_new_keys_shares_one_count_and_memory_stays_bounded() -> None
     assert len(limit._counts) == 4  # a, b, c, and the overflow
     # The keys already known keep their own counts.
     limit.hit("a")
+
+
+class DelayedClock:
+    """A clock for the window boundary race. The thread named "late" reads a time just
+    before the minute ends, then is held up (as a busy server could hold it) until the
+    other thread is done or a short wait runs out. Every other thread reads a time just
+    after the new minute started."""
+
+    def __init__(self) -> None:
+        # Set once the late thread has read its time.
+        self.late_has_read = threading.Event()
+        # Set once the other thread's requests are done.
+        self.others_done = threading.Event()
+
+    def __call__(self) -> float:
+        if threading.current_thread().name == "late":
+            self.late_has_read.set()
+            # Held up after reading the clock. If the limiter reads the clock while holding
+            # its lock (as it must), the other thread cannot run now, so this wait just
+            # runs out.
+            self.others_done.wait(timeout=0.3)
+            return 59.9
+        return 60.5
+
+
+def test_a_delayed_request_cannot_turn_the_window_back() -> None:
+    # Review of #144: a request that read the clock in the old minute but reached the
+    # counts after the new minute began used to reset them to the old minute, dropping the
+    # new minute's counts and letting more requests through than the limit allows.
+    clock = DelayedClock()
+    limit = RateLimit(limit=2, clock=clock)
+    # 1. The late request reads the clock (the old minute) and is held up.
+    late = threading.Thread(target=limit.hit, args=("a",), name="late")
+    late.start()
+    assert clock.late_has_read.wait(timeout=5)
+    # 2. Meanwhile two requests arrive in the new minute: the limit's full count.
+    limit.hit("a")
+    limit.hit("a")
+    clock.others_done.set()
+    late.join(timeout=5)
+    assert not late.is_alive()
+    # 3. The new minute's two requests are still counted, so a third is refused.
+    with pytest.raises(TooManyRequests):
+        limit.hit("a")
+
+
+def test_a_clock_that_steps_back_keeps_the_current_window() -> None:
+    # The system time can be corrected backward. Windows only move forward, so the
+    # counts are kept, and Retry-After is never longer than one window.
+    clock = Clock(660.0 + 10)
+    limit = RateLimit(limit=1, clock=clock)
+    limit.hit("a")
+    clock.now = 600.0 + 10  # a minute back
+    with pytest.raises(TooManyRequests) as refused:
+        limit.hit("a")
+    assert refused.value.headers == {"Retry-After": "60"}
