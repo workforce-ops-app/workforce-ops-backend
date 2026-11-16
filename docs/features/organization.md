@@ -115,7 +115,7 @@ sequenceDiagram
 - `timezone`: an IANA name such as `America/Chicago` ([0021](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md)); the form suggests the browser's own.
 - `display_name`: the owner's name, 1 to 120 characters.
 - `email`: as for any account (one `@`, at most 254 characters, stored in lowercase, unique across the platform).
-- `password`: the password rules of [authentication](../architecture/authentication.md#passwords): 15 to 128 characters, not on the blocklist, and not containing the company's name, the person's name, or their email.
+- `password`: the password rules of [authentication](../architecture/authentication.md#passwords): 15 to 128 characters, not on the blocklist, and not containing the company's name, the person's name, or their email. A new company has not chosen any settings yet, so the minimum is the platform default of 15 (the default of its `auth.password_min_length` setting, [company settings](../architecture/data-model.md#company_settings)).
 - Any other field: 422, as for every request ([threat T2](../security/threat-model.md)).
 
 **What the new company gets**, all in one transaction, so a failure leaves nothing behind:
@@ -124,6 +124,8 @@ sequenceDiagram
 3. One department, **General**, as everyone needs a home department. The owner renames it or adds others afterwards.
 4. The owner's account with the hashed password: Owner for the whole company and Employee for General, as the seed script gives its owners. No reporting lines: the Owner is above everyone.
 5. A new session for the owner, exactly as at sign-in (a new token, `__Host-session` cookie, `csrf_token` in the answer), so the next screen is the company's setup.
+
+No company settings rows are created: a missing row means the platform default ([company settings](../architecture/data-model.md#company_settings)), so a new company starts on every default and the owner can make rules stricter later.
 
 **One transaction across sessions.** The company row must be inserted by a session with no company, and everything inside the company by a session for it, so sign-up follows `seed_company()` in `scripts/seed_demo.py`: one connection opened with `engine.begin()`, and each session created on that connection. A session given a connection that is already in a transaction only flushes; it never commits or rolls back, so the whole block commits at its end or rolls back if anything inside raises. In order:
 1. **Before the transaction:** check the fields and the password rules, and hash the password (the slow part, kept outside any lock), and apply the per-address limit.

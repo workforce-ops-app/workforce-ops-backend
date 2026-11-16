@@ -41,6 +41,7 @@ from app.auth.sessions import Current, SignedIn, new_token
 from app.db.base import utcnow
 from app.db.types import new_id
 from app.modules.org.models import Company, User
+from app.settings.service import password_min_length
 
 # How long a re-entry counts (decision 0025).
 REAUTH_WINDOW = timedelta(minutes=5)
@@ -156,12 +157,18 @@ def change_password(
         _record_failure(db, current, "password_change")
         raise WrongPassword()
     # 2. The same rules as every password (app/auth/passwords.py): length, the blocklist,
-    #    and not the person's or the company's name.
+    #    and not the person's or the company's name. The length is the company's own
+    #    minimum (its auth.password_min_length setting, never below the platform's 15), so
+    #    a company that asks for longer passwords gets them here too.
     company = db.get(Company, user.company_id)
     if company is None:  # the session's own company is always visible to it
         raise RuntimeError("the signed-in person's company is missing")
     check_password(
-        new_password, company_name=company.name, email=user.email, display_name=user.display_name
+        new_password,
+        company_name=company.name,
+        email=user.email,
+        display_name=user.display_name,
+        min_length=password_min_length(db),
     )
 
     # 3. Save the new password (only its Argon2id hash).

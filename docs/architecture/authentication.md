@@ -21,7 +21,7 @@ The blocklist is `app/auth/common-passwords.txt`: the UK National Cyber Security
 
 The starting settings take about 0.1 s per hash on a developer laptop; they are raised towards 0.5 s once there is a server to measure on, and existing passwords are re-hashed at their next sign-in (`needs_rehash`).
 
-Companies may raise the minimum length (up to 64), never lower it ([0025](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md)). When the hashing settings are raised later, each password is re-hashed with the new settings the next time its owner signs in.
+Companies may raise the minimum length (up to 64), never lower it ([0025](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md)): the company setting `auth.password_min_length` ([company settings](data-model.md#company_settings)). Wherever a person sets a password, the check passes the company's minimum, `check_password(..., min_length=password_min_length(db))`; `check_password` itself also keeps any minimum it is given between 15 and 64, so a wrong number can never weaken the rule. When the hashing settings are raised later, each password is re-hashed with the new settings the next time its owner signs in.
 
 **Why a slow hash for passwords but a fast one for tokens?** Passwords are short and chosen by people, so an attacker with the hashes could try billions of guesses; Argon2id makes each guess expensive. Session and link tokens are 256-bit random values that cannot be guessed, so a fast SHA-256 is enough to keep them useless if the database leaks.
 
