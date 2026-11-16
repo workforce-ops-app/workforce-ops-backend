@@ -53,6 +53,12 @@ services:
       # The address browsers use: the frontend's nginx, which serves the pages and passes
       # /api on (decision 0003). Changes must come from it (the Origin check).
       APP_ORIGIN: ${APP_ORIGIN:-http://localhost:8080}
+      # Whose X-Forwarded-For header uvicorn believes: only the containers on the shared
+      # network (the frontend's nginx), never the network's gateway, which is where
+      # browsers on this computer come from. uvicorn then takes the right-most address
+      # it does not trust, the one nginx added, so a browser cannot choose its own
+      # address for the sign-in limit by sending the header (app/auth/limits.py).
+      FORWARDED_ALLOW_IPS: ${SHARED_CONTAINER_RANGE:-172.30.250.128/25}
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
     # Start the API only once MySQL reports healthy, so its first requests do not fail.
@@ -69,6 +75,12 @@ networks:
   # Shared with the frontend's nginx, which forwards /api here; MySQL is not on it.
   workforce-ops:
     name: ${SHARED_NETWORK:-workforce-ops}
+    # A fixed address plan, so the API can tell nginx from everyone else: containers get
+    # addresses from the upper half only, and the gateway (.1) stays outside it.
+    ipam:
+      config:
+        - subnet: ${SHARED_SUBNET:-172.30.250.0/24}
+          ip_range: ${SHARED_CONTAINER_RANGE:-172.30.250.128/25}
 
 volumes:
   db-data:

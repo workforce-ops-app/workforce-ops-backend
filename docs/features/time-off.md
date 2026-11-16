@@ -68,7 +68,7 @@ stateDiagram-v2
 
 - **Whole days only**, from a first to a last day (at most 30 days per request), stored as `DATE` in the employee's workplace zone ([0021](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md)). The first day is **tomorrow or later**, so every request can be reviewed before it starts.
 - **No overlap:** a new request may not overlap the employee's own pending, escalated, or approved requests (409).
-- **Required approvals:** a company setting, `time_off.required_approvals`, default **1**, counted among the direct managers ([company settings](../architecture/data-model.md#company_settings)). If fewer direct managers can review than required, administrators are told the setting is misconfigured and all available direct managers are required instead.
+- **Required approvals:** a company setting, `time_off.required_approvals`, default **1** (a company may choose 1 to 5, never 0, declared in `app/modules/time_off/settings.py`), counted among the direct managers ([company settings](../architecture/data-model.md#company_settings)). If fewer direct managers can review than required, administrators are told the setting is misconfigured and all available direct managers are required instead.
 - **Outcome among direct managers:**
   - enough approvals and no denial: **approved**;
   - denials and no approval: **denied**;

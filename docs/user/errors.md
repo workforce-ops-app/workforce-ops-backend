@@ -19,7 +19,7 @@ Media type `application/problem+json`:
 
 | Field | Meaning |
 |---|---|
-| `type` | always `about:blank` for now (no custom problem types yet) |
+| `type` | `about:blank`, except for the problem types below that the interface acts on |
 | `title` | the standard phrase for the status code |
 | `status` | the HTTP status code, repeated in the body |
 | `detail` | a short explanation for this case, when there is one |
@@ -38,6 +38,12 @@ Media type `application/problem+json`:
 ```
 
 `location` says where the problem is (`path`, `query`, or `body`, then the field name). The value that was sent is never copied back.
+
+## Problem types
+
+| `type` | Status | Meaning | What the interface does |
+|---|---|---|---|
+| `reauth-required` | 403 | a sensitive action needs the password entered in this session within the last 5 minutes ([authentication](../architecture/authentication.md#password-re-entry-for-sensitive-actions)) | asks for the password, sends `POST /api/sessions/current/reauth`, and repeats the request once (`js/api/client.js`) |
 
 **Unexpected errors (500)** add an `error_id`:
 

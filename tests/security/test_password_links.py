@@ -27,6 +27,7 @@ from app.authz.models import ReportingLine, Role
 from app.authz.roles import assign_role
 from app.db.base import utcnow
 from app.modules.org.models import User
+from app.settings.models import CompanySetting
 from tests.shift_data import BASE_URL, PASSWORD, ShiftSetup, shifts
 
 __all__ = ["shifts"]  # the fixture, imported so pytest finds it here
@@ -158,6 +159,42 @@ def test_a_password_that_breaks_the_rules_does_not_use_up_the_link(links: ShiftS
     )
     assert response.status_code == 422 and "15 characters" in response.json()["detail"]
     # The person can try again with a better one.
+    assert _redeem(links, token) == 204
+
+
+def test_a_link_follows_the_companys_own_minimum_length(links: ShiftSetup) -> None:
+    """A company that asks for longer passwords gets them through links too, not only
+    when people change their own (auth.password_min_length, app/settings/service.py)."""
+    with links.db() as db:
+        db.add(CompanySetting(module="auth", setting_key="password_min_length", value=30))
+        db.commit()
+    token = _token(links, "owner", "newbie")
+    # 27 characters: enough for the platform's 15, not for this company's 30.
+    assert _redeem(links, token, "a brand new long passphrase") == 422
+    assert _redeem(links, token, "a brand new and much longer passphrase") == 204
+
+
+def test_twenty_tries_a_minute_from_one_address(links: ShiftSetup) -> None:
+    """Redeeming shares sign-in's limit per address (app/auth/limits.py): nobody can try
+    tokens, or make the server hash passwords, without limit. Past 20 the answer is 429,
+    before the token is even looked up, so a real link waits too."""
+    token = _token(links, "owner", "newbie")
+    browser = TestClient(
+        links.app,  # type: ignore[arg-type]
+        base_url=BASE_URL,
+        headers={"Origin": BASE_URL},
+        client=("192.0.2.30", 50000),
+    )
+    body = {"token": "x" * 43, "new_password": NEW_PASSWORD}
+    statuses = [
+        browser.post("/api/password-links/redeem", json=body).status_code for _ in range(21)
+    ]
+    assert statuses == [400] * 20 + [429]
+    real = browser.post(
+        "/api/password-links/redeem", json={"token": token, "new_password": NEW_PASSWORD}
+    )
+    assert real.status_code == 429
+    # From another address the real link still works.
     assert _redeem(links, token) == 204
 
 

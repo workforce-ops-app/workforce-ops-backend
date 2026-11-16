@@ -2,13 +2,15 @@
 
     POST /api/users/{id}/setup-link     201  a link for a new account (user.manage, above them)
     POST /api/users/{id}/reset-link     201  a link for a forgotten password (the same rule)
-    POST /api/password-links/redeem     204  set a password with a link (anyone holding one)
+    POST /api/password-links/redeem     204  set a password with a link (anyone holding one;
+                                             20 tries a minute per address, with sign-in)
 
 The rules live in app/auth/links.py; this file only turns HTTP into calls and back.
 
 Errors: 400 the link does not work (one answer for every reason), 401 not signed in,
 403 not allowed, 404 no such person (or another company's), 409 the kind of link does not
-fit the account, 422 invalid input or a password that breaks a rule.
+fit the account, 422 invalid input or a password that breaks a rule, 429 too many tries
+from one address.
 """
 
 import uuid
@@ -18,6 +20,7 @@ from fastapi import APIRouter, Request
 
 from app.auth import links
 from app.auth.dependencies import Database, SignedInPerson
+from app.auth.limits import client_address
 from app.modules.password_links.schemas import LinkCreated, RedeemRequest
 
 people = APIRouter(prefix="/api/users", tags=["password links"])
@@ -57,8 +60,11 @@ def create_reset_link(
 
 
 @redeeming.post("/redeem", status_code=204)
-def redeem_link(body: RedeemRequest, db: Database) -> None:
-    """Set a password with a link. Nobody is signed in: the link is the proof."""
+def redeem_link(body: RedeemRequest, request: Request, db: Database) -> None:
+    """Set a password with a link. Nobody is signed in: the link is the proof. Attempts
+    count toward the same 20 a minute per address as sign-in (app/auth/limits.py), so
+    nobody can try links, or make the server hash passwords, without limit."""
+    request.app.state.limits.sign_in_per_address.hit(client_address(request))
     links.redeem(db, body.token.get_secret_value(), body.new_password.get_secret_value())
 
 

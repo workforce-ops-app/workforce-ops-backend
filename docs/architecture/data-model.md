@@ -4,7 +4,7 @@
 
 Decisions behind this page: [0016 tenancy](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0016-tenant-isolation.md) · [0017 scoped roles](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0017-scoped-role-assignments.md) · [0018 audit](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0018-audit-log-chains.md) · [0019 IDs](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0019-uuidv7-ids.md) · [0020 deletion](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md) · [0021 time](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md) · [0022 SQLAlchemy](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0022-sqlalchemy-and-alembic.md)
 
-> **Status:** partly built. `companies`, `departments`, `teams`, `users`, and `team_members` exist (`app/modules/org/models.py`, migration `0002`), and so do the audit log (`0003`), sessions (`0004`), permissions, roles, and role assignments (`0005`), shifts (`0006`), `reporting_lines` (`app/authz/models.py`, migration `0007`), and `one_time_tokens` (`app/auth/models.py`, migration `0009`); the other tables are created when the features that need them are built. Feature tables (time off, coverage and swaps, tasks, announcements, notifications) are documented on their feature pages.
+> **Status:** partly built. `companies`, `departments`, `teams`, `users`, and `team_members` exist (`app/modules/org/models.py`, migration `0002`), and so do the audit log (`0003`), sessions (`0004`), permissions, roles, and role assignments (`0005`), shifts (`0006`), `reporting_lines` (`app/authz/models.py`, migration `0007`), and `one_time_tokens` (`app/auth/models.py`, migration `0010`); the other tables are created when the features that need them are built. Feature tables (time off, coverage and swaps, tasks, announcements, notifications) are documented on their feature pages.
 
 **How to read this page:** the [diagram](#overview-diagram) is a summary. The [entities](#entities) and [relationships](#relationships) sections are the detailed, authoritative version. A change to a table updates all three (see [adding a table](#adding-a-table)).
 
@@ -440,7 +440,16 @@ Details, notes, and event text are written by users, so they are shown as plain 
 | `setting_key` | `VARCHAR(80)` | setting name within the module |
 | `value` | `JSON` | validated against the module's declared type |
 
-Primary key: `(company_id, module, setting_key)`. A missing row means "use the default".
+Primary key: `(company_id, module, setting_key)`. A missing row means "use the default". Migration `0009` creates the table; existing companies need no rows, and neither do new ones: sign-up and the seed script create none, so every new company starts on the defaults.
+
+**The registry** (`app/settings/registry.py`): each module declares its settings in `app/modules/<feature>/settings.py` as a list named `SETTINGS`, and the shared layers declare theirs in the registry itself, as permissions are declared. Each declaration has a type (whole numbers for now), a platform **default**, a platform **limit**, and which direction is **stricter**. A company may only choose a value from the default to the limit: stricter than the platform, never weaker (rule AZ10, threat E7). The value is checked against the declaration both when it is chosen and every time it is read, so a weaker value written straight into the table is ignored (the default applies, and the application log says so). Settings are read with `setting_value()` and changed with `change_setting()` (`app/settings/service.py`), only in a session for one company; each change is audited as `settings.changed`. Changing settings through the API is next tier; that endpoint will need `settings.manage` and the password re-entered ([0025](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md)).
+
+| Setting | Declared in | Default | Companies may choose | Used by |
+|---|---|---|---|---|
+| `auth.password_min_length` | `app/settings/registry.py` | 15 | 15 to 64 (longer is stricter) | every password a person sets (`check_password(min_length=password_min_length(db))`): changing one's own password (`PUT /api/me/password`) and the demo seed |
+| `time_off.required_approvals` | `app/modules/time_off/settings.py` | 1 | 1 to 5 (more is stricter) | time-off approval ([time off](../features/time-off.md)), when it is built |
+
+"From the default to the limit" means a company that chose 20 may later go back to 16, but never below 15. Two changes of the same setting at the same moment take turns on an existing row; the very first change of a setting by two requests at once would make one of them fail on the primary key, which matters only once the settings endpoint exists.
 
 ### audit_chain_heads
 

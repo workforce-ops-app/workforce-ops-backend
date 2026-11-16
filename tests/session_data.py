@@ -28,6 +28,7 @@ from app.db.base import Base, utcnow
 from app.db.session import get_session
 from app.main import create_app
 from app.modules.org.models import Company, Department, Team, TeamMember, User
+from app.settings.models import CompanySetting
 from app.tenancy.context import set_company
 from tests.audit_data import TEST_KEY, use_key
 from tests.conftest import TEST_CSRF_KEY
@@ -53,6 +54,8 @@ TABLES = [
     RolePermission.__table__,
     RoleAssignment.__table__,
     ReportingLine.__table__,
+    # Company settings: changing a password reads the company's minimum length.
+    CompanySetting.__table__,
 ]
 
 

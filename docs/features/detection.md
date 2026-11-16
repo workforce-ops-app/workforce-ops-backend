@@ -1,6 +1,6 @@
 # Detection and the security page
 
-- **Status:** the detector (DT3, #129: `app/detection/`) and the security event tables and their writer (DT2, #128: `app/modules/security/`) are built; the detection layer, the endpoints, and the page follow in the other slices
+- **Status:** the detector (DT3, #129: `app/detection/`), the security event tables and their writer (DT2, #128: `app/modules/security/`), the `security.view` permission with the two read-only endpoints (DT5, #131: `app/modules/security/router.py`), and demo security events in the seed script (DT6, #132: `scripts/seed_demo.py`) are built; the detection layer and the page follow in the other slices
 - **Related:** design workforce-ops-app/workforce-ops-backend#115, detection workforce-ops-app/workforce-ops-backend#116, security page workforce-ops-app/workforce-ops-frontend#61, tracker workforce-ops-app/.github#91; refused requests workforce-ops-app/workforce-ops-backend#92; method [decision 0030](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0030-security-study-method.md); results go to the [research repository](https://github.com/workforce-ops-app/workforce-ops-research)
 
 ## In short
@@ -14,7 +14,9 @@ The API looks at the text people send it and notes anything that looks like an a
 | Manager, Employee | nothing; they never see security events, including their own | | |
 | Platform staff | events from people who were not signed in (stretch: a cross-company view) | | platform |
 
-`security.view` is a company-kind permission, so it needs a company-wide role assignment. The Owner and Administrator starting roles grant it; Manager and Employee do not ([authorization](../architecture/authorization.md#starting-roles)).
+`security.view` is a company-kind permission, so it needs a company-wide role assignment. The Owner and Administrator starting roles grant it; Manager and Employee do not ([authorization](../architecture/authorization.md#starting-roles)). It is declared in `app/modules/security/permissions.py`.
+
+Companies whose roles were created before `security.view` existed: the Owner sees the page at once (an Owner holds every registered permission), but their Administrator role does not grant it until an owner adds it through role management (Z4, #55), as for any permission a later module adds ([authorization](../architecture/authorization.md#permissions)). No data migration adds it: a role's grants change only through the audited role rules (AZ12). A local demo database gets it by being reset and seeded again.
 
 ## How it works
 
@@ -125,7 +127,7 @@ Events with a company and events without one are kept in **separate tables**, so
 | `id` | `BINARY(16)` | primary key (UUIDv7) |
 | `company_id` | `BINARY(16)` | required; the session's company (DE9) |
 | `user_id` | `BINARY(16)` | required; the person whose session sent the request; company-aware foreign key to `users` |
-| `kind` | `VARCHAR(50)` | `detection.<type>` (for example `detection.xss`), `detection.summary` (DE6); later `authz.denied` and `csrf.refused` (#92) |
+| `kind` | `VARCHAR(50)` | `detection.<type>` (for example `detection.xss`), `detection.summary` (DE6), `audit.chain_broken` (an audit chain failed its check, [audit log](../architecture/audit-log.md#verification)); later `authz.denied` and `csrf.refused` (#92) |
 | `pattern_id` | `VARCHAR(20)` | which pattern matched; null for non-detection kinds |
 | `field` | `VARCHAR(100)` | where the value was, for example `query.search` or `body.note` |
 | `method`, `route` | `VARCHAR(10)`, `VARCHAR(200)` | the route template (`/api/shifts/{shift_id}`), not the raw path |
@@ -135,7 +137,7 @@ Events with a company and events without one are kept in **separate tables**, so
 | `count` | `INT` | 1, or how many events a summary row stands for |
 | `occurred_at` | `DATETIME(6)` | UTC |
 
-**`platform_security_events`:** events from requests without a valid session, which belong to no company. The same columns **without `company_id` and `user_id`**, so a row cannot point at a company or a person even by mistake. Its kinds are the detection kinds, `detection.dropped` (DE11), and later `auth.lockout` (#92): a lockout happens before anyone is signed in, so it is a platform event too.
+**`platform_security_events`:** events from requests without a valid session, which belong to no company. The same columns **without `company_id` and `user_id`**, so a row cannot point at a company or a person even by mistake. Its kinds are the detection kinds, `detection.dropped` (DE11), `audit.chain_broken` (the nightly audit check found a broken chain; which one is only in the application log), and later `auth.lockout` (#92): a lockout happens before anyone is signed in, so it is a platform event too.
 - It is **not** `CompanyOwned`, so the tenancy coverage test lists it as a stated exception, next to the audit tables, with the reason.
 - Only the detection writer inserts into it, in a database session with no company. No endpoint reads it: the platform view is a stretch goal and gets its own permission and checks when it is designed.
 - A company's session can never see these rows, because no company query touches this table, and the table has no company column a mistaken filter could match.
@@ -151,9 +153,14 @@ Both tables are kept for **1 year**, then removed by a nightly job (data model, 
 
 There is no endpoint to change or remove events. Both endpoints read only `security_events`, filtered to the session's company by the tenancy layer like every other table; `platform_security_events` has no endpoint.
 
+- **List filters:** `kind` is one of `detection.sql_injection`, `detection.xss`, `detection.path_traversal`, `detection.command_injection`, `detection.format_string`, `detection.summary`, or `audit.chain_broken` (anything else: 422); `user_id` is a person (another company's person matches nothing, an empty page); `from` and `to` are days in the company's time zone, both included. Paged with `cursor` (the last event's ID, looked up in the company) and `limit` (1 to 200, default 50).
+- **An event in an answer:** `id`, `kind`, `pattern_id`, `field`, `method`, `route`, `user_id`, `user_name`, `client_address`, `request_id`, `excerpt` (exactly as stored), `count`, `occurred_at` (UTC).
+- **The summary:** `{"kinds": [{"kind", "last_7_days", "last_30_days"}]}` for every kind above, zero included, counted back from now. A summary row adds its `count` (the events the rate cap held back), not 1.
+- Reads are not audited. Errors: 401 not signed in, 403 without `security.view`, 422 invalid filters.
+
 ### Frontend
 
-The security page (workforce-ops-app/workforce-ops-frontend#61): counts per type at the top, then the event list with filters. Each row shows the time, type, pattern, field, route, person (or "not signed in"), address, and excerpt. Every value is set with `textContent`.
+The security page (workforce-ops-app/workforce-ops-frontend#61): counts per type at the top, then the event list with filters. The seed script gives both demo companies events to show before any real traffic exists ([organization: demo data](organization.md#demo-data)). Each row shows the time, type, pattern, field, route, person (or "not signed in"), address, and excerpt. Every value is set with `textContent`.
 
 ### Audit and security
 
@@ -164,7 +171,7 @@ The security page (workforce-ops-app/workforce-ops-frontend#61): counts per type
   - the caps hold (DE4, DE6): after 20 events a source gets exactly one summary row with the right count, and no row is ever updated;
   - a full queue never slows a request (DE11): with the worker paused, requests still answer at normal speed and the drops are counted;
   - the excerpt survives as plain text (DE7);
-  - company separation (DE9): another company's events answer 404, and a Manager gets 403; a sign-in attempt with an attack string in the email, for an account of a real company, writes nothing to that company's `security_events`; a request without a session writes only to `platform_security_events`.
+  - company separation (DE9): another company's events never appear in the list, under any filter, or in the summary, and a bookmark naming one is refused; a Manager and an Employee get 403 on both endpoints, their own events included; `platform_security_events` is never read (built, `tests/security/test_security_events_api.py`); a sign-in attempt with an attack string in the email, for an account of a real company, writes nothing to that company's `security_events`; a request without a session writes only to `platform_security_events`.
 - Reading the security page is not audited, like other reads.
 
 ### Known limitations

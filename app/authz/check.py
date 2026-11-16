@@ -149,6 +149,23 @@ def is_owner(db: Session, user: User) -> bool:
     return found is not None
 
 
+# The admin-level permissions (authorization.md, "Sensitive actions"): changing who holds
+# them, or deactivating someone who does, needs the password re-entered.
+ADMIN_LEVEL = frozenset(
+    {"user.manage", "role.manage", "role.assign", "reporting_line.manage", "settings.manage"}
+)
+
+
+def holds_admin_level(db: Session, person: User) -> bool:
+    """Whether the person holds an admin-level permission anywhere right now.
+
+    Read from the permissions their roles actually grant (effective_permissions), not from
+    role names, so a company's own roles count as soon as they include one of these codes.
+    Archived roles and assignments for archived scopes grant nothing, so they do not count.
+    """
+    return not ADMIN_LEVEL.isdisjoint(effective_permissions(db, person))
+
+
 def is_above(db: Session, user: User, person: User) -> bool:
     """Whether the user is above the person in the reporting chain.
 

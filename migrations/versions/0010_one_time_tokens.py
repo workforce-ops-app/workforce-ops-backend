@@ -1,7 +1,7 @@
 """Add the one_time_tokens table: setup and reset links.
 
-Revision: 0009
-Revises: 0008
+Revision: 0010
+Revises: 0009
 
 As in data-model.md and app/auth/models.py (decision 0027). Company-owned like every
 company table: the person and the administrator who created the link are both linked
@@ -19,8 +19,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import mysql
 
-revision: str = "0009"
-down_revision: str | None = "0008"
+revision: str = "0010"
+down_revision: str | None = "0009"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

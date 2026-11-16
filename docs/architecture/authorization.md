@@ -50,7 +50,7 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 | `settings.manage` | company | change company settings, including security settings |
 | `audit.view` | company | read the company's audit log |
 | `audit.verify` | company | run verification of the company's audit chain |
-| `security.view` | company | see the company's security events on the security page (next tier, [detection](../features/detection.md)) |
+| `security.view` | company | see the company's security events on the security page (built, DT5: [detection](../features/detection.md#backend)) |
 | `announcement.create` | record | post, edit, and archive announcements for an audience in scope; see who has read them ([announcements](../features/announcements.md)) |
 | `company.transfer_ownership` | company | propose adding or removing an owner (Owner role only; other owners must agree) |
 
@@ -208,7 +208,7 @@ Each rule becomes a security test in `tests/security/` when the code is built. T
 | AZ7 | Nobody reviews their own request. | E5 |
 | AZ8 | The last owner cannot be removed, demoted, or deactivated; owners are added and removed only through the owner approval flow. | E6 |
 | AZ9 | The Owner role's permissions cannot be changed. | E6 |
-| AZ10 | Security settings can only be made stricter, within platform limits. | E7 |
+| AZ10 | Security settings can only be made stricter, within platform limits. Enforced for every company setting by the settings registry (`app/settings/registry.py`): a value must lie between the platform default and the platform limit ([company settings](data-model.md#company_settings)). | E7 |
 | AZ11 | Every endpoint enforces its permission on the server, whatever the interface shows. | E8 |
 | AZ12 | Every role, permission, assignment, reporting line, ownership, and approval change writes an audit entry. | R1 |
 | AZ13 | A role can be changed, renamed, or archived only by someone above every current holder (or the Owner). | E9 |
@@ -225,6 +225,8 @@ These need the password re-entered shortly before, as set out in [0025](https://
 - adding or ending a reporting line;
 - changing security settings.
 
+Each of these actions calls `require_reauth()` (`app/auth/reauth.py`) before it changes anything, as its endpoint is built. Deactivating an admin-level holder does so now (`deactivate()` in `app/modules/org/people.py`): "holds such a role" is read from the permissions the person's active roles grant (`holds_admin_level()` in `app/authz/check.py`), so a company's own roles count too. Still to come: the role, line, and owner actions with Z4 and Z5, security settings with #59.
+
 Schedule changes affecting 10 or more shifts show a confirmation with the count (no password re-entry). Companies may add actions to the re-entry list but never remove them.
 
 ## Audit events
@@ -237,6 +239,7 @@ Schedule changes affecting 10 or more shifts show a confirmation with the count 
 | `reporting_line.added`, `reporting_line.ended` | a reporting line starts or ends |
 | `ownership.owner_added`, `ownership.owner_removed` | an owner change takes effect |
 | `approval.requested`, `approval.approved`, `approval.denied`, `approval.not_reviewed`, `approval.cancelled` | a same-level grant or owner change is requested, decided, or lapses (details: kind, who) |
+| `settings.changed` | a company setting changes (details: `setting`, `old`, `new`); written by `change_setting()` in `app/settings/service.py` |
 
 Refused requests (403) are not audit entries: they are recorded as security events for detection (next tier), with the permission and the kind of target, never the record's contents.
 

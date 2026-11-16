@@ -1,8 +1,8 @@
 """One error format for the whole API: RFC 9457 "problem details" (decision 0026).
 
 Every error response has the media type application/problem+json and the fields "type"
-("about:blank"), "title" (the standard phrase for the status, e.g. "Not Found"), "status",
-and, where useful, "detail".
+("about:blank", or a type the interface acts on, such as "reauth-required"), "title" (the
+standard phrase for the status, e.g. "Not Found"), "status", and, where useful, "detail".
 
 - HTTP errors (Starlette's HTTPException, which also covers FastAPI's): unknown paths (404),
   wrong methods (405), and errors raised on purpose, e.g. HTTPException(403, "Not allowed").
@@ -35,7 +35,9 @@ async def http_exception_handler(request: Request, exc: Exception) -> JSONRespon
     return JSONResponse(
         status_code=exc.status_code,
         content={
-            "type": "about:blank",
+            # "about:blank" (the status says it all), unless the error names a type of its
+            # own that the interface acts on, such as "reauth-required" (app/auth/reauth.py).
+            "type": getattr(exc, "problem_type", "about:blank"),
             "title": HTTPStatus(exc.status_code).phrase,
             "status": exc.status_code,
             "detail": str(exc.detail),

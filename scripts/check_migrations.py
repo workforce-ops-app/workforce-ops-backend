@@ -15,9 +15,10 @@
    here on the real thing.
 5. Changes that must take turns do so in MySQL (_race_problems): two requests adding
    reporting lines at the same moment cannot add a duplicate or a loop, and two requests
-   booking one person at the same moment cannot double-book them, account changes take
-   turns with team and department changes, and one setup link used twice at the same
-   moment sets a password only once. SQLite has no row locks, so this too can only be
+   booking one person at the same moment cannot double-book them, account changes
+   take turns with team and department changes, wrong passwords sent together are
+   each counted toward the lockout, and one setup link used twice at the same moment
+   sets a password only once. SQLite has no row locks, so this too can only be
    tried on MySQL.
 
 The database is a throwaway Docker container (removed afterwards), unless
@@ -284,6 +285,7 @@ def _race_problems(url: str) -> list[str]:
             + _shift_race_problems(engine)
             + _org_race_problems(engine)
             + _people_race_problems(engine)
+            + _lockout_race_problems(engine)
             + _link_race_problems(engine)
         )
     finally:
@@ -736,6 +738,82 @@ def _org_race_problems(engine: Engine) -> list[str]:
     return problems
 
 
+def _lockout_race_problems(engine: Engine) -> list[str]:
+    """Wrong passwords for one account sent at the same moment; return what failed.
+
+    Each sign-in locks the account's row before it reads the count of wrong passwords
+    (app/auth/sessions.py). Without that, guesses sent together would each read the same
+    count and each write it plus one, so a burst of parallel guesses would count as one
+    and never reach the lockout. Six guesses sent together must take turns: the first
+    five are counted and the fifth locks the account, so the sixth is refused as locked
+    without being tried or counted. Without the lock they all read the same count, and
+    the account ends up below 5 and unlocked (tried).
+    """
+    import threading
+
+    from sqlalchemy.orm import Session
+
+    from app.audit import Actor
+    from app.auth import sessions
+    from app.auth.passwords import hash_password
+    from app.authz.roles import create_starting_roles
+    from app.modules.org.models import Company, Department, User
+    from app.tenancy.context import set_company
+
+    with Session(engine) as platform:
+        company = Company(name="lockout race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+    with Session(engine) as db:
+        set_company(db, company_id)
+        home = Department(name="Office")
+        db.add(home)
+        db.flush()
+        create_starting_roles(db, Actor.system())
+        person = User(
+            email=f"guessed-{company_id.hex}@lockout-race.example.com",
+            display_name="guessed",
+            department_id=home.id,
+            password_hash=hash_password("the real long passphrase here"),
+        )
+        db.add(person)
+        db.commit()
+        person_id, address = person.id, person.email
+
+    guesses = 6
+    start = threading.Barrier(guesses)
+    errors: list[str] = []
+
+    def guess() -> None:
+        # Each guess is its own request, in a session with no company yet, as at sign-in.
+        with Session(engine) as db:
+            start.wait()
+            try:
+                if sessions.sign_in(db, address, "a wrong guess"):
+                    errors.append("a wrong password signed in")
+            except Exception as error:  # a 500 in the app: reported below
+                errors.append(f"error: {error!r}"[:300])
+
+    threads = [threading.Thread(target=guess) for _ in range(guesses)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+    with Session(engine) as db:
+        set_company(db, company_id)
+        guessed = db.get(User, person_id)
+        counted = guessed.failed_sign_ins if guessed is not None else None
+        locked = guessed is not None and guessed.locked_until is not None
+    problems = [f"wrong passwords at the same moment: {error}" for error in errors]
+    if counted != 5 or not locked:
+        problems.append(
+            f"{guesses} wrong passwords at the same moment counted {counted} (expected 5, "
+            f"then locked), locked={locked}"
+        )
+    return problems
+
+
 def _link_race_problems(engine: Engine) -> list[str]:
     """Setup and reset links used and replaced at the same moment; return what failed.
 
@@ -820,7 +898,8 @@ def _link_race_problems(engine: Engine) -> list[str]:
     # 1. One link, two redemptions at once.
     for number in range(3):
         token = create(new_person(number))
-        start, outcomes = threading.Barrier(2), []
+        start = threading.Barrier(2)
+        outcomes: list[str] = []
         threads = [
             threading.Thread(target=redeem, args=(token, phrase, start, outcomes))
             for phrase in ("first chosen long passphrase", "second chosen long passphrase")
@@ -837,7 +916,8 @@ def _link_race_problems(engine: Engine) -> list[str]:
     for number in range(3):
         person_id = new_person(100 + number)
         token = create(person_id)
-        start, outcomes = threading.Barrier(2), []
+        start = threading.Barrier(2)
+        outcomes = []
 
         def replace(start: threading.Barrier, outcomes: list[str], person_id: object) -> None:
             start.wait()
@@ -892,6 +972,7 @@ def _people_race_problems(engine: Engine) -> list[str]:
 
     from app.audit import Actor
     from app.audit.models import AuditEvent
+    from app.auth.models import UserSession
     from app.authz.roles import assign_role, create_starting_roles
     from app.modules.org import people, service
     from app.modules.org.models import Company, Department, Team, User
@@ -988,7 +1069,9 @@ def _people_race_problems(engine: Engine) -> list[str]:
         joiner_id = new_person(f"joiner-{number}")
 
         def deactivate(db: Session, acting: User, person_id: uuid.UUID = joiner_id) -> str:
-            people.deactivate(db, acting, person_id)
+            # The joiner holds no admin-level permission, so no password re-entry is
+            # needed: an empty session (never re-entered) is enough.
+            people.deactivate(db, acting, person_id, session=UserSession())
             return "ok"
 
         def join(

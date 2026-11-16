@@ -46,6 +46,7 @@ from app.authz.check import authorize
 from app.db.base import utcnow
 from app.db.types import new_id
 from app.modules.org.models import Company, User
+from app.settings.service import password_min_length
 from app.tenancy.context import set_company
 from app.tenancy.filter import cross_company_read
 
@@ -220,7 +221,9 @@ def redeem(db: Session, token: str, new_password: str) -> None:
         db.rollback()  # releases the locks
         raise LinkNotValid()
 
-    # 4. The usual password rules, with the company's name and the person's names.
+    # 4. The usual password rules, with the company's name and the person's names, and
+    #    the company's own minimum length (its auth.password_min_length setting, never
+    #    below the platform's 15), the same as changing your own password.
     company = db.get(Company, person.company_id)
     if company is None:  # the link's own company is always visible to it
         raise RuntimeError("the link's company is missing")
@@ -230,6 +233,7 @@ def redeem(db: Session, token: str, new_password: str) -> None:
             company_name=company.name,
             email=person.email,
             display_name=person.display_name,
+            min_length=password_min_length(db),
         )
     except PasswordRejected as error:
         db.rollback()
