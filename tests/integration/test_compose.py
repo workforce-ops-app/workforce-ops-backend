@@ -139,10 +139,9 @@ def test_the_nightly_audit_check_runs_in_the_api_image() -> None:
     # host's cron line runs it: `docker compose exec -T api python -m ...`. The image
     # installs only the app package, so this proves the command is inside it, and that it
     # reaches the database and finds the signing key there.
-    # 1. The throwaway database starts empty: apply the migrations first, as the image's
-    #    own instructions say (alembic.ini and migrations/ travel with it).
-    compose_exec("api", "alembic", "upgrade", "head")
-    # 2. The check itself. compose_exec fails the test on a non-zero exit code, which the
-    #    command gives when a chain failed or it could not run at all.
+    # It runs as the application user: the migrate tool has already applied the migrations
+    # (scripts/integration_test.py), and the API could not apply them itself (#43).
+    # compose_exec fails the test on a non-zero exit code, which the command gives when a
+    # chain failed or it could not run at all.
     output = compose_exec("api", "python", "-m", "app.jobs.verify_audit_log")
     assert output.endswith("audit chains: 0 failed"), output
