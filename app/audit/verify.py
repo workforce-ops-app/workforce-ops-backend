@@ -32,7 +32,7 @@ import hmac
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.audit.models import NO_SIGNATURE, AuditChainHead, AuditEvent
@@ -131,3 +131,19 @@ def verify_chain(db: Session, chain_id: uuid.UUID, keys: dict[str, bytes]) -> Re
     if head is not None and head_seq > 0 and previous != head.last_signature:
         return bad(head_seq, "the last entry is not the one the chain head records", found - 1)
     return Result(chain_id, True, found, head_seq, head_signature=head_signature)
+
+
+def can_append(db: Session, chain_id: uuid.UUID) -> bool:
+    """Whether record() can add an entry to this chain without running into one already
+    there.
+
+    record() numbers a new entry one past the head (0 when there is no head). If the head
+    was moved back, or removed, while its entries stayed, that number is already taken,
+    and the unique key on (chain_id, seq) would refuse the new entry with a database
+    error. So this asks the same question first: is any entry numbered past the head?
+    Any other damage (an edited, removed, or cut-off entry) still leaves the next number
+    free, so the check can be recorded next to it.
+    """
+    head_seq = db.scalar(select(AuditChainHead.last_seq).where(AuditChainHead.chain_id == chain_id))
+    highest = db.scalar(select(func.max(AuditEvent.seq)).where(AuditEvent.chain_id == chain_id))
+    return (highest or 0) <= (head_seq or 0)

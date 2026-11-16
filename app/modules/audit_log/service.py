@@ -6,7 +6,11 @@ who may ask, and what happens with the result:
 
 - Every check is recorded in the chain it checked, as an audit entry `audit.verified`
   with what was found. A broken chain still takes new entries (record() links them to
-  the head), so the record of the check survives next to the damage it found.
+  the head), so the record of the check survives next to the damage it found. The one
+  exception is a head that was moved back or removed while its entries stayed: the next
+  number is then already taken, so no entry can be added (can_append() in
+  app/audit/verify.py). The check is reported anyway (the answer, the security event,
+  the log lines), only without its audit entry, and the log says why.
 - A failure also becomes a security event, so it shows on the security page (DT5):
   - on demand: in the company's own security_events, naming the person who ran it;
   - nightly: in platform_security_events, which has no company or person (rule DE9),
@@ -15,6 +19,9 @@ who may ask, and what happens with the result:
   That copy lives outside the database, so if the whole database were put back to an
   older state (removing entries AND moving the head back), the head in the log from an
   earlier night would be further along than the one in the database.
+- Nightly, a chain that cannot be checked at all (an unexpected error) is reported as
+  failed and the check goes on with the next chain, so one damaged chain never stops the
+  others from being checked.
 """
 
 import logging
@@ -26,18 +33,20 @@ from sqlalchemy.orm import Session
 
 from app.audit import Actor, record
 from app.audit.models import PLATFORM_CHAIN_ID, AuditChainHead, AuditEvent
-from app.audit.verify import Result, available_keys, verify_chain
+from app.audit.verify import Result, available_keys, can_append, verify_chain
 from app.authz.check import authorize
 from app.db.base import utcnow
 from app.modules.org.models import User
 from app.modules.security import repository as security_events
-from app.modules.security.models import SecurityEvent
+from app.modules.security.models import CHAIN_BROKEN, SecurityEvent
 from app.tenancy.context import get_company, set_company
 
 logger = logging.getLogger(__name__)
 
-# The security event kind for a chain that failed its check.
-CHAIN_BROKEN = "audit.chain_broken"
+# CHAIN_BROKEN, the security event kind for a chain that failed its check, is defined with
+# the other kinds (COMPANY_KINDS in app/modules/security/models.py), so the security-events
+# API accepts and counts it; it is imported here for the code that writes it.
+__all__ = ["CHAIN_BROKEN", "verify_company_chain", "verify_every_chain"]
 
 
 def _details(result: Result, *, nightly: bool) -> dict[str, Any]:
@@ -52,6 +61,23 @@ def _details(result: Result, *, nightly: bool) -> dict[str, Any]:
     }
 
 
+def _record_check(db: Session, actor: Actor, result: Result, *, nightly: bool) -> bool:
+    """Record a check as `audit.verified` in the chain it checked, if the chain can take a
+    new entry; otherwise log why not. Returns whether it was recorded. The caller
+    commits."""
+    # A head moved back or removed while its entries stayed: the next number is taken,
+    # and record() would fail on the unique key (see the module text). The check itself
+    # has already failed in that case (verify_chain finds the entry past the head).
+    if not can_append(db, result.chain_id):
+        logger.error(
+            "audit check not recorded: the chain head does not match its entries",
+            extra={"fields": {"chain_id": str(result.chain_id), "nightly": nightly}},
+        )
+        return False
+    record(db, actor=actor, action="audit.verified", details=_details(result, nightly=nightly))
+    return True
+
+
 def verify_company_chain(db: Session, user: User) -> Result:
     """Check the signed-in person's company's chain now (POST /api/audit/verify)."""
     # 1. Permission first: audit.verify is a company permission (Owner and Administrator).
@@ -64,13 +90,9 @@ def verify_company_chain(db: Session, user: User) -> Result:
         raise RuntimeError("verify_company_chain needs a session working for a company")
     result = verify_chain(db, company_id, available_keys())
 
-    # 3. Record the check in the chain it checked, and a failure as a security event.
-    record(
-        db,
-        actor=Actor.user(user.id),
-        action="audit.verified",
-        details=_details(result, nightly=False),
-    )
+    # 3. Record the check in the chain it checked (when the chain can take an entry), and
+    #    a failure as a security event, which needs no chain and so is always written.
+    _record_check(db, Actor.user(user.id), result, nightly=False)
     if not result.ok:
         # The company filter fills in company_id from the session (tenancy layer 1).
         db.add(
@@ -97,38 +119,50 @@ def _every_chain(engine: Engine) -> list[uuid.UUID]:
     return sorted(heads | named)
 
 
+def _check_one(engine: Engine, chain_id: uuid.UUID, keys: dict[str, bytes]) -> Result:
+    """One chain of the nightly check, in its own session and transaction."""
+    # A company's chain is checked, and its result recorded, in a session working for that
+    # company (record() takes the chain from the session); the platform chain in a
+    # session with no company.
+    company_id = None if chain_id == PLATFORM_CHAIN_ID else chain_id
+    with Session(engine) as db:
+        if company_id is not None:
+            set_company(db, company_id)
+        result = verify_chain(db, chain_id, keys)
+        # The outside copy: the head as it was when this check read it. IDs and numbers
+        # only (decision 0031); a signature is not secret, and it is the point.
+        logger.info(
+            "audit chain head",
+            extra={
+                "fields": {
+                    "chain_id": str(chain_id),
+                    "last_seq": result.last_seq,
+                    "last_signature": result.head_signature.hex(),
+                }
+            },
+        )
+        _record_check(db, Actor.system(), result, nightly=True)
+        db.commit()
+    return result
+
+
 def verify_every_chain(engine: Engine) -> list[Result]:
     """The nightly check: every chain from the start, each in its own transaction."""
     keys = available_keys()  # before anything: no key, no check (AuditError)
     results = []
     for chain_id in _every_chain(engine):
-        # A company's chain is checked, and its result recorded, in a session working for
-        # that company (record() takes the chain from the session); the platform chain in
-        # a session with no company.
-        company_id = None if chain_id == PLATFORM_CHAIN_ID else chain_id
-        with Session(engine) as db:
-            if company_id is not None:
-                set_company(db, company_id)
-            result = verify_chain(db, chain_id, keys)
-            # The outside copy: the head as it was when this check read it. IDs and
-            # numbers only (decision 0031); a signature is not secret, and it is the point.
-            logger.info(
-                "audit chain head",
-                extra={
-                    "fields": {
-                        "chain_id": str(chain_id),
-                        "last_seq": result.last_seq,
-                        "last_signature": result.head_signature.hex(),
-                    }
-                },
+        try:
+            result = _check_one(engine, chain_id, keys)
+        except Exception as error:  # one chain must not stop the others being checked
+            # Something nobody planned for went wrong with this chain. It counts as failed
+            # (it was not shown to be intact), and the check goes on with the next chain.
+            # Only the type of the error is logged: a database error's text can repeat the
+            # values of its statement, and the log holds IDs and numbers only (0031).
+            logger.error(
+                "audit chain check could not finish",
+                extra={"fields": {"chain_id": str(chain_id), "error": type(error).__name__}},
             )
-            record(
-                db,
-                actor=Actor.system(),
-                action="audit.verified",
-                details=_details(result, nightly=True),
-            )
-            db.commit()
+            result = Result(chain_id, False, 0, 0, problem="the check could not finish")
         if not result.ok:
             _log_failure(result)
             # No company or person on this table (DE9): which chain is in the log line.

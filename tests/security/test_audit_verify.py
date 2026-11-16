@@ -11,7 +11,7 @@ import uuid
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
-from app.audit.models import AuditEvent
+from app.audit.models import AuditChainHead, AuditEvent
 from app.modules.audit_log.service import CHAIN_BROKEN
 from app.modules.security.models import PlatformSecurityEvent, SecurityEvent
 from tests.shift_data import ShiftSetup, shifts
@@ -141,3 +141,84 @@ def test_a_cut_off_chain_names_the_entry_the_head_expected(shifts: ShiftSetup) -
     body = owner.post(URL).json()
     assert body["ok"] is False and body["first_bad_seq"] == last
     assert body["checked"] == last - 2
+
+
+# --- A damaged head, through the API -----------------------------------------------------
+# Review of #145: recording the check in a chain whose head was moved back (or removed)
+# while its entries stayed used to fail on the unique (chain_id, seq) key: a 500 instead of
+# the answer, and no security event.
+
+
+def _move_head_back(setup: ShiftSetup, company_id: uuid.UUID) -> int:
+    """Point the head one entry back, leaving the last entry in place. Returns that
+    entry's seq (the first one past the head)."""
+    with Session(setup.engine) as db:
+        entries = list(
+            db.scalars(
+                select(AuditEvent).where(AuditEvent.chain_id == company_id).order_by(AuditEvent.seq)
+            )
+        )
+        # Read before the commit, which expires every loaded entry.
+        last, before_last = entries[-1].seq, entries[-2]
+        db.execute(
+            update(AuditChainHead)
+            .where(AuditChainHead.chain_id == company_id)
+            .values(last_seq=before_last.seq, last_signature=before_last.signature)
+        )
+        db.commit()
+    return last
+
+
+def _remove_head(setup: ShiftSetup, company_id: uuid.UUID) -> int:
+    """Remove the head, leaving the entries (SQLite does not enforce the head's foreign
+    key by default; MySQL would refuse, but the check must not rely on it)."""
+    with Session(setup.engine) as db:
+        db.execute(delete(AuditChainHead).where(AuditChainHead.chain_id == company_id))
+        db.commit()
+    return 1
+
+
+def test_a_damaged_head_is_reported_not_a_server_error(shifts: ShiftSetup) -> None:
+    for damage in (_move_head_back, _remove_head):
+        owner = shifts.browser("owner")  # signed in first: signing in adds entries too
+        before = len(_verified(shifts, shifts.company_a))
+        bad_seq = damage(shifts, shifts.company_a)
+        answer = owner.post(URL)
+        # The answer, not a 500: the chain failed, at the first entry past the head.
+        assert answer.status_code == 200, damage.__name__
+        body = answer.json()
+        assert body["ok"] is False and body["first_bad_seq"] == bad_seq, damage.__name__
+        # No audit.verified entry could be added to this chain, and none was.
+        assert len(_verified(shifts, shifts.company_a)) == before, damage.__name__
+        # The failure is still a security event in the company, naming who found it.
+        with shifts.db(shifts.company_a) as db:
+            events = list(
+                db.scalars(select(SecurityEvent).where(SecurityEvent.kind == CHAIN_BROKEN))
+            )
+            assert events[-1].user_id == shifts.ids["owner"], damage.__name__
+            assert events[-1].excerpt == f"first bad entry {bad_seq}", damage.__name__
+
+
+# --- The security page shows broken chains -----------------------------------------------
+# Review of #145: audit.chain_broken was written but not one of the company kinds, so the
+# security-events list refused it as a filter (422) and the summary did not count it.
+
+
+def test_a_broken_chain_shows_in_the_security_events_list_and_summary(
+    shifts: ShiftSetup,
+) -> None:
+    _break(shifts, shifts.company_a, seq=2)
+    owner = shifts.browser("owner")
+    assert owner.post(URL).json()["ok"] is False
+    # The list, filtered to the kind: the one event, as the page shows it.
+    listed = owner.get("/api/security-events", params={"kind": CHAIN_BROKEN})
+    assert listed.status_code == 200
+    [event] = listed.json()["items"]
+    assert event["kind"] == CHAIN_BROKEN and event["excerpt"] == "first bad entry 2"
+    # The summary counts it in both windows.
+    summary = owner.get("/api/security-events/summary").json()["kinds"]
+    counts = {k["kind"]: (k["last_7_days"], k["last_30_days"]) for k in summary}
+    assert counts[CHAIN_BROKEN] == (1, 1)
+    # The event is company A's only: company B's events hold none of it.
+    with shifts.db(shifts.company_b) as db:
+        assert list(db.scalars(select(SecurityEvent))) == []

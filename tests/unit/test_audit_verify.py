@@ -11,6 +11,7 @@ import hmac
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -291,3 +292,106 @@ def test_the_next_nights_check_still_finds_the_damage(audit: AuditSetup) -> None
     verify_every_chain(audit.engine)
     again = {r.chain_id: r for r in verify_every_chain(audit.engine)}
     assert again[audit.company_a].first_bad_seq == 1
+
+
+# --- A damaged head in the nightly check -------------------------------------------------
+# Review of #145: recording the check in a chain whose head was moved back (or removed)
+# while its entries stayed used to fail on the unique (chain_id, seq) key, which stopped
+# the nightly check before the chains after it were checked.
+
+
+def _move_head_back(setup: AuditSetup, chain_id: uuid.UUID, to: int) -> None:
+    """Point the head at an earlier entry, leaving the entries after it in place."""
+    with setup.session_for(None) as session:
+        target = session.scalars(select(AuditEvent).where(entry(chain_id, to))).one()
+        session.execute(
+            update(AuditChainHead)
+            .where(AuditChainHead.chain_id == chain_id)
+            .values(last_seq=to, last_signature=target.signature)
+        )
+        session.commit()
+
+
+def _remove_head(setup: AuditSetup, chain_id: uuid.UUID) -> None:
+    """Remove the head, leaving the entries. (The head's foreign key is not enforced on
+    SQLite by default; MySQL would refuse this, but the check must not rely on it.)"""
+    tamper(setup, delete(AuditChainHead).where(AuditChainHead.chain_id == chain_id))
+
+
+@pytest.mark.parametrize(
+    ("damage", "bad_seq"),
+    [
+        # Entries 1 to 3, the head pointing at 2: the next number (3) is taken.
+        (lambda setup, chain_id: _move_head_back(setup, chain_id, to=2), 3),
+        # Entries 1 to 3 and no head: record() would start again at 1, which is taken.
+        (_remove_head, 1),
+    ],
+    ids=["head moved back", "head removed"],
+)
+def test_the_nightly_check_reports_a_damaged_head_and_goes_on(
+    audit: AuditSetup,
+    caplog: pytest.LogCaptureFixture,
+    damage: Callable[[AuditSetup, uuid.UUID], None],
+    bad_seq: int,
+) -> None:
+    # Company A's head is damaged; B and the platform are untouched.
+    PlatformSecurityEvent.__table__.create(audit.engine)  # type: ignore[attr-defined]
+    write(audit, audit.company_a)
+    write(audit, audit.company_b)
+    write(audit, None, count=1)
+    damage(audit, audit.company_a)
+    with caplog.at_level(logging.INFO, logger="app.modules.audit_log.service"):
+        results = {r.chain_id: r for r in verify_every_chain(audit.engine)}
+
+    # 1. Every chain was checked, the ones after the damaged one included.
+    assert set(results) == {audit.company_a, audit.company_b, PLATFORM_CHAIN_ID}
+    assert not results[audit.company_a].ok
+    assert results[audit.company_a].first_bad_seq == bad_seq
+    assert results[audit.company_b].ok and results[PLATFORM_CHAIN_ID].ok
+    # 2. The damaged chain got no audit.verified entry (none could be added), and its
+    #    entries are as they were; the others recorded their check as usual.
+    assert [e.seq for e in audit.events(audit.company_a)] == [1, 2, 3]
+    assert audit.events(audit.company_b)[-1].action == "audit.verified"
+    # 3. The failure is still reported: the error lines name the chain and say why the
+    #    check was not recorded, and there is a platform security event.
+    errors = {
+        r.getMessage(): r.fields  # type: ignore[attr-defined]
+        for r in caplog.records
+        if r.levelno == logging.ERROR
+    }
+    assert errors["audit chain failed verification"]["chain_id"] == str(audit.company_a)
+    not_recorded = "audit check not recorded: the chain head does not match its entries"
+    assert errors[not_recorded]["chain_id"] == str(audit.company_a)
+    with audit.session_for(None) as session:
+        assert [r.kind for r in session.scalars(select(PlatformSecurityEvent))] == [CHAIN_BROKEN]
+
+
+def test_a_chain_that_cannot_be_checked_fails_without_stopping_the_others(
+    audit: AuditSetup, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any unexpected error in one chain's check: that chain fails, the rest are checked."""
+    from app.modules.audit_log import service
+
+    PlatformSecurityEvent.__table__.create(audit.engine)  # type: ignore[attr-defined]
+    write(audit, audit.company_a)
+    write(audit, audit.company_b)
+    real = service.verify_chain
+
+    def broken_for_a(db, chain_id, keys):  # type: ignore[no-untyped-def]
+        if chain_id == audit.company_a:
+            raise RuntimeError("a value from the statement that must not be logged")
+        return real(db, chain_id, keys)
+
+    monkeypatch.setattr(service, "verify_chain", broken_for_a)
+    with caplog.at_level(logging.INFO, logger="app.modules.audit_log.service"):
+        results = {r.chain_id: r for r in verify_every_chain(audit.engine)}
+
+    assert not results[audit.company_a].ok
+    assert results[audit.company_a].problem == "the check could not finish"
+    assert results[audit.company_b].ok
+    # The error is logged by its type only, never its text.
+    [line] = [r for r in caplog.records if r.getMessage() == "audit chain check could not finish"]
+    assert line.fields == {"chain_id": str(audit.company_a), "error": "RuntimeError"}  # type: ignore[attr-defined]
+    assert "must not be logged" not in caplog.text
+    with audit.session_for(None) as session:
+        assert [r.kind for r in session.scalars(select(PlatformSecurityEvent))] == [CHAIN_BROKEN]

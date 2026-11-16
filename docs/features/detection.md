@@ -153,7 +153,7 @@ Both tables are kept for **1 year**, then removed by a nightly job (data model, 
 
 There is no endpoint to change or remove events. Both endpoints read only `security_events`, filtered to the session's company by the tenancy layer like every other table; `platform_security_events` has no endpoint.
 
-- **List filters:** `kind` is one of `detection.sql_injection`, `detection.xss`, `detection.path_traversal`, `detection.command_injection`, `detection.format_string`, or `detection.summary` (anything else: 422); `user_id` is a person (another company's person matches nothing, an empty page); `from` and `to` are days in the company's time zone, both included. Paged with `cursor` (the last event's ID, looked up in the company) and `limit` (1 to 200, default 50).
+- **List filters:** `kind` is one of `detection.sql_injection`, `detection.xss`, `detection.path_traversal`, `detection.command_injection`, `detection.format_string`, `detection.summary`, or `audit.chain_broken` (anything else: 422); `user_id` is a person (another company's person matches nothing, an empty page); `from` and `to` are days in the company's time zone, both included. Paged with `cursor` (the last event's ID, looked up in the company) and `limit` (1 to 200, default 50).
 - **An event in an answer:** `id`, `kind`, `pattern_id`, `field`, `method`, `route`, `user_id`, `user_name`, `client_address`, `request_id`, `excerpt` (exactly as stored), `count`, `occurred_at` (UTC).
 - **The summary:** `{"kinds": [{"kind", "last_7_days", "last_30_days"}]}` for every kind above, zero included, counted back from now. A summary row adds its `count` (the events the rate cap held back), not 1.
 - Reads are not audited. Errors: 401 not signed in, 403 without `security.view`, 422 invalid filters.

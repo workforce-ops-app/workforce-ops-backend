@@ -1,13 +1,16 @@
 """Check every audit chain, and copy each chain's head to the application log
 (docs/architecture/audit-log.md, verification).
 
-    python -m scripts.verify_audit_log
+    python -m app.jobs.verify_audit_log
 
-Run nightly. Until the application has its own background jobs, schedule it on the host
-like scripts/remove_old_security_events.py: a cron line, once a night, that changes into
-the backend folder (the one with docker-compose.yml) and then runs
+Run nightly. Until the application has its own background jobs, schedule it on the host:
+a cron line, once a night, that changes into the backend folder (the one with
+docker-compose.yml; cron starts in the home folder) and then runs
 
-    docker compose exec -T api python -m scripts.verify_audit_log
+    docker compose exec -T api python -m app.jobs.verify_audit_log
+
+It is part of the app package (app/jobs/__init__.py says why), so it is installed in the
+API image and runs there; tests/integration/test_compose.py runs it in the real image.
 
 Each chain is checked from its first entry (app/audit/verify.py), and the result is
 recorded in that chain as `audit.verified`. Each chain's head is written to the log as one
