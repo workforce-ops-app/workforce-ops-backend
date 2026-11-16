@@ -120,4 +120,6 @@ def test_the_summary_counts_each_kind_in_both_windows(events: ShiftSetup) -> Non
         "detection.format_string": (0, 0),
         # A summary row stands for the events the rate cap held back: 15, not 1.
         "detection.summary": (15, 15),
+        # A broken audit chain is a company kind too, so it is always in the summary.
+        "audit.chain_broken": (0, 0),
     }
