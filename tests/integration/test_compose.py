@@ -1,4 +1,5 @@
-"""The backend as Docker Compose runs it: reachable, healthy, and not running as root.
+"""The backend as Docker Compose runs it: reachable, healthy, not running as root, and
+able to run its scheduled commands (app/jobs/).
 
 Run by `python -m scripts.integration_test`, which starts a throwaway Compose project and
 sets INTEGRATION_API_URL and INTEGRATION_COMPOSE_PROJECT. Without them (for example a
@@ -90,3 +91,17 @@ def test_api_image_contains_no_env_file() -> None:
     # Secrets come from the environment at run time, never baked into the image, so
     # no .env file may be there (.dockerignore keeps it out).
     assert compose_exec("api", "ls", "-a", "/srv").split().count(".env") == 0
+
+
+def test_the_nightly_audit_check_runs_in_the_api_image() -> None:
+    # The documented nightly command (app/jobs/verify_audit_log.py), run exactly as the
+    # host's cron line runs it: `docker compose exec -T api python -m ...`. The image
+    # installs only the app package, so this proves the command is inside it, and that it
+    # reaches the database and finds the signing key there.
+    # 1. The throwaway database starts empty: apply the migrations first, as the image's
+    #    own instructions say (alembic.ini and migrations/ travel with it).
+    compose_exec("api", "alembic", "upgrade", "head")
+    # 2. The check itself. compose_exec fails the test on a non-zero exit code, which the
+    #    command gives when a chain failed or it could not run at all.
+    output = compose_exec("api", "python", "-m", "app.jobs.verify_audit_log")
+    assert output.endswith("audit chains: 0 failed"), output

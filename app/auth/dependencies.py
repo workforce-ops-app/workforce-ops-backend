@@ -21,16 +21,20 @@ Database = Annotated[Session, Depends(get_session)]
 
 
 def signed_in(request: Request, db: Database) -> Current:
-    """The signed-in person of this request, or 401 Unauthorized."""
+    """The signed-in person of this request, or 401 Unauthorized. Each session may make
+    at most 300 requests a minute; past that the answer is 429 (app/auth/limits.py), so a
+    stolen or runaway session cannot flood the API."""
     current = load_session(db, request.cookies.get(COOKIE_NAME))
     if current is None:
         raise HTTPException(status_code=401, detail="Sign in first.")
     # Detection may place this request's events in the session's company, and only
-    # because this check passed (rule DE9, app/modules/security/layer.py).
+    # because this check passed (rule DE9, app/modules/security/layer.py). It comes before
+    # the limit, so the events of a request answered 429 still belong to the company.
     note_identity(
         request.scope.setdefault("state", {}),
         Identity(current.session.id, current.company_id, current.user.id),
     )
+    request.app.state.limits.requests_per_session.hit(current.session.id)
     return current
 
 

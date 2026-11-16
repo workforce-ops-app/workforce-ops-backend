@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 
 class SignInRequest(BaseModel):
@@ -42,3 +42,22 @@ class SessionInfo(BaseModel):
     expires_at: datetime
     # Sent back as X-CSRF-Token on every request that changes something (app/auth/csrf.py).
     csrf_token: str
+
+
+class ReauthRequest(BaseModel):
+    """POST /api/sessions/current/reauth: the password, entered again."""
+
+    model_config = ConfigDict(extra="forbid")
+    # SecretStr: never shown in a repr, an error, or a log line, and marks the field as a
+    # credential for the detection walk test (docs/features/detection.md, rule 4).
+    password: SecretStr = Field(max_length=1024)
+
+
+class PasswordChange(BaseModel):
+    """PUT /api/me/password: the current password and the new one. The limit only stops
+    oversized requests; the password rules check the new one (app/auth/passwords.py)."""
+
+    model_config = ConfigDict(extra="forbid")
+    # SecretStr, as above: both are credentials.
+    current_password: SecretStr = Field(max_length=1024)
+    new_password: SecretStr = Field(max_length=1024)

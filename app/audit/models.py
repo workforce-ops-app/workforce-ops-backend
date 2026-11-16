@@ -1,9 +1,10 @@
 """The audit log's two tables: the chain heads and the entries (audit-log.md, decision 0018).
 
 Each company has its own chain of entries, and the platform has one more (for actions by
-platform code and, later, platform staff). A chain head is the bookmark at the end of a
-chain: the newest entry's number and signature. Adding an entry locks the head row, so
-two entries can never take the same number.
+platform code, such as company sign-up and the nightly check, and later platform staff).
+A chain head is the bookmark at the end of a chain: the newest entry's number and
+signature. Adding an entry locks the head row, so two entries can never take the same
+number.
 
 Not company-owned (CompanyOwned): the platform chain belongs to no company, so
 company_id is null there. Instead, only app/audit/record.py writes these tables, and it

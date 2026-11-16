@@ -1,7 +1,8 @@
 """Passwords: which ones are allowed, and how they are stored (authentication.md, decision 0027).
 
 Rules (NIST SP 800-63B rev. 4 for password-only sign-in):
-- 15 to 128 characters (a company may raise the minimum, up to 64, never lower it);
+- 15 to 128 characters (a company may raise the minimum, up to 64, never lower it: its
+  auth.password_min_length setting);
 - any characters, spaces and emoji included; Unicode is normalized (NFKC) first, so the
   same password typed on another device or keyboard matches;
 - no "must contain a digit" rules and no forced changes; these make passwords weaker;
@@ -28,6 +29,9 @@ from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatc
 
 MIN_LENGTH = 15
 MAX_LENGTH = 128
+# The highest minimum a company may choose (its auth.password_min_length setting,
+# app/settings/registry.py): a stricter company may ask for up to 64 characters.
+MAX_MIN_LENGTH = 64
 
 # Argon2id with the documented starting settings: 64 MiB of memory and 3 passes (about
 # half a second on the server). The parallelism and output length are the library's
@@ -85,11 +89,13 @@ def check_password(
 ) -> None:
     """Raise PasswordRejected if the password breaks a rule; return quietly if it is fine.
 
-    min_length is the company's minimum (its own setting may raise it; never below 15).
+    min_length is the company's minimum: pass password_min_length(db) from
+    app/settings/service.py wherever a person sets a password. It is kept between 15 and
+    64 here too, so a wrong number passed in can never weaken the rule.
     """
     # Lengths are counted after normalizing, on what will actually be hashed.
     text = normalize(password)
-    minimum = max(min_length, MIN_LENGTH)
+    minimum = min(max(min_length, MIN_LENGTH), MAX_MIN_LENGTH)
     if len(text) < minimum:
         raise PasswordRejected(
             f"Use at least {minimum} characters; a few words with spaces work well."

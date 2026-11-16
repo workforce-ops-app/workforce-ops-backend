@@ -106,8 +106,8 @@ def client_address(scope: Scope) -> str | None:
     It is the peer uvicorn reports in scope["client"]. uvicorn replaces that with the
     address in nginx's X-Forwarded-For header only when the connection came from an
     allowed proxy, so a client that sends the header itself cannot change it (threat S6).
-    This is the one place the address is read: the sign-up limit per address (SU1, #122)
-    is meant to use it too, so detection and the limits always agree on who sent what.
+    The rate limits read the same peer (client_address in app/auth/limits.py), so
+    detection and the limits always agree on who sent what.
     """
     client = scope.get("client")
     return client[0][:MAX_ADDRESS_CHARS] if client else None

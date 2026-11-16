@@ -34,6 +34,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.audit import Actor, record
+from app.auth.limits import is_locked, register_failure, register_success
 from app.auth.models import UserSession
 from app.auth.passwords import hash_password, needs_rehash, verify_password
 from app.db.base import utcnow
@@ -141,14 +142,22 @@ def _check_and_start(db: Session, email: str, password: str) -> SignedIn | None:
 
     # 2. From here on the database session works for the person's company.
     set_company(db, found.company_id)
-    user = db.get(User, found.id)
+    # Locked (SELECT ... FOR UPDATE, read fresh) until this sign-in is saved, so attempts
+    # on one account take turns. Without it, guesses sent at the same moment would each
+    # read the same count of wrong passwords and each write it plus one, and a burst of
+    # parallel guesses would count as one (app/auth/limits.py).
+    user = db.get(User, found.id, with_for_update=True, populate_existing=True)
     if user is None:  # found a moment ago, so only a concurrent change gets here
         return None
     now = utcnow()
 
-    # 3. Check the password, always, so every case takes the same time. Without a password
-    #    yet, the dummy hash is checked (and cannot match).
-    matches = verify_password(user.password_hash or _dummy_hash(), password)
+    # 3. Check a password, always, so every case takes the same time. Without a password
+    #    yet, the dummy hash is checked (and cannot match). While the account is locked,
+    #    the guess is not tried against the real hash at all: the dummy takes its place,
+    #    so a lock stops guessing instead of only hiding the result (app/auth/limits.py).
+    locked = is_locked(user, now)
+    real_hash = None if locked else user.password_hash
+    matches = verify_password(real_hash or _dummy_hash(), password)
 
     # 4. Refuse anything but an active, unlocked account with a matching password.
     reason = None
@@ -156,10 +165,12 @@ def _check_and_start(db: Session, email: str, password: str) -> SignedIn | None:
         reason = "no_password"
     elif user.deactivated_at is not None:
         reason = "deactivated"
-    elif user.locked_until is not None and user.locked_until > now:
+    elif locked:
         reason = "locked"
     elif not matches:
         reason = "wrong_password"
+        # Counts toward the lockout; the 5th, 10th, and 15th and later lock the account.
+        register_failure(db, user, now)
     if reason is not None:
         # Recorded in the company's audit log (never the password). Nobody is signed in,
         # so the actor is the system; the target is the account that was tried.
@@ -174,8 +185,10 @@ def _check_and_start(db: Session, email: str, password: str) -> SignedIn | None:
         db.commit()
         return None
 
-    # 5. Correct. If the password was hashed with older, weaker settings, hash it again
-    #    now, while the plain password is in hand (authentication.md).
+    # 5. Correct. The count of wrong passwords starts again. If the password was hashed
+    #    with older, weaker settings, hash it again now, while the plain password is in
+    #    hand (authentication.md).
+    register_success(user)
     if user.password_hash is not None and needs_rehash(user.password_hash):
         user.password_hash = hash_password(password)
 
