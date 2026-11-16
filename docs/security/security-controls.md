@@ -40,7 +40,7 @@ Tests are in `tests/security/` unless another folder is named.
 
 | Protection | Threats | Where | Tests |
 |---|---|---|---|
-| Passwords: 15 to 128 characters (or the company's longer minimum, up to 64), any characters, common-password blocklist, no names | S1 | `app/auth/passwords.py`, `app/auth/common-passwords.txt`, `password_min_length()` in `app/settings/service.py` | `test_password_rules.py`, `test_company_settings.py::test_the_company_minimum_applies_to_new_passwords` |
+| Passwords: 15 to 128 characters (or the company's longer minimum, up to 64), any characters, common-password blocklist, no names | S1 | `app/auth/passwords.py`, `app/auth/common-passwords.txt`, `password_min_length()` in `app/settings/service.py` | `test_password_rules.py`, `test_company_settings.py::test_the_company_minimum_applies_to_new_passwords`, `test_reauth.py::test_a_password_change_follows_the_companys_own_minimum` |
 | Argon2id password hashes (64 MiB, 3 passes), upgraded at sign-in when settings rise | S1, I5 | `app/auth/passwords.py` | `test_password_rules.py::test_the_stored_hash_never_contains_the_password`, `tests/unit/test_passwords.py` |
 | Every failed sign-in gets the same answer, does the same work, and takes at least 0.5 seconds | I3 | `sign_in()` in `app/auth/sessions.py` | `test_sign_in.py::test_every_failed_sign_in_gets_exactly_the_same_answer`, `..._does_the_same_work`, `..._takes_at_least_the_same_minimum_time` |
 | Random 256-bit session token; only its SHA-256 is stored | S2, I5 | `new_token()` in `app/auth/sessions.py` | `test_each_sign_in_gets_a_new_unguessable_token`, `test_no_answer_contains_a_password_hash_or_token_hash` |

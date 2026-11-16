@@ -10,10 +10,12 @@ import logging
 import pytest
 from sqlalchemy import select
 
+from app.audit import Actor
 from app.audit.models import AuditEvent
 from app.auth.models import UserSession
 from app.auth.reauth import ReauthRequired, require_reauth
 from app.auth.sessions import COOKIE_NAME
+from app.settings.service import PASSWORD_MIN_LENGTH, change_setting
 from tests.session_data import PASSWORD, SignInSetup, email, signin
 
 __all__ = ["signin"]  # the fixture, imported so pytest finds it here
@@ -129,3 +131,41 @@ def test_reentry_and_password_change_refuse_forged_requests(signin: SignInSetup)
     assert row.reauth_at is None
     # The password is unchanged: the old one still signs in.
     assert signin.sign_in(signin.new_client(), email(signin, "a_ana")) == 201
+
+
+def test_a_password_change_follows_the_companys_own_minimum(signin: SignInSetup) -> None:
+    """Review of #146: a company that raised its minimum (auth.password_min_length) must
+    get it at every place a password is set, the own-password change included. A password
+    long enough for the platform's 15 but shorter than the company's 30 is refused, and
+    nothing changes; the other company, still on the default, accepts it."""
+    with signin.session_for(signin.company_a) as db:
+        change_setting(db, PASSWORD_MIN_LENGTH, 30, actor=Actor.system())
+        db.commit()
+    twenty = "twenty chars of text"  # 20 characters: over 15, under 30
+    assert len(twenty) == 20
+
+    # 1. Company A: refused with the company's number, and the old password still works.
+    signin.sign_in(signin.client, email(signin, "a_ana"))
+    refused = signin.client.put(
+        "/api/me/password", json={"current_password": PASSWORD, "new_password": twenty}
+    )
+    assert refused.status_code == 422
+    assert "at least 30 characters" in refused.text
+    assert signin.sign_in(signin.new_client(), email(signin, "a_ana")) == 201
+    # A password of 30 or more is accepted.
+    longer = "thirty one characters of text!!"
+    assert len(longer) >= 30
+    accepted = signin.client.put(
+        "/api/me/password", json={"current_password": PASSWORD, "new_password": longer}
+    )
+    assert accepted.status_code == 200
+
+    # 2. Company B keeps the platform default: the same 20 characters are fine there.
+    other = signin.new_client()
+    signin.sign_in(other, email(signin, "b_ana"))
+    assert (
+        other.put(
+            "/api/me/password", json={"current_password": PASSWORD, "new_password": twenty}
+        ).status_code
+        == 200
+    )
