@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     # without a key is refused (app/audit/record.py), and the action fails with it.
     audit_signing_key: SecretStr | None = Field(default=None, min_length=32)
     audit_key_id: str = Field(default="local-1", min_length=1, max_length=40)
+    # Keys used before the current one, by their ID, as JSON in the environment, e.g.
+    # AUDIT_PREVIOUS_KEYS={"local-1": "the old key"}. Never used to sign; only so that
+    # verification (app/audit/verify.py) can still check entries signed before a key
+    # change. Empty until the key is first rotated.
+    audit_previous_keys: dict[str, SecretStr] = Field(default_factory=dict)
     # The secret key that turns a session into its CSRF token (app/auth/csrf.py). Separate
     # from the audit key, so leaking one does not weaken the other. The API refuses to
     # start without it (app/main.py): every change to data depends on it.
