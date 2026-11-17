@@ -121,8 +121,9 @@ class RoleRef(BaseModel):
 class EmployeeRef(BaseModel):
     id: uuid.UUID
     display_name: str
-    # The person's active roles, in the people menu's order (repository.roles_of). Everyone
-    # who can see the shift sees them, employees included (decision 0038, 2026-11-17).
+    # The person's active roles in the shift's department, in the people menu's order
+    # (repository.roles_of). Everyone who can see the shift sees them, employees included
+    # (decision 0038, 2026-11-17).
     roles: list[RoleRef] = []
 
 

@@ -90,10 +90,14 @@ def test_archived_roles_and_archived_scopes_do_not_count(shifts: ShiftSetup) -> 
 
 
 def test_deactivated_people_and_people_without_roles_have_none(shifts: ShiftSetup) -> None:
+    gone, ana = (
+        (shifts.ids["gone"], shifts.ids["kitchen"]),
+        (shifts.ids["ana"], shifts.ids["kitchen"]),
+    )
     with shifts.db() as db:
-        found = repository.roles_of(db, [shifts.ids["gone"], shifts.ids["ana"]])
-    assert found[shifts.ids["gone"]] == []
-    assert found[shifts.ids["ana"]] == [("Employee", "employee")]
+        found = repository.roles_of(db, [gone, ana])
+    assert found[gone] == []
+    assert found[ana] == [("Employee", "employee")]
     # Nobody to look up: no query, an empty answer.
     with shifts.db() as db:
         assert repository.roles_of(db, []) == {}
@@ -111,12 +115,14 @@ def test_the_list_looks_roles_up_once_for_the_whole_page(
     shifts.new_shift(starts_at=iso(soon(4)), ends_at=iso(soon(4) + timedelta(hours=4)))
 
     # Count the lookups, and what each was asked for.
-    calls: list[list[uuid.UUID]] = []
+    calls: list[list[repository.PersonInDepartment]] = []
     original = repository.roles_of
 
-    def counting(db: Session, user_ids: list[uuid.UUID]) -> repository.RolesByPerson:
-        calls.append(sorted(user_ids))
-        return original(db, user_ids)
+    def counting(
+        db: Session, people: list[repository.PersonInDepartment]
+    ) -> repository.RolesByPerson:
+        calls.append(sorted(people))
+        return original(db, people)
 
     monkeypatch.setattr(repository, "roles_of", counting)
     first = soon().date()
@@ -124,8 +130,10 @@ def test_the_list_looks_roles_up_once_for_the_whole_page(
         "/api/shifts", params={"from": str(first), "to": str(first + timedelta(days=6))}
     )
     assert response.status_code == 200
-    # One lookup, each person once (the open shift has nobody to look up).
-    assert calls == [sorted([shifts.ids["ana"], shifts.ids["cara"]])]
+    # One lookup, each person once with the shifts' department (the open shift has nobody
+    # to look up).
+    kitchen = shifts.ids["kitchen"]
+    assert calls == [sorted([(shifts.ids["ana"], kitchen), (shifts.ids["cara"], kitchen)])]
     assert all(s["employee"] is None or s["employee"]["roles"] for s in response.json()["items"])
 
 
@@ -160,3 +168,34 @@ def test_every_answer_with_a_person_shows_their_roles(shifts: ShiftSetup) -> Non
     )
     assert batch.status_code == 200, batch.text
     assert [s["employee"]["roles"] for s in batch.json()["items"]] == [employee_role] * 2
+
+
+def test_roles_count_only_in_the_department_they_cover(shifts: ShiftSetup) -> None:
+    # Decided 2026-11-17: the calendar shows each person's roles in the department being
+    # viewed. Lead manages the Weekend Crew, a Kitchen team, but lives in Front; Ben is an
+    # Employee of Front; the Owner holds a company-wide role. Cara also becomes a Manager
+    # for one person, Ana, whose home is Kitchen.
+    give_role(shifts, "cara", "Manager", "employee", "ana")
+    kitchen, front = shifts.ids["kitchen"], shifts.ids["front"]
+    pairs = [
+        (shifts.ids[person], department)
+        for person in ("lead", "ben", "owner", "cara")
+        for department in (kitchen, front)
+    ]
+    with shifts.db() as db:
+        found = repository.roles_of(db, pairs)
+
+    def roles(person: str, department: uuid.UUID) -> list[str]:
+        return [name for name, _ in found[(shifts.ids[person], department)]]
+
+    # A team role counts in the team's department only.
+    assert roles("lead", kitchen) == ["Manager"]
+    assert roles("lead", front) == []
+    # A department role counts in its department only.
+    assert roles("ben", front) == ["Employee"]
+    assert roles("ben", kitchen) == []
+    # A company-wide role counts everywhere.
+    assert roles("owner", kitchen) == roles("owner", front) == ["Owner"]
+    # A role for one person counts in that person's home department.
+    assert roles("cara", kitchen) == ["Manager", "Employee"]
+    assert roles("cara", front) == []

@@ -46,8 +46,8 @@ router = APIRouter(prefix="/api/shifts", tags=["shifts"])
 def _out(
     item: Shift, department_name: str, employee_name: str | None, roles: repository.RolesByPerson
 ) -> ShiftOut:
-    """A shift in the agreed answer shape. roles holds the roles of everyone in the answer,
-    looked up once for all its shifts (repository.roles_of)."""
+    """A shift in the agreed answer shape. roles holds everyone's roles in the departments
+    of the answer's shifts, looked up once for all of them (repository.roles_of)."""
     return ShiftOut(
         id=item.id,
         department=DepartmentRef(id=item.department_id, name=department_name),
@@ -57,7 +57,7 @@ def _out(
                 display_name=employee_name or "",
                 roles=[
                     RoleRef(name=name, built_in=built_in)
-                    for name, built_in in roles.get(item.employee_id, [])
+                    for name, built_in in roles.get((item.employee_id, item.department_id), [])
                 ],
             )
             if item.employee_id is not None
@@ -74,9 +74,12 @@ def _out(
     )
 
 
-def _people(items: list[Shift]) -> list[uuid.UUID]:
-    """The people who work these shifts, each once (open shifts have nobody)."""
-    return list({item.employee_id for item in items if item.employee_id is not None})
+def _people(items: list[Shift]) -> list[repository.PersonInDepartment]:
+    """Who works these shifts and in which department, each pair once (open shifts have
+    nobody). Roles are shown for the shift's department (repository.roles_of)."""
+    return list(
+        {(item.employee_id, item.department_id) for item in items if item.employee_id is not None}
+    )
 
 
 def _one(db: Database, item: Shift, roles: repository.RolesByPerson | None = None) -> ShiftOut:

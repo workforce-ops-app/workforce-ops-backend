@@ -334,11 +334,11 @@ def test_another_companys_roles_are_never_found(shifts: ShiftSetup) -> None:
     # (as a forged request might try), it finds none of their roles.
     from app.modules.schedules import repository
 
+    b_ana = (shifts.ids["b_ana"], shifts.ids["b_kitchen"])
+    b_chef = (shifts.ids["b_chef"], shifts.ids["b_kitchen"])
     with shifts.db(shifts.company_a) as db:
-        found = repository.roles_of(db, [shifts.ids["b_ana"], shifts.ids["b_chef"]])
-    assert found == {shifts.ids["b_ana"]: [], shifts.ids["b_chef"]: []}
+        found = repository.roles_of(db, [b_ana, b_chef])
+    assert found == {b_ana: [], b_chef: []}
     # And under company B's own filter, they are there: the test is not empty by accident.
     with shifts.db(shifts.company_b) as db:
-        assert repository.roles_of(db, [shifts.ids["b_ana"]])[shifts.ids["b_ana"]] == [
-            ("Employee", "employee")
-        ]
+        assert repository.roles_of(db, [b_ana])[b_ana] == [("Employee", "employee")]
