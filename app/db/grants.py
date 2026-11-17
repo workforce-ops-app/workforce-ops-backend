@@ -67,6 +67,11 @@ APP_RIGHTS: dict[str, frozenset[str]] = {
     # changed, then changed in place (UPDATE; also needed to lock the row with SELECT ...
     # FOR UPDATE while it changes). Never removed: no setting goes back to "no row".
     "company_settings": frozenset({"SELECT", "INSERT", "UPDATE"}),
+    # Setup and reset links (app/auth/links.py): added when an administrator creates one,
+    # read and locked (SELECT ... FOR UPDATE, which needs UPDATE) when it is redeemed,
+    # marked used (UPDATE), and deleted when a newer link for the person replaces it
+    # (DELETE). So all four.
+    "one_time_tokens": DATA,
 }
 
 # Alembic's own bookkeeping: only the migrations user needs it.
