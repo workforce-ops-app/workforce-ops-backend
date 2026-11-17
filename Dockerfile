@@ -24,8 +24,9 @@ COPY app ./app
 # itself into Python's packages; the copied source folder is then no longer needed.
 RUN pip install . && rm -rf app
 
-# Migrations travel with the image, so they can be applied with
-#   docker compose run --rm api alembic upgrade head
+# Migrations travel with the image, so they can be applied with the migrations user
+# (Compose's migrate tool, never the running API):
+#   docker compose run --rm migrate
 COPY alembic.ini ./
 COPY migrations ./migrations
 

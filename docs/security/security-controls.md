@@ -90,7 +90,7 @@ Tests are in `tests/security/` unless another folder is named.
 | Verification: numbering, links, signatures, and the chain's end against its head; the first bad entry is named | T4, R2 | `verify_chain()` in `app/audit/verify.py` | `tests/unit/test_audit_verify.py` (edited, removed, inserted, cut-off entries; older keys) |
 | On-demand check of one's own company's chain only, with `audit.verify`; a failure becomes a security event, shown on the security page, even when the head is damaged | T4, I1 | `POST /api/audit/verify`, `app/modules/audit_log/service.py` | `tests/security/test_audit_verify.py` |
 | Nightly check of every chain, and each head copied to the application log; a damaged chain never stops the others | T4, R2 | `app/jobs/verify_audit_log.py` (scheduled on the host, runs in the API image) | `test_audit_verify.py::test_the_nightly_check_covers_every_chain_and_copies_the_heads`, `test_the_nightly_check_reports_a_damaged_head_and_goes_on`, `test_a_chain_that_cannot_be_checked_fails_without_stopping_the_others`; `test_compose.py::test_the_nightly_audit_check_runs_in_the_api_image` |
-| Insert-only database rights | T4, R2 | not built yet (#43) | |
+| Separate database users: the application user may only read and write data, per table, and only add to the audit log; the migrations user changes the structure and is never given to the API | T4, R2, D3, P4 | `app/db/grants.py`, `migrations/env.py`, `docker/mysql/init/01-users.sh`, the `migrate` tool in `docker-compose.yml` | `check_migrations.py` (`_grant_problems`), `tests/unit/test_grants.py`, `tests/integration/test_compose.py` |
 
 ## Cryptography
 
