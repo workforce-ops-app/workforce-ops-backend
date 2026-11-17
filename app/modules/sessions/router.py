@@ -32,6 +32,7 @@ from app.auth.sessions import (
 )
 from app.authz.check import effective_permissions
 from app.modules.org.models import Company, User
+from app.modules.security.layer import detection_skip
 from app.modules.sessions.schemas import (
     PasswordChange,
     ReauthRequest,
@@ -87,6 +88,7 @@ def _info(request: Request, db: Session, user: User, session: UserSession) -> Se
 
 
 @sessions.post("", status_code=201)
+@detection_skip  # a credential route: detection copies nothing of it (rule DE3)
 def create_session(
     body: SignInRequest, request: Request, response: Response, db: Database
 ) -> SessionInfo:
@@ -124,6 +126,7 @@ def delete_all_sessions(response: Response, current: SignedInPerson, db: Databas
 
 
 @sessions.post("/current/reauth", status_code=204)
+@detection_skip  # takes the password (rule DE3)
 def reauth(body: ReauthRequest, current: SignedInPerson, db: Database) -> None:
     """Enter the password again: sensitive actions are allowed for 5 minutes on this
     browser. A wrong password is 403 (and recorded); the session itself stays."""
@@ -131,6 +134,7 @@ def reauth(body: ReauthRequest, current: SignedInPerson, db: Database) -> None:
 
 
 @me.put("/password")
+@detection_skip  # takes the current and the new password (rule DE3)
 def put_password(
     body: PasswordChange,
     request: Request,
