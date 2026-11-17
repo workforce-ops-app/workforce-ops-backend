@@ -220,12 +220,12 @@ Each rule becomes a security test in `tests/security/` when the code is built. T
 These need the password re-entered shortly before, as set out in [0025](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md) (how re-entry works is on the [authentication](authentication.md) page):
 
 - proposing or approving an owner change;
-- **admin-level changes**: assigning or removing a role that includes any of `user.manage`, `role.manage`, `role.assign`, `reporting_line.manage`, or `settings.manage`, and deactivating someone who holds such a role;
+- **admin-level changes**: assigning or removing a role that includes any of `user.manage`, `role.manage`, `role.assign`, `reporting_line.manage`, or `settings.manage`, deactivating someone who holds such a role, and creating a setup or reset link for them (whoever holds the link chooses the account's password);
 - changing what a role grants;
 - adding or ending a reporting line;
 - changing security settings.
 
-Each of these actions calls `require_reauth()` (`app/auth/reauth.py`) before it changes anything, as its endpoint is built. Deactivating an admin-level holder does so now (`deactivate()` in `app/modules/org/people.py`): "holds such a role" is read from the permissions the person's active roles grant (`holds_admin_level()` in `app/authz/check.py`), so a company's own roles count too. Still to come: the role, line, and owner actions with Z4 and Z5, security settings with #59.
+Each of these actions calls `require_reauth()` (`app/auth/reauth.py`) before it changes anything, as its endpoint is built. Deactivating an admin-level holder does so now (`deactivate()` in `app/modules/org/people.py`), and so does creating a link for one (`create_link()` in `app/auth/links.py`): "holds such a role" is read from the permissions the person's active roles grant (`holds_admin_level()` in `app/authz/check.py`), so a company's own roles count too. Still to come: the role, line, and owner actions with Z4 and Z5, security settings with #59.
 
 Schedule changes affecting 10 or more shifts show a confirmation with the count (no password re-entry). Companies may add actions to the re-entry list but never remove them.
 

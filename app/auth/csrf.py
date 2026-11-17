@@ -35,11 +35,17 @@ from app.auth.sessions import COOKIE_NAME, hash_cookie
 # The methods that may change something; every other method only reads.
 CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
-# Signing in: checked for Origin only, never for a token. It starts a session rather than
-# acting within one, and a browser may still carry the cookie of a session that already
-# ended (idle for an hour); demanding that dead session's token would lock the person out.
-# A forged sign-in (into the attacker's account) is refused by the Origin check.
-SIGN_IN = ("POST", "/api/sessions")
+# Requests checked for Origin only, never for a token: they do not act within a session,
+# so a session's token proves nothing for them, and a browser may still carry the cookie
+# of a session that already ended (idle for an hour); demanding that dead session's token
+# would lock the person out. A forged request from another site is still refused by the
+# Origin check.
+# - Signing in starts a session (a forged sign-in into the attacker's account is the
+#   attack the Origin check stops).
+# - Redeeming a setup or reset link: its proof is the one-time token in the body, not a
+#   session. Someone opening a reset link in a browser with an old session cookie must
+#   reach the link check, not a 403.
+ORIGIN_ONLY = frozenset({("POST", "/api/sessions"), ("POST", "/api/password-links/redeem")})
 
 # One answer for every refusal: it does not tell an attacker which check failed.
 REFUSED = "This request did not come from the application's own pages."
@@ -96,8 +102,9 @@ class CsrfMiddleware:
             return False
 
         # 2. Token: only a browser that carries a session cookie can act as someone, so
-        #    only then is the token needed. Sign-in starts a session instead (see SIGN_IN).
-        if (request.method, request.url.path.rstrip("/")) == SIGN_IN:
+        #    only then is the token needed. Sign-in and link redemption do not act within
+        #    a session (see ORIGIN_ONLY).
+        if (request.method, request.url.path.rstrip("/")) in ORIGIN_ONLY:
             return True
         token_hash = hash_cookie(request.cookies.get(COOKIE_NAME))
         if token_hash is None:

@@ -4,7 +4,7 @@
 
 Decisions behind this page: [0016 tenancy](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0016-tenant-isolation.md) · [0017 scoped roles](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0017-scoped-role-assignments.md) · [0018 audit](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0018-audit-log-chains.md) · [0019 IDs](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0019-uuidv7-ids.md) · [0020 deletion](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md) · [0021 time](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md) · [0022 SQLAlchemy](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0022-sqlalchemy-and-alembic.md)
 
-> **Status:** partly built. `companies`, `departments`, `teams`, `users`, and `team_members` exist (`app/modules/org/models.py`, migration `0002`), and so do the audit log (`0003`), sessions (`0004`), permissions, roles, and role assignments (`0005`), shifts (`0006`), and `reporting_lines` (`app/authz/models.py`, migration `0007`); the other tables are created when the features that need them are built. Feature tables (time off, coverage and swaps, tasks, announcements, notifications) are documented on their feature pages.
+> **Status:** partly built. `companies`, `departments`, `teams`, `users`, and `team_members` exist (`app/modules/org/models.py`, migration `0002`), and so do the audit log (`0003`), sessions (`0004`), permissions, roles, and role assignments (`0005`), shifts (`0006`), `reporting_lines` (`app/authz/models.py`, migration `0007`), and `one_time_tokens` (`app/auth/models.py`, migration `0010`); the other tables are created when the features that need them are built. Feature tables (time off, coverage and swaps, tasks, announcements, notifications) are documented on their feature pages.
 
 **How to read this page:** the [diagram](#overview-diagram) is a summary. The [entities](#entities) and [relationships](#relationships) sections are the detailed, authoritative version. A change to a table updates all three (see [adding a table](#adding-a-table)).
 
@@ -203,7 +203,7 @@ Every table also has `created_at` and `updated_at` (`DATETIME(6)`, UTC); they ar
 | `timezone` | `VARCHAR(64)` | required; IANA zone name, e.g. `America/Chicago` |
 | `archived_at` | `DATETIME(6)` | null = active |
 
-Not itself company-owned, but protected by the company filter (`CompanyRecord`): a session working for a company sees and changes only its own row. Only platform code (a session with no company, such as the seed script) creates or archives companies.
+Not itself company-owned, but protected by the company filter (`CompanyRecord`): a session working for a company sees and changes only its own row. Only platform code (a session with no company: company sign-up and the seed script) creates or archives companies ([organization](../features/organization.md#company-sign-up)).
 
 ### departments
 
@@ -239,7 +239,7 @@ Not itself company-owned, but protected by the company filter (`CompanyRecord`):
 | `company_id` | `BINARY(16)` | required |
 | `department_id` | `BINARY(16)` | required; company-aware foreign key to `departments` (home department) |
 | `email` | `VARCHAR(254)` | required; stored in lowercase (`CHECK`); **unique across the whole platform**, so sign-in needs only an email and a password; compared exactly in MySQL (`utf8mb4_bin`), since the default comparison ignores case and accents |
-| `password_hash` | `VARCHAR(255)` | Argon2id ([0027](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md)); null until the person sets a password with their setup link |
+| `password_hash` | `VARCHAR(255)` | Argon2id ([0027](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0027-authentication-and-sessions.md)); null until the person sets a password with their setup link; a company's first owner chooses one at sign-up, so it is never null for them |
 | `display_name` | `VARCHAR(120)` | required |
 | `password_changed_at` | `DATETIME(6)` | when the password was last set |
 | `failed_sign_ins` | `SMALLINT` | wrong passwords since the last success; reset after a success or 24 hours without failures |
@@ -407,7 +407,7 @@ Sessions end after 1 hour without activity or 30 days after sign-in, whichever c
 | `expires_at` | `DATETIME(6)` | required; 48 hours after creation by default |
 | `used_at` | `DATETIME(6)` | null = not used yet; a token works once |
 
-Creating a new link cancels the person's earlier unused links. Used and expired rows are deleted.
+Creating a new link cancels the person's earlier unused links by deleting them, together with any used or expired ones, so a person has at most one row. A unique key on `token_hash` (redeeming finds the link by it) and a `CHECK` on `purpose`.
 
 ### shifts
 
