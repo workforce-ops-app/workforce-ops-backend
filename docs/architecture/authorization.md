@@ -33,7 +33,7 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 | Permission | Kind | Allows |
 |---|---|---|
 | `schedule.view_self` | self | see your own shifts |
-| `schedule.view` | record | see shifts in scope, including open shifts |
+| `schedule.view` | record | see shifts in scope, including open shifts, with the names of each person's roles (not their permissions or scopes; decision 0038) |
 | `schedule.edit` | record | create, change, and cancel shifts in scope |
 | `time_off.request_self` | self | ask for time off for yourself |
 | `time_off.cancel_self` | self | cancel your own pending or approved request |

@@ -16,7 +16,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.orm import Session
 
-from app.modules.org.models import Company, Department, User
+from app.authz.models import Role, RoleAssignment
+from app.modules.org.models import Company, Department, Team, User
 from app.modules.schedules.models import Shift
 
 
@@ -102,6 +103,78 @@ def names(db: Session, item: Shift) -> tuple[str, str | None]:
         employee = db.get(User, item.employee_id)
         person_name = employee.display_name if employee is not None else None
     return (dept.name if dept is not None else ""), person_name
+
+
+# The order of the people menu's sections (frontend #83): the starting roles from the top
+# of a company down, with the roles a company added in between (by name), and Employee
+# last, since nearly everyone holds it.
+_ROLE_RANK = {"owner": 0, "administrator": 1, "manager": 2, None: 3, "employee": 4}
+
+# Each person's roles, as roles_of answers: (name, built_in) pairs, by person.
+RolesByPerson = dict[uuid.UUID, list[tuple[str, str | None]]]
+
+
+def roles_of(db: Session, user_ids: list[uuid.UUID]) -> RolesByPerson:
+    """Each person's active roles, as (name, built_in) pairs in the menu's order: owner,
+    administrator, manager, the company's own roles by name, employee.
+
+    "Active" means what it means for permissions (app/authz/check.py, _active_assignments):
+    the role is not archived, the assignment is not for an archived department or team, and
+    the person is not deactivated. A role held in several scopes is listed once; the scopes
+    themselves stay on the server (who manages where is not the schedule's business).
+
+    One query for all the people on a page, not one per shift. The IDs are looked up first
+    and passed in, since the company filter refuses subqueries (tenancy.md). Every joined
+    model has a column in the select list, so the company filter limits each to the
+    session's company. In SQL it is roughly:
+
+        SELECT role_assignments.user_id, roles.name, roles.built_in
+          FROM role_assignments
+          JOIN roles ON roles.id = role_assignments.role_id
+          JOIN users ON users.id = role_assignments.user_id
+          LEFT OUTER JOIN departments ON departments.id = role_assignments.department_id
+          LEFT OUTER JOIN teams ON teams.id = role_assignments.team_id
+         WHERE role_assignments.user_id IN (:people)
+           AND roles.archived_at IS NULL AND users.deactivated_at IS NULL
+           AND departments.archived_at IS NULL AND teams.archived_at IS NULL
+    """
+    # 1. Nobody to look up (a page of open shifts only): no query at all.
+    if not user_ids:
+        return {}
+    # 2. Everyone gets an entry, so people with no active role get an empty list.
+    found: dict[uuid.UUID, set[tuple[str, str | None]]] = {person: set() for person in user_ids}
+    # 3. The query of the docstring.
+    rows = db.execute(
+        select(
+            RoleAssignment.user_id,
+            Role.name,
+            Role.built_in,
+            User.id,
+            Department.id,
+            Team.id,
+        )
+        .join(Role, Role.id == RoleAssignment.role_id)
+        .join(User, User.id == RoleAssignment.user_id)
+        # Outer joins: an assignment for the whole company or one person has neither, and
+        # then the archived_at conditions below are true for it.
+        .outerjoin(Department, Department.id == RoleAssignment.department_id)
+        .outerjoin(Team, Team.id == RoleAssignment.team_id)
+        .where(
+            RoleAssignment.user_id.in_(user_ids),
+            Role.archived_at.is_(None),
+            User.deactivated_at.is_(None),
+            Department.archived_at.is_(None),
+            Team.archived_at.is_(None),
+        )
+    )
+    # 4. A set per person drops the same role held in several scopes.
+    for person, name, built_in, *_ in rows:
+        found[person].add((name, built_in))
+    # 5. The menu's order: by rank, then by name (which only matters among added roles).
+    return {
+        person: sorted(roles, key=lambda role: (_ROLE_RANK.get(role[1], 3), role[0].casefold()))
+        for person, roles in found.items()
+    }
 
 
 # --- The list ---------------------------------------------------------------------------

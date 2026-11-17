@@ -309,3 +309,36 @@ def test_thirty_one_days_is_allowed(shifts: ShiftSetup) -> None:
     first = soon().date()
     query = {"from": str(first), "to": str(first + timedelta(days=30))}
     assert shifts.browser("chef").get("/api/shifts", params=query).status_code == 200
+
+
+# --- Roles in the schedule (workforce-ops-backend#159) ----------------------------------
+
+
+def test_an_employee_sees_coworkers_role_names_and_nothing_more(shifts: ShiftSetup) -> None:
+    # Decided 2026-11-17 (decision 0038): everyone who can see a schedule sees the role
+    # names of the people on it. Only the name and which starting role it is: no role IDs,
+    # no permissions, no scopes (who manages which department stays on the server).
+    shifts.new_shift(employee_id=shifts.ids["cara"])
+    first = soon().date()
+    response = shifts.browser("ana").get(
+        "/api/shifts", params={"from": str(first), "to": str(first + timedelta(days=6))}
+    )
+    assert response.status_code == 200, response.text
+    person = response.json()["items"][0]["employee"]
+    assert set(person) == {"id", "display_name", "roles"}
+    assert person["roles"] == [{"name": "Employee", "built_in": "employee"}]
+
+
+def test_another_companys_roles_are_never_found(shifts: ShiftSetup) -> None:
+    # The lookup runs under company A's filter. Even handed the IDs of company B's people
+    # (as a forged request might try), it finds none of their roles.
+    from app.modules.schedules import repository
+
+    with shifts.db(shifts.company_a) as db:
+        found = repository.roles_of(db, [shifts.ids["b_ana"], shifts.ids["b_chef"]])
+    assert found == {shifts.ids["b_ana"]: [], shifts.ids["b_chef"]: []}
+    # And under company B's own filter, they are there: the test is not empty by accident.
+    with shifts.db(shifts.company_b) as db:
+        assert repository.roles_of(db, [shifts.ids["b_ana"]])[shifts.ids["b_ana"]] == [
+            ("Employee", "employee")
+        ]
