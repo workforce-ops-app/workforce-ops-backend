@@ -22,6 +22,7 @@ from app.auth import links
 from app.auth.dependencies import Database, SignedInPerson
 from app.auth.limits import client_address
 from app.modules.password_links.schemas import LinkCreated, RedeemRequest
+from app.modules.security.layer import detection_skip
 
 people = APIRouter(prefix="/api/users", tags=["password links"])
 redeeming = APIRouter(prefix="/api/password-links", tags=["password links"])
@@ -60,6 +61,7 @@ def create_reset_link(
 
 
 @redeeming.post("/redeem", status_code=204)
+@detection_skip  # takes the link token and the new password (rule DE3)
 def redeem_link(body: RedeemRequest, request: Request, db: Database) -> None:
     """Set a password with a link. Nobody is signed in: the link is the proof. Attempts
     count toward the same 20 a minute per address as sign-in (app/auth/limits.py), so
