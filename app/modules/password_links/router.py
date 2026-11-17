@@ -8,9 +8,10 @@
 The rules live in app/auth/links.py; this file only turns HTTP into calls and back.
 
 Errors: 400 the link does not work (one answer for every reason), 401 not signed in,
-403 not allowed, 404 no such person (or another company's), 409 the kind of link does not
-fit the account, 422 invalid input or a password that breaks a rule, 429 too many tries
-from one address.
+403 not allowed (or reauth-required: a link for someone with an admin-level permission
+needs the password entered again first), 404 no such person (or another company's),
+409 the kind of link does not fit the account, 422 invalid input or a password that
+breaks a rule, 429 too many tries from one address.
 """
 
 import uuid
@@ -49,7 +50,9 @@ def create_setup_link(
     user_id: uuid.UUID, request: Request, current: SignedInPerson, db: Database
 ) -> LinkCreated:
     """A link for a new account to choose its first password."""
-    return _created(request, links.create_link(db, current.user, user_id, "setup"))
+    return _created(
+        request, links.create_link(db, current.user, user_id, "setup", session=current.session)
+    )
 
 
 @people.post("/{user_id}/reset-link", status_code=201)
@@ -57,7 +60,9 @@ def create_reset_link(
     user_id: uuid.UUID, request: Request, current: SignedInPerson, db: Database
 ) -> LinkCreated:
     """A link for someone who forgot their password (or is locked out) to choose a new one."""
-    return _created(request, links.create_link(db, current.user, user_id, "reset"))
+    return _created(
+        request, links.create_link(db, current.user, user_id, "reset", session=current.session)
+    )
 
 
 @redeeming.post("/redeem", status_code=204)

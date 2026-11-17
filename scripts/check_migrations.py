@@ -832,6 +832,7 @@ def _link_race_problems(engine: Engine) -> list[str]:
 
     from app.audit import Actor
     from app.auth import links
+    from app.auth.models import UserSession
     from app.authz.roles import assign_role, create_starting_roles
     from app.modules.org.models import Company, Department, User
     from app.tenancy.context import set_company
@@ -881,7 +882,16 @@ def _link_race_problems(engine: Engine) -> list[str]:
             acting = db.get(User, owner_id)
             if acting is None:  # made above, in this company
                 raise RuntimeError("the race probe's owner is missing")
-            return links.create_link(db, acting, person_id, "setup").token  # type: ignore[arg-type]
+            # create_link wants the acting person's session, for the password re-entry a
+            # link for an administrator needs. The new people here hold no role, so it is
+            # never asked for; an unsaved session stands in for the owner's.
+            return links.create_link(
+                db,
+                acting,
+                person_id,  # type: ignore[arg-type]
+                "setup",
+                session=UserSession(user_id=owner_id),
+            ).token
 
     def redeem(token: str, password: str, start: threading.Barrier, outcomes: list[str]) -> None:
         # Each redemption is its own request, in a session with no company yet.

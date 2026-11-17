@@ -23,6 +23,7 @@ from app.audit.models import AuditEvent
 from app.auth.links import LINK_NOT_VALID
 from app.auth.models import OneTimeToken, UserSession
 from app.auth.passwords import hash_password
+from app.auth.sessions import COOKIE_NAME, new_token
 from app.authz.models import ReportingLine, Role
 from app.authz.roles import assign_role
 from app.db.base import utcnow
@@ -252,6 +253,77 @@ def test_a_link_stops_working_when_the_person_is_deactivated(links: ShiftSetup) 
         ana.deactivated_at = utcnow()
         db.commit()
     assert _redeem(links, token) == 400
+
+
+def test_a_link_for_an_administrator_needs_the_password_entered_again(
+    links: ShiftSetup,
+) -> None:
+    """Someone who took over the owner's session (a computer left signed in) must not be
+    able to hand themselves another administrator's account with a link: the session alone
+    is not enough, the owner's password must have been entered again in the last 5 minutes
+    (threat S2; the same rule as deactivating an administrator)."""
+    owner = links.browser("owner")
+    url = f"/api/users/{links.ids['admin']}/reset-link"
+
+    # Without a recent re-entry: refused with reauth-required, and no link exists.
+    refused = owner.post(url)
+    assert refused.status_code == 403
+    assert refused.json()["type"] == "reauth-required"
+    with links.db() as db:
+        assert db.scalars(select(OneTimeToken)).all() == []
+
+    # After entering the password again in this session: allowed.
+    reauth = owner.post("/api/sessions/current/reauth", json={"password": PASSWORD})
+    assert reauth.status_code == 204, reauth.text
+    assert owner.post(url).status_code == 201
+
+
+def test_a_link_for_someone_without_admin_rights_needs_no_reentry(links: ShiftSetup) -> None:
+    # Ana is an employee: the session is enough, as before.
+    assert _create(links, "owner", "ana", "reset").status_code == 201
+
+
+# --- CSRF: redeeming is checked for Origin only, like signing in ------------------------
+
+
+def test_a_link_works_in_a_browser_with_an_old_session_cookie(links: ShiftSetup) -> None:
+    """The link is the proof, not a session. A browser that still has a session cookie
+    (expired, or someone else's on a shared computer) and no CSRF token must reach the
+    link check instead of being refused before it."""
+    # An old cookie: the right shape, but its session no longer exists.
+    first = _token(links, "owner", "ana", "reset")
+    expired = _anonymous(links)
+    expired.cookies.set(COOKIE_NAME, new_token()[0])
+    response = expired.post(
+        "/api/password-links/redeem", json={"token": first, "new_password": NEW_PASSWORD}
+    )
+    assert response.status_code == 204, response.text
+
+    # Someone else's live session in the same browser (chef's cookie, without chef's
+    # token): the link still works, and chef stays signed in as chef.
+    second = _token(links, "owner", "newbie")
+    shared = _anonymous(links)
+    shared.cookies.set(COOKIE_NAME, links.browser("chef").cookies[COOKIE_NAME])
+    response = shared.post(
+        "/api/password-links/redeem", json={"token": second, "new_password": NEW_PASSWORD}
+    )
+    assert response.status_code == 204, response.text
+    assert _signs_in(links, "newbie", NEW_PASSWORD)
+    assert links.browser("chef").get("/api/sessions/current").status_code == 200
+
+
+def test_a_redemption_from_another_site_is_still_refused(links: ShiftSetup) -> None:
+    # The Origin check still applies: another site cannot submit a link (for instance one
+    # for the attacker's own account) from the victim's browser.
+    token = _token(links, "owner", "newbie")
+    response = _anonymous(links).post(
+        "/api/password-links/redeem",
+        json={"token": token, "new_password": NEW_PASSWORD},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert response.status_code == 403
+    # Refused before the link was looked at: it still works from our own pages.
+    assert _redeem(links, token) == 204
 
 
 # --- AU8: a reset ends every session; it also clears a lockout --------------------------

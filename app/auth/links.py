@@ -41,8 +41,9 @@ from sqlalchemy.orm import Session
 from app.audit import Actor, record
 from app.auth.models import OneTimeToken, UserSession
 from app.auth.passwords import PasswordRejected, check_password, hash_password
+from app.auth.reauth import require_reauth
 from app.auth.sessions import hash_cookie, new_token
-from app.authz.check import authorize
+from app.authz.check import authorize, holds_admin_level
 from app.db.base import utcnow
 from app.db.types import new_id
 from app.modules.org.models import Company, User
@@ -107,13 +108,17 @@ def _locked_person(db: Session, person_id: uuid.UUID) -> User | None:
     return db.get(User, person_id, with_for_update=True, populate_existing=True)
 
 
-def create_link(db: Session, user: User, person_id: uuid.UUID, purpose: Purpose) -> NewLink:
+def create_link(
+    db: Session, user: User, person_id: uuid.UUID, purpose: Purpose, *, session: UserSession
+) -> NewLink:
     """Create a setup or reset link for the person, cancelling their earlier links.
 
     Allowed for someone with user.manage who is above the person (authorize() refuses
     everyone else, and anyone acting on themselves). A setup link is only for an account
     without a password yet, and a reset link only for one with a password; neither for a
-    deactivated account (409). Commits.
+    deactivated account (409). A link for someone who holds an admin-level permission is a
+    sensitive action: it needs the password re-entered in `session` (the user's own)
+    within the last 5 minutes (authorization.md, sensitive actions). Commits.
     """
     # 1. Allowed to create links at all? Checked before the person is even looked up, so
     #    someone without the permission learns nothing about which people exist.
@@ -137,12 +142,23 @@ def create_link(db: Session, user: User, person_id: uuid.UUID, purpose: Purpose)
     if purpose == "reset" and person.password_hash is None:
         raise Conflict("This person has no password yet; create a setup link instead.")
 
-    # 5. Cancel the person's earlier links by deleting them: unused ones stop working at
+    # 5. A link hands over the account: whoever holds it chooses the password. So for
+    #    someone who holds an admin-level permission (by what their roles grant, custom
+    #    roles included), it is as sensitive as deactivating them: refused with
+    #    reauth-required unless the password was entered again recently in this session
+    #    (threat S2: a session taken over on a shared computer must not be enough to take
+    #    over another administrator's account too). The same check as deactivate()
+    #    (app/modules/org/people.py), for setup and reset links alike. Checked before
+    #    anything changes; links for anyone else need no re-entry.
+    if holds_admin_level(db, person):
+        require_reauth(session)
+
+    # 6. Cancel the person's earlier links by deleting them: unused ones stop working at
     #    once, and used or expired ones are cleared away, so a person has at most one row.
     #    A delete with a where clause: the company filter adds the company condition too.
     cancelled = db.execute(delete(OneTimeToken).where(OneTimeToken.user_id == person.id))
 
-    # 6. A new random token; only its SHA-256 is stored.
+    # 7. A new random token; only its SHA-256 is stored.
     token, token_hash = new_token()
     link = OneTimeToken(
         id=new_id(),
@@ -154,7 +170,7 @@ def create_link(db: Session, user: User, person_id: uuid.UUID, purpose: Purpose)
     )
     db.add(link)
 
-    # 7. Audited in the same transaction (never the token or its hash).
+    # 8. Audited in the same transaction (never the token or its hash).
     record(
         db,
         actor=Actor.user(user.id),
@@ -253,7 +269,7 @@ def redeem(db: Session, token: str, new_password: str) -> None:
     #    everywhere"); the two could share one helper later.
     ended = db.execute(delete(UserSession).where(UserSession.user_id == person.id))
 
-    # 7. Audited in the same transaction. The person acts on their own account, though no
+    # 8. Audited in the same transaction. The person acts on their own account, though no
     #    session is signed in yet.
     record(
         db,
