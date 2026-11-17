@@ -274,6 +274,41 @@ def _database_rule_problems(url: str) -> list[str]:
             if _refused(connection, line_sql, line(company_a, ana["id"], ben["id"])):
                 problems.append("an ended reporting line blocked adding the same line again")
 
+            # 7 and 8. Announcements (AN1): the audience CHECK keeps exactly the ID the
+            # type needs (MySQL only enforces CHECKs from 8.0.16), and the company-aware
+            # keys keep an announcement out of another company's department.
+            announcement_sql = (
+                "INSERT INTO announcements (id, company_id, author_id, audience_type, "
+                "department_id, team_id, title, body, created_at, updated_at) VALUES (:id, "
+                ":company, :author, :type, :department, NULL, 'probe', 'probe', NOW(6), NOW(6))"
+            )
+
+            def announcement(company: bytes, kind: str, dept: bytes | None) -> dict[str, object]:
+                return {
+                    "id": secrets.token_bytes(16),
+                    "company": company,
+                    "author": ana["id"],
+                    "type": kind,
+                    "department": dept,
+                }
+
+            if not _refused(
+                connection, announcement_sql, announcement(company_a, "company", department_a)
+            ):
+                problems.append("a company-wide announcement could name a department")
+            if not _refused(
+                connection, announcement_sql, announcement(company_a, "department", None)
+            ):
+                problems.append("a department announcement could have no department")
+            if not _refused(
+                connection, announcement_sql, announcement(company_b, "department", department_a)
+            ):
+                problems.append("an announcement could point at another company's department")
+            if _refused(
+                connection, announcement_sql, announcement(company_a, "department", department_a)
+            ):
+                problems.append("a valid department announcement was refused")
+
             transaction.rollback()
     finally:
         engine.dispose()
