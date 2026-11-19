@@ -172,6 +172,7 @@ def test_a_request_nobody_reviewed_in_time_can_never_be_approved(people: ShiftSe
     assert late.status_code == 409
     found = state(people, request_id)
     assert found.status == "denied" and found.not_reviewed is True
+    assert found.decided_at == found.review_by  # declined at the deadline itself
     assert not holds(people, "chef", administrator)
     assert actions(people, "approval.not_reviewed") == ["approval.not_reviewed"]
     mine = people.browser("admin").get(URL).json()["items"]
