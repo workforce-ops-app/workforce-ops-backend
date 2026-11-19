@@ -157,3 +157,21 @@ def is_above_fresh(db: Session, user: User, person: User) -> bool:
     if user.id == person.id or user.deactivated_at is not None:
         return False
     return is_owner(db, user) or is_above_in_chain_fresh(db, user.id, person.id)
+
+
+def active_owners(db: Session) -> set[uuid.UUID]:
+    """The company's owners right now: people with the Owner role for the whole company
+    who are not deactivated, read fresh (FOR SHARE), for checks after the company's lock
+    (the last owner, who must agree to an owner change)."""
+    holders_now = db.scalars(
+        select(RoleAssignment.user_id, Role.id)
+        .join(Role, Role.id == RoleAssignment.role_id)
+        .where(Role.built_in == "owner", RoleAssignment.scope_type == "company")
+        .with_for_update(read=True)
+    )
+    owners = set()
+    for person_id in set(holders_now):
+        person = db.get(User, person_id)
+        if person is not None and person.deactivated_at is None:
+            owners.add(person_id)
+    return owners
