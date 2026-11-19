@@ -22,12 +22,12 @@ import uuid
 from fastapi import APIRouter, Response
 from fastapi.responses import JSONResponse
 
-from app.approvals.models import ApprovalRequest
+import app.modules.roles.approval  # noqa: F401  (registers what role requests do on approval)
 from app.auth.dependencies import Database, SignedInPerson
 from app.authz.models import Role, RoleAssignment
+from app.modules.approval_requests.schemas import ApprovalRequestOut, shown
 from app.modules.roles import assignments, service
 from app.modules.roles.schemas import (
-    ApprovalRequestOut,
     AssignmentCreate,
     AssignmentList,
     AssignmentOut,
@@ -111,21 +111,6 @@ def _assignment(item: RoleAssignment, role: Role) -> AssignmentOut:
     )
 
 
-def _request(item: ApprovalRequest) -> ApprovalRequestOut:
-    """A request waiting for approval, in the answer shape."""
-    return ApprovalRequestOut(
-        id=item.id,
-        kind=item.kind,
-        status=item.status,
-        requested_by=item.requested_by,
-        subject_user_id=item.subject_user_id,
-        payload=item.payload,
-        required_approvals=item.required_approvals,
-        review_by=item.review_by,
-        not_reviewed=item.not_reviewed,
-    )
-
-
 @role_assignments.get("")
 def list_assignments(user_id: uuid.UUID, current: SignedInPerson, db: Database) -> AssignmentList:
     rows = assignments.list_for(db, current.user, user_id)
@@ -146,8 +131,8 @@ def give_role(
     given = assignments.give(db, current.user, body, session=current.session)
     if given.assignment is None:
         # Accepted, not done: the role is given only once someone above approves it.
-        shown = _request(given.request).model_dump(mode="json")  # type: ignore[arg-type]
-        return JSONResponse(status_code=202, content=shown)
+        content = shown(given.request).model_dump(mode="json")  # type: ignore[arg-type]
+        return JSONResponse(status_code=202, content=content)
     return _assignment(given.assignment, given.role)
 
 
