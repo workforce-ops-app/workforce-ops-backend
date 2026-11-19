@@ -374,7 +374,7 @@ A pending request grants nothing: a role assignment is created only when the req
 | `decision` | `VARCHAR(8)` | `approve` or `deny` |
 | `decided_at` | `DATETIME(6)` | required |
 
-Primary key: `(request_id, approver_id)`, so each person decides once. A request is approved when it has `required_approvals` approvals and is denied by any denial, unless a feature defines its own rule (time off escalates disagreements, [0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)).
+Primary key: `(request_id, approver_id)`, so each person decides once. `approver_id` has no foreign key, since a platform user is not in `users`; for `approver_type = user` the service only records the signed-in person of the request's company. Built in migration `0011` (`app/approvals/models.py`), with a `CHECK` that `decided_at` is set exactly when a request is no longer pending. A request is approved when it has `required_approvals` approvals and is denied by any denial, unless a feature defines its own rule (time off escalates disagreements, [0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)).
 
 ### sessions
 
