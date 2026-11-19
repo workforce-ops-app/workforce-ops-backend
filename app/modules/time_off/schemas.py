@@ -54,6 +54,7 @@ class Decision(BaseModel):
     approver_id: uuid.UUID
     decision: str  # approve or deny
     decided_at: datetime
+    comment: str | None  # plain text, as the reviewer wrote it
 
 
 class TimeOffDetail(TimeOffOut):
@@ -61,6 +62,12 @@ class TimeOffDetail(TimeOffOut):
 
     affected_shifts: list[AffectedShift]
     decisions: list[Decision]
+
+
+class DecisionBody(Strict):
+    """An optional comment with an approval or denial."""
+
+    comment: Reason | None = None
 
 
 class TimeOffList(BaseModel):

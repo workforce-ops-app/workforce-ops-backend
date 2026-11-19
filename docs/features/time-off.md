@@ -1,6 +1,6 @@
 # Time-off requests
 
-- **Status:** asking, cancelling, and following requests are built (TO1: `app/modules/time_off/`, migration `0012`); reviewing, escalation, and opening shifts follow in TO2 (#64)
+- **Status:** built (core tier): asking, cancelling, and following requests (TO1, #63, migration `0012`); reviewing, escalation, and opening shifts (TO2, #64). Code in `app/modules/time_off/`
 - **Related:** workforce-ops-app/workforce-ops-backend#10; frontend page: time-off screens (workforce-ops-app/workforce-ops-frontend#3); design: [authorization](../architecture/authorization.md), [data model](../architecture/data-model.md#approval_requests), [schedules](schedules.md)
 
 ## In short
@@ -39,7 +39,7 @@ sequenceDiagram
 
 1. The employee picks the first and last day and may add a short reason. The request shows which of their shifts fall on those days.
 2. It goes to their **direct managers** who hold `time_off.review`. If none of them can review it (or the employee has no manager), it moves up the chain until someone can, ending at the Owner ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)).
-3. Reviewers see the request, its affected shifts, and the other reviewers' decisions. Anyone higher in the chain may also step in.
+3. Reviewers see the request, its affected shifts, and the other reviewers' decisions. Someone higher in the chain decides only once the request moves up to them (agreed 2026-11-19 for the final: letting anyone higher step in at any time would need its own rule for how their decision combines with the others').
 4. When it is approved, the employee's shifts on those days become **open**. The manager can give them to someone else before or after the decision ([schedules](schedules.md)).
 5. The employee can cancel their request until its first day.
 6. **Same-day absences** (for example calling in sick that morning) are not time-off requests: the manager makes that day's shifts open on the schedule, which is audited ([schedules](schedules.md)).
@@ -68,11 +68,11 @@ stateDiagram-v2
 
 - **Whole days only**, from a first to a last day (at most 30 days per request), stored as `DATE` in the employee's workplace zone ([0021](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0021-time-handling.md)). The first day is **tomorrow or later**, so every request can be reviewed before it starts.
 - **No overlap:** a new request may not overlap the employee's own pending, escalated, or approved requests (409).
-- **Required approvals:** a company setting, `time_off.required_approvals`, default **1** (a company may choose 1 to 5, never 0, declared in `app/modules/time_off/settings.py`), counted among the direct managers ([company settings](../architecture/data-model.md#company_settings)). If fewer direct managers can review than required, administrators are told the setting is misconfigured and all available direct managers are required instead.
+- **Required approvals:** a company setting, `time_off.required_approvals`, default **1** (a company may choose 1 to 5, never 0, declared in `app/modules/time_off/settings.py`), counted among the direct managers ([company settings](../architecture/data-model.md#company_settings)). If fewer direct managers can review than required, all available direct managers are required instead. Telling administrators that the setting does not fit their reporting lines comes with notifications (next tier).
 - **Outcome among direct managers:**
   - enough approvals and no denial: **approved**;
   - denials and no approval: **denied**;
-  - both approvals and a denial: **escalated** to the **nearest shared manager**, the lowest person above all of the managers who decided. That person's decision settles it; with several equally near, the first decision settles it; with none, the Owner decides.
+  - both approvals and a denial: **escalated** to the **nearest shared manager**, the lowest person above all of the managers who decided. That person's decision settles it; with several equally near, the first decision settles it; with none, the Owner decides. Nearest means the fewest steps up to the farthest of the managers who decided, and the shared manager must hold `time_off.review` over the employee. Nobody who already decided reviews it again; if that leaves nobody (an owner was one of the managers who disagreed, and there is no other owner), it waits until it is declined as not reviewed.
 - **No self-review:** nobody reviews their own request; a manager's request goes to their own managers.
 - **Reviewers are checked at the moment they decide** (still above the employee, still holding `time_off.review`).
 - **On approval:** every shift of the employee that overlaps the approved days becomes **open** (`employee_id` cleared, status `open`), with an audit entry linking it to the request.
@@ -122,7 +122,7 @@ stateDiagram-v2
 
 **Not reviewed in time, without a background job** (agreed 2026-11-19 for the final; see [authorization](../architecture/authorization.md#approval-request-endpoints)): the approval record's deadline (`review_by`) is the start of the first day in the employee's workplace zone. The first read or action on a request after that moment declines it as not reviewed (actor `system`, `decided_at` = the deadline itself), through the shared approval layer and the time-off handler's `lapsed` hook (`app/modules/time_off/approval.py`). Every list and view does this first, so the answer never shows a stale status, and no decision can arrive late. A scheduled job can replace it later without changing any endpoint.
 
-**In the code:** rules in `app/modules/time_off/service.py`; the approval record's hooks in `approval.py`; where a request belongs (its employee) in `scope.py`. Each person's requests take turns through a lock on their user row, so two requests sent at once cannot both pass the overlap check. The reason never goes into the audit log, which is kept for good.
+**In the code:** rules for asking, cancelling, and deciding in `app/modules/time_off/service.py`; who reviews and what the decisions add up to in `review.py` (the shared layer calls it through the handler's `outcome` hook, instead of its own "one denial denies"); the approval record's hooks in `approval.py`; days and time zones in `days.py`; where a request belongs (its employee) in `scope.py`. A decision locks, in order, the company's reporting lines, the employee, the request, its approval record, and the shifts it opens, and only then writes audit entries: the same order as every schedule change, so the two never wait on each other. For that reason time-off requests are decided only on their own endpoints; `/api/approval-requests/{id}/approve` answers 409 for them. Reviewers' comments are kept with the approval record (plain text, at most 500 characters) and never in the audit log. Each person's requests take turns through a lock on their user row, so two requests sent at once cannot both pass the overlap check. The reason never goes into the audit log, which is kept for good.
 
 ### Audit and security
 

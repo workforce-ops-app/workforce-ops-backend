@@ -120,6 +120,10 @@ def _decide(
     db: Session, user: User, request_id: uuid.UUID, decision: str, session: UserSession
 ) -> ApprovalRequest:
     request = _locked(db, user, request_id)
+    if request.kind == "time_off":
+        # Decided on its own endpoints, which lock the employee and their shifts first
+        # (app/modules/time_off/service.py): deciding here would take them in another order.
+        raise Conflict("Time-off requests are reviewed on the time-off page.")
     if not may_decide(db, user, request):
         raise Forbidden()  # involved (they asked, or it is about them), but not a reviewer
     if handler_for(request).sensitive(db, request):

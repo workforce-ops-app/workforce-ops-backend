@@ -3,13 +3,16 @@ service.py.
 
     GET  /api/time-off-requests?mine=true                      200  your own requests
     GET  /api/time-off-requests?status=&employee_id=&from=&to= 200  requests in your scope
+    GET  /api/time-off-requests/waiting                        200  waiting for my review
     GET  /api/time-off-requests/{id}                           200  one, with affected shifts
     POST /api/time-off-requests  {first_day, last_day, reason} 201  ask for time off
     POST /api/time-off-requests/{id}/cancel                    200  cancel your own
+    POST /api/time-off-requests/{id}/approve  {comment}        200  approve as a reviewer
+    POST /api/time-off-requests/{id}/deny     {comment}        200  deny as a reviewer
 
 Errors: 401 not signed in, 403 not allowed, 404 not found (or another company's), 409
-overlapping days or not cancellable now, 422 invalid input. Every change also needs the
-CSRF token.
+overlapping days, not cancellable now, or already decided, 422 invalid input. Every
+change also needs the CSRF token.
 """
 
 import uuid
@@ -27,6 +30,7 @@ from app.modules.time_off.models import TimeOffRequest
 from app.modules.time_off.schemas import (
     AffectedShift,
     Decision,
+    DecisionBody,
     TimeOffCreate,
     TimeOffDetail,
     TimeOffList,
@@ -53,6 +57,7 @@ def _out(item: TimeOffRequest, not_reviewed: bool) -> TimeOffOut:
 def _detail(db: Database, detail: service.Detail) -> TimeOffDetail:
     item = detail.request
     flags = service.not_reviewed(db, [item])
+    comments = service.comments(db, item)
     return TimeOffDetail(
         **_out(item, flags[item.id]).model_dump(),
         affected_shifts=[
@@ -62,7 +67,12 @@ def _detail(db: Database, detail: service.Detail) -> TimeOffDetail:
             for s in detail.affected_shifts
         ],
         decisions=[
-            Decision(approver_id=d.approver_id, decision=d.decision, decided_at=d.decided_at)
+            Decision(
+                approver_id=d.approver_id,
+                decision=d.decision,
+                decided_at=d.decided_at,
+                comment=comments.get(str(d.approver_id)),
+            )
             for d in detail.decisions
         ],
     )
@@ -93,6 +103,15 @@ def list_requests(
     return TimeOffList(items=[_out(row, flags[row.id]) for row in rows])
 
 
+@router.get("/waiting")
+def waiting(
+    current: SignedInPerson, db: Database, limit: Annotated[int, Query(ge=1, le=200)] = 50
+) -> TimeOffList:
+    rows = service.waiting(db, current.user, limit=limit)
+    flags = service.not_reviewed(db, rows)
+    return TimeOffList(items=[_out(row, flags[row.id]) for row in rows])
+
+
 @router.get("/{request_id}")
 def view_request(request_id: uuid.UUID, current: SignedInPerson, db: Database) -> TimeOffDetail:
     return _detail(db, service.view_request(db, current.user, request_id))
@@ -107,4 +126,22 @@ def ask(body: TimeOffCreate, current: SignedInPerson, db: Database) -> TimeOffDe
 @router.post("/{request_id}/cancel")
 def cancel(request_id: uuid.UUID, current: SignedInPerson, db: Database) -> TimeOffOut:
     request = service.cancel(db, current.user, request_id)
+    return _out(request, service.not_reviewed(db, [request])[request.id])
+
+
+@router.post("/{request_id}/approve")
+def approve(
+    request_id: uuid.UUID, current: SignedInPerson, db: Database, body: DecisionBody | None = None
+) -> TimeOffOut:
+    comment = body.comment if body else None
+    request = service.decide_request(db, current.user, request_id, "approve", comment)
+    return _out(request, service.not_reviewed(db, [request])[request.id])
+
+
+@router.post("/{request_id}/deny")
+def deny(
+    request_id: uuid.UUID, current: SignedInPerson, db: Database, body: DecisionBody | None = None
+) -> TimeOffOut:
+    comment = body.comment if body else None
+    request = service.decide_request(db, current.user, request_id, "deny", comment)
     return _out(request, service.not_reviewed(db, [request])[request.id])

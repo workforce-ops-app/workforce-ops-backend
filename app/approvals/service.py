@@ -57,6 +57,10 @@ class Handler:
     describe(db, request): what the audit entries show about it (no personal data).
     lapsed(db, request): called when the request is declined as not reviewed, so the
         feature can update its own record too (time off marks its request denied).
+    outcome(db, request): for kinds with their own rule instead of "one denial denies,
+        enough approvals approve": called after each decision is recorded, it answers
+        "approved", "denied", or None (still waiting). Time off uses it to send a
+        disagreement up the chain instead of deciding it.
     """
 
     reviewers: Callable[[Session, ApprovalRequest], set[uuid.UUID]]
@@ -64,6 +68,7 @@ class Handler:
     apply: Callable[[Session, ApprovalRequest, User], None]
     describe: Callable[[Session, ApprovalRequest], dict[str, Any]]
     lapsed: Callable[[Session, ApprovalRequest], None] | None = None
+    outcome: Callable[[Session, ApprovalRequest], str | None] | None = None
 
 
 _handlers: dict[str, Handler] = {}
@@ -193,7 +198,8 @@ def may_decide(db: Session, user: User, request: ApprovalRequest) -> bool:
 
 def decide(db: Session, user: User, request: ApprovalRequest, decision: str) -> None:
     """Record the user's approval or denial (the caller has checked may_decide and taken
-    the company's lock). One denial denies; enough approvals approve and apply it."""
+    the company's lock). One denial denies; enough approvals approve and apply it. A kind
+    with its own outcome rule (Handler.outcome) decides that instead."""
     already = db.get(ApprovalDecision, (request.id, user.id))
     if already is not None:
         raise DecisionError("You have already decided this request.")
@@ -208,6 +214,13 @@ def decide(db: Session, user: User, request: ApprovalRequest, decision: str) -> 
         )
     )
     details = {"kind": request.kind, **handler_for(request).describe(db, request)}
+    rule = handler_for(request).outcome
+    if rule is not None:
+        db.flush()  # the kind's rule reads this decision with the others
+        result = rule(db, request)
+        if result is None:
+            return  # still waiting (or sent up the chain)
+        decision = "deny" if result == "denied" else "approve"
     if decision == "deny":
         request.status, request.decided_at = "denied", now
         record(
@@ -220,14 +233,15 @@ def decide(db: Session, user: User, request: ApprovalRequest, decision: str) -> 
         )
         return
 
-    db.flush()  # the decision is counted below
-    approvals = db.scalars(
-        select(ApprovalDecision.approver_id).where(
-            ApprovalDecision.request_id == request.id, ApprovalDecision.decision == "approve"
-        )
-    ).all()
-    if len(approvals) < request.required_approvals:
-        return  # more approvals needed; it stays pending
+    if rule is None:
+        db.flush()  # the decision is counted below
+        approvals = db.scalars(
+            select(ApprovalDecision.approver_id).where(
+                ApprovalDecision.request_id == request.id, ApprovalDecision.decision == "approve"
+            )
+        ).all()
+        if len(approvals) < request.required_approvals:
+            return  # more approvals needed; it stays pending
     # Approved: the change is made in this same transaction, so either both happen or
     # neither does.
     handler_for(request).apply(db, request, user)
