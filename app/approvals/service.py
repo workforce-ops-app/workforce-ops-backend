@@ -26,7 +26,7 @@ themselves; each person decides a request once (the decisions table's key).
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -55,12 +55,15 @@ class Handler:
     apply(db, request, approver): make the change once approved; raise DecisionError if
         it can no longer be made (say, the role was archived meanwhile).
     describe(db, request): what the audit entries show about it (no personal data).
+    lapsed(db, request): called when the request is declined as not reviewed, so the
+        feature can update its own record too (time off marks its request denied).
     """
 
     reviewers: Callable[[Session, ApprovalRequest], set[uuid.UUID]]
     sensitive: Callable[[Session, ApprovalRequest], bool]
     apply: Callable[[Session, ApprovalRequest, User], None]
     describe: Callable[[Session, ApprovalRequest], dict[str, Any]]
+    lapsed: Callable[[Session, ApprovalRequest], None] | None = None
 
 
 _handlers: dict[str, Handler] = {}
@@ -110,11 +113,13 @@ def open_request(
     payload: dict[str, Any],
     details: dict[str, Any],
     required_approvals: int = 1,
+    review_by: datetime | None = None,
 ) -> ApprovalRequest:
     """Record a request waiting for approval, with its audit entry; the caller commits.
 
     `payload` is what happens on approval (kept with the request); `details` is what the
-    audit entry shows about it (for a role: its name and scope).
+    audit entry shows about it (for a role: its name and scope). `review_by` is the
+    deadline, 7 days from now unless the kind sets its own (time off: its first day).
     """
     if kind not in KINDS:
         raise ValueError(f"unknown kind of approval request {kind!r}")
@@ -125,7 +130,7 @@ def open_request(
         payload=payload,
         status="pending",
         required_approvals=required_approvals,
-        review_by=utcnow() + REVIEW_WITHIN,
+        review_by=review_by if review_by is not None else utcnow() + REVIEW_WITHIN,
         not_reviewed=False,
     )
     db.add(request)
@@ -166,6 +171,9 @@ def lapse(db: Session, request: ApprovalRequest) -> bool:
         target_id=request.id,
         details={"kind": request.kind, **handler_for(request).describe(db, request)},
     )
+    hook = handler_for(request).lapsed
+    if hook is not None:
+        hook(db, request)
     return True
 
 
