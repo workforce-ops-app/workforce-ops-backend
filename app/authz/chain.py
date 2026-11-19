@@ -39,6 +39,7 @@ from sqlalchemy.orm import Session, aliased
 
 from app.audit import Actor, record
 from app.authz.models import ReportingLine
+from app.db.base import utcnow
 from app.modules.org.models import Company
 from app.tenancy.context import get_company
 
@@ -263,5 +264,31 @@ def add_reporting_line(
         target_type="reporting_line",
         target_id=line.id,
         details={"manager_id": str(manager_id), "employee_id": str(employee_id)},
+    )
+    return line
+
+
+def end_reporting_line(db: Session, actor: Actor, line_id: uuid.UUID) -> ReportingLine:
+    """End a current line (it stays as history, decision 0020); audited. The caller commits.
+
+    Takes the company's lock first, before the audit entry, like add_reporting_line(), and
+    then reads the line fresh and locked: if another request ended it while this one
+    waited, it is refused here instead of being ended twice. Who may end it (someone above
+    both people, with reporting_line.manage) is checked by the caller.
+    """
+    lock_reporting_lines(db)
+    line = db.get(ReportingLine, line_id, populate_existing=True, with_for_update=True)
+    if line is None:
+        raise LookupError("no such reporting line")
+    if line.ended_at is not None:
+        raise ReportingLineError("this reporting line has already ended")
+    line.ended_at = utcnow()
+    record(
+        db,
+        actor=actor,
+        action="reporting_line.ended",
+        target_type="reporting_line",
+        target_id=line.id,
+        details={"manager_id": str(line.manager_id), "employee_id": str(line.employee_id)},
     )
     return line

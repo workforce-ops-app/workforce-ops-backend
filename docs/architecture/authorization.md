@@ -4,7 +4,7 @@
 
 Decisions: [0017 scoped role assignments](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0017-scoped-role-assignments.md) · [0024 authorization model](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md) · [0025 sensitive actions](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0025-sensitive-actions-and-security-settings.md) · [0029 approval routing](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md) · [0032 delegation limits](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md)
 
-> **Status:** permissions, roles, assignments, `authorize()`, scope resolvers, and the list filter are built (`app/authz/`, migration `0005`, slice Z1), and so is the reporting chain (`app/authz/chain.py`, migration `0007`, slice Z2): person permissions work for anyone above the person. The role, role-assignment, and approval-request endpoints are built (slice Z4: [role endpoints](#role-endpoints), [approval requests](#approval-request-endpoints)); a role at the giver's own level opens an approval request (`app/approvals/`, migration `0011`) that the manager above decides. Reporting lines are only added by the seed script and with new accounts so far; the endpoints to add and end lines, and owner changes, follow in Z5.
+> **Status:** permissions, roles, assignments, `authorize()`, scope resolvers, and the list filter are built (`app/authz/`, migration `0005`, slice Z1), and so is the reporting chain (`app/authz/chain.py`, migration `0007`, slice Z2): person permissions work for anyone above the person. The role, role-assignment, and approval-request endpoints are built (slice Z4: [role endpoints](#role-endpoints), [approval requests](#approval-request-endpoints)); a role at the giver's own level opens an approval request (`app/approvals/`, migration `0011`) that the manager above decides. Reporting lines can be added and ended through the API (`app/modules/reporting_lines/`, slice Z5 part 1); owner changes follow in Z5 part 2.
 
 ## The two questions every check answers
 
@@ -174,6 +174,16 @@ In the code (`app/authz/chain.py`) the last line reads the `reporting_lines` mod
 - Only one current line per manager and employee pair.
 - Adding or ending a line needs the password re-entered and is audited.
 
+**Endpoints** (`app/modules/reporting_lines/`):
+
+| Endpoint | Needs | What it does |
+|---|---|---|
+| `GET /api/reporting-lines?user_id=[&include_ended=true]` | your own, or `user.view` covering the person | the lines a person is part of, as manager or employee |
+| `POST /api/reporting-lines` `{manager_id, employee_id}` | `reporting_line.manage` over both people (never yourself: AZ2), above both (AZ6), password re-entry | add a line; 409 for a loop, a duplicate, or a deactivated person |
+| `POST /api/reporting-lines/{id}/end` | as for adding | end a line; it stays as history; 409 if it has already ended |
+
+Both take the company's lock before anything else (and before the audit entry), then check "above both" again on fresh reads; ending reads the line itself fresh and locked, so two requests never end it twice (a race in `scripts/check_migrations.py`).
+
 **People with no line above them** can be managed only by the Owner. Their requests go straight to the Owner ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)).
 
 ## Delegation limits
@@ -258,7 +268,7 @@ These need the password re-entered shortly before, as set out in [0025](https://
 - adding or ending a reporting line;
 - changing security settings.
 
-Each of these actions calls `require_reauth()` (`app/auth/reauth.py`) before it changes anything, as its endpoint is built. Deactivating an admin-level holder does so now (`deactivate()` in `app/modules/org/people.py`), and so does creating a link for one (`create_link()` in `app/auth/links.py`): "holds such a role" is read from the permissions the person's active roles grant (`holds_admin_level()` in `app/authz/check.py`), so a company's own roles count too. Changing what a role grants and archiving a role do so too (`update_role()` and `archive_role()` in `app/modules/roles/service.py`); a rename alone does not. So do giving and removing a role with an admin-level permission (`give()` and `remove()` in `app/modules/roles/assignments.py`). So does approving or denying a request for an admin-level role (`_decide()` in `app/modules/approval_requests/service.py`). Still to come: the line and owner actions with Z5, security settings with #59.
+Each of these actions calls `require_reauth()` (`app/auth/reauth.py`) before it changes anything, as its endpoint is built. Deactivating an admin-level holder does so now (`deactivate()` in `app/modules/org/people.py`), and so does creating a link for one (`create_link()` in `app/auth/links.py`): "holds such a role" is read from the permissions the person's active roles grant (`holds_admin_level()` in `app/authz/check.py`), so a company's own roles count too. Changing what a role grants and archiving a role do so too (`update_role()` and `archive_role()` in `app/modules/roles/service.py`); a rename alone does not. So do giving and removing a role with an admin-level permission (`give()` and `remove()` in `app/modules/roles/assignments.py`). So does approving or denying a request for an admin-level role (`_decide()` in `app/modules/approval_requests/service.py`). Adding and ending a line do so too (`app/modules/reporting_lines/service.py`). Still to come: the owner actions with Z5, security settings with #59.
 
 Schedule changes affecting 10 or more shifts show a confirmation with the count (no password re-entry). Companies may add actions to the re-entry list but never remove them.
 
@@ -295,5 +305,5 @@ The session endpoint returns the signed-in user's effective permissions, so the 
 | A module's permissions | `app/modules/<feature>/permissions.py`, a list named `PERMISSIONS`; found automatically |
 | A module's scope resolver | `@scope_resolver(Model)` in the module (people: `app/authz/scope.py`) |
 | The `reporting_lines` table | `app/authz/models.py`, migration `0007` |
-| Reporting chain queries, and adding a line with its data rules (audited) | `app/authz/chain.py`; the endpoints that add and end lines are Z5 |
-| Tests | `tests/unit/test_authz.py`, `tests/security/test_authorization.py`, `tests/security/test_reporting_chain.py` (E3, E4, AZ5, AZ6), `tests/security/test_people.py` (AZ5 and AZ8 on account actions), `tests/security/test_roles.py` (AZ3, AZ9, AZ11, AZ12, AZ13 on roles), `tests/security/test_role_assignments.py` (AZ1, AZ3, AZ4, AZ5, AZ14 on giving and removing roles), `tests/security/test_approval_requests.py` (AZ7, AZ14 on deciding requests); the other escalation tests arrive with the endpoints that make those changes (Z4, Z5) |
+| Reporting chain queries, and adding or ending a line with its data rules (audited) | `app/authz/chain.py`; the endpoints in `app/modules/reporting_lines/` |
+| Tests | `tests/unit/test_authz.py`, `tests/security/test_authorization.py`, `tests/security/test_reporting_chain.py` (E3, E4, AZ5, AZ6), `tests/security/test_people.py` (AZ5 and AZ8 on account actions), `tests/security/test_roles.py` (AZ3, AZ9, AZ11, AZ12, AZ13 on roles), `tests/security/test_role_assignments.py` (AZ1, AZ3, AZ4, AZ5, AZ14 on giving and removing roles), `tests/security/test_approval_requests.py` (AZ7, AZ14 on deciding requests), `tests/security/test_reporting_line_endpoints.py` (AZ2, AZ6 on the line endpoints); the other escalation tests arrive with the endpoints that make those changes (Z4, Z5) |

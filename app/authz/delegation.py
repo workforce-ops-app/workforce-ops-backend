@@ -148,3 +148,12 @@ def is_same_level(db: Session, user: User, codes: set[str], scope: Scope | None)
         return False
     mine_here = held_for(db, user, set(effective_permissions(db, user)), scope)
     return mine_here <= codes
+
+
+def is_above_fresh(db: Session, user: User, person: User) -> bool:
+    """Whether the user is above the person, on fresh reads, for checks made after the
+    company's lock: an owner always; anyone else through current lines (a line ended while
+    the request waited counts). Nobody is above themselves."""
+    if user.id == person.id or user.deactivated_at is not None:
+        return False
+    return is_owner(db, user) or is_above_in_chain_fresh(db, user.id, person.id)
