@@ -10,7 +10,8 @@ change. The request grants nothing while it is pending. Then:
 - lapse():    nobody decided by review_by: it is declined as "not reviewed", and the audit
               log says so (decision 0032). This happens the next time anyone reads or
               acts on the request, so no background job is needed: nothing can approve a
-              lapsed request, because every decision lapses it first.
+              lapsed request, because every decision lapses it first. Its decided_at is
+              the deadline itself; the audit entry is written when it is noticed.
 
 What a kind of request does, and who may review it, is up to the feature that owns the
 kind: it registers a Handler (register_handler), as roles do for "role_assignment"
@@ -158,7 +159,9 @@ def lapse(db: Session, request: ApprovalRequest) -> bool:
         return False
     request.status = "denied"
     request.not_reviewed = True
-    request.decided_at = utcnow()
+    # Declined at the deadline, not at the moment someone happened to look: the history
+    # then shows exactly when the request ran out of time.
+    request.decided_at = request.review_by
     record(
         db,
         actor=Actor.system(),
