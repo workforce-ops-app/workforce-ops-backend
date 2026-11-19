@@ -51,7 +51,9 @@ def upgrade() -> None:
             ["company_id", "approval_request_id"],
             ["approval_requests.company_id", "approval_requests.id"],
         ),
-        sa.UniqueConstraint("approval_request_id", name="uq_time_off_requests_approval"),
+        sa.UniqueConstraint(
+            "company_id", "approval_request_id", name="uq_time_off_requests_approval"
+        ),
         sa.CheckConstraint("last_day >= first_day", name="time_off_requests_days"),
         sa.CheckConstraint(
             "status IN ('pending', 'escalated', 'approved', 'denied', 'cancelled')",

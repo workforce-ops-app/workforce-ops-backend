@@ -40,8 +40,10 @@ class TimeOffRequest(IdAndTimestamps, CompanyOwned, Base):
             ["company_id", "approval_request_id"],
             ["approval_requests.company_id", "approval_requests.id"],
         ),
-        # One request, one approval record.
-        UniqueConstraint("approval_request_id", name="uq_time_off_requests_approval"),
+        # One request, one approval record. company_id comes first so this index also
+        # serves the company-aware key above; without it MySQL adds an unnamed index of its
+        # own, which the migration check reports as a difference.
+        UniqueConstraint("company_id", "approval_request_id", name="uq_time_off_requests_approval"),
         Index("ix_time_off_requests_company_employee", "company_id", "employee_id", "first_day"),
         CheckConstraint("last_day >= first_day", name="time_off_requests_days"),
         CheckConstraint(
