@@ -204,6 +204,11 @@ def test_a_denial_with_a_comment(people: ShiftSetup) -> None:
     assert [(d["decision"], d["comment"]) for d in seen["decisions"]] == [
         ("deny", "<b>short-staffed</b>")  # kept as typed, shown as plain text
     ]
+    # Who asked and who decided, by name, for the review screen (#172).
+    assert seen["employee_name"] == "Ana"
+    assert [d["approver_name"] for d in seen["decisions"]] == ["Chef"]
+    waiting = people.browser("chef").get(f"{URL}?status=denied").json()["items"]
+    assert {item["employee_name"] for item in waiting} <= {"Ana"}
     assert actions(people, "time_off.denied") == ["time_off.denied"]
     with people.db() as db:
         shift = db.get(Shift, uuid.UUID(on_the_day))

@@ -98,6 +98,8 @@ stateDiagram-v2
 | `POST /time-off-requests/{id}/cancel` | `time_off.cancel_self` | cancel your own request |
 | `POST /time-off-requests/{id}/approve`, `POST /time-off-requests/{id}/deny` `{comment}` | `time_off.review`, above the employee | decide |
 
+Every answer names the employee (`employee_name`), and each decision its reviewer (`approver_name`), so the review screen needs no lookups the reviewer may not be allowed to make (#172). Names are read in one query per answer. Anyone who may see a request may see these names.
+
 **Table: `time_off_requests`** (feature table; the shared approval tables are on the [data model](../architecture/data-model.md#approval_requests) page)
 
 | Column | Type | Rules |
