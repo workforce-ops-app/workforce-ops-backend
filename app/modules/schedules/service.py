@@ -17,7 +17,9 @@ Rules:
   is refused (409) rather than changed without its person's lock.
 - A shift that has ended, or was cancelled, can no longer be changed (409).
 - No new shift goes into an archived department (409).
-- Time off is checked here once time-off requests exist (time-off slices).
+- Nobody is assigned during their approved time off (409): checked with the double booking,
+  under the same row lock, so an approval and an assignment take turns
+  (repository.on_time_off). Only approved time off counts.
 - Several shifts at once (batch): every shift passes the same checks as one shift would,
   all in one transaction, so either every change is saved or none is. At 10 or more shifts
   the request must repeat the count (confirm_count), or nothing is saved (409).
@@ -31,14 +33,13 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.audit import Actor, record
 from app.authz.check import Forbidden, authorize, scope_filter
 from app.authz.scope import ScopeColumns
 from app.db.base import utcnow
-from app.modules.org.models import Team, TeamMember, User
+from app.modules.org.models import User
 from app.modules.schedules import repository
 from app.modules.schedules import scope as _scope  # noqa: F401  (registers the resolver)
 from app.modules.schedules.models import Shift
@@ -75,6 +76,8 @@ class NotFound(HTTPException):
 
 
 CANNOT_ASSIGN = "This person cannot be assigned to this shift."
+# Shown as it is on the screens, so it names the reason in plain words.
+ON_TIME_OFF = "This person has approved time off then."
 
 
 def _utc(moment: datetime) -> datetime:
@@ -147,26 +150,16 @@ def _lock_for_change(
 def _check_assignable(db: Session, shift: Shift, employee_id: uuid.UUID) -> None:
     """Refuse anyone who cannot work this shift (see the rules at the top)."""
     person = repository.person(db, employee_id, lock=True)
-    # Unknown (or of another company), deactivated, or not set up yet ("invited").
-    if person is None or person.deactivated_at is not None or person.password_hash is None:
-        raise Invalid(CANNOT_ASSIGN)
-    # Home department, or on an active team in the shift's department. An archived team
-    # keeps its member list for history (organization.md), but being listed on it no
-    # longer makes anyone eligible.
-    on_team = db.execute(
-        select(TeamMember.user_id, Team.id)
-        .join(Team, Team.id == TeamMember.team_id)
-        .where(
-            TeamMember.user_id == person.id,
-            Team.department_id == shift.department_id,
-            Team.archived_at.is_(None),
-        )
-        .limit(1)
-    ).first()
-    if person.department_id != shift.department_id and on_team is None:
+    # Unknown (or of another company), deactivated, not set up yet ("invited"), or neither
+    # living in the shift's department nor on an active team in it.
+    if person is None or not repository.assignable(db, person, shift.department_id):
         raise Invalid(CANNOT_ASSIGN)
     if repository.has_overlap(db, person.id, shift.starts_at, shift.ends_at, ignore=shift.id):
         raise Conflict("This person already has a shift at that time.")
+    # Approved time off: the approval already opened their shifts on those days, so giving
+    # them one there again (or a new one) would undo it. Same lock as above.
+    if repository.on_time_off(db, person, shift.starts_at, shift.ends_at):
+        raise Conflict(ON_TIME_OFF)
 
 
 def get_shift(db: Session, user: User, shift_id: uuid.UUID) -> Shift:
@@ -268,6 +261,11 @@ def update_shift(db: Session, user: User, shift_id: uuid.UUID, body: ShiftUpdate
         and repository.has_overlap(db, item.employee_id, item.starts_at, item.ends_at, item.id)
     ):
         raise Conflict("This person already has a shift at that time.")
+    # New times: and they must not move into the person's approved time off.
+    if new_times and item.employee_id is not None:
+        person = repository.person(db, item.employee_id)  # already locked above
+        if person is not None and repository.on_time_off(db, person, item.starts_at, item.ends_at):
+            raise Conflict(ON_TIME_OFF)
 
     if changed:
         record(
