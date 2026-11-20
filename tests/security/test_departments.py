@@ -29,6 +29,8 @@ def test_list_departments_never_returns_another_companys_departments(
     returned_ids = {department["id"] for department in response.json()["items"]}
     assert returned_ids == company_a_ids
     assert returned_ids.isdisjoint(company_b_ids)
+    # Each says its own time zone, or null for the company's (#170).
+    assert all("timezone" in department for department in response.json()["items"])
 
 
 def test_list_departments_rejects_another_companys_cursor(signin: SignInSetup) -> None:
