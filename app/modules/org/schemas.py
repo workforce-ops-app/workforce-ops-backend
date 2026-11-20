@@ -40,6 +40,19 @@ class DepartmentOut(BaseModel):
 
     id: uuid.UUID
     name: str
+    timezone: str | None  # null: the company's time zone applies (#170)
+
+
+class MyDepartment(DepartmentOut):
+    """A department where the signed-in person holds a role, with what they may do there
+    (GET /api/departments/mine): the department picker lists these, and each screen offers
+    only the tools these permissions allow. The API still checks every request."""
+
+    permissions: list[str]  # sorted permission codes
+
+
+class MyDepartments(BaseModel):
+    items: list[MyDepartment]  # in name order
 
 
 class DepartmentPage(BaseModel):
@@ -145,6 +158,11 @@ class UserOut(BaseModel):
     status: str
     # Whether wrong passwords have locked the account for now.
     locked: bool
+    # Whether the signed-in person is above them in the reporting chain (the Owner is
+    # above everyone; nobody is above themselves). A hint for the interface, which
+    # shows action buttons only for people the user is above (AZ5); the API checks
+    # every action regardless.
+    you_are_above: bool
 
 
 class UserPage(BaseModel):

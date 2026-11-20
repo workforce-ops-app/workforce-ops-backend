@@ -55,7 +55,8 @@ def test_list_departments_returns_only_active_departments_sorted_by_name(
     returned_ids = {department["id"] for department in page["items"]}
     assert expected_added_ids <= returned_ids
     assert archived_id not in returned_ids
-    assert all(set(department) == {"id", "name"} for department in page["items"])
+    # Exactly these fields; timezone is null where the company's applies (#170).
+    assert all(set(department) == {"id", "name", "timezone"} for department in page["items"])
 
 
 def test_list_departments_follows_the_cursor_to_the_next_page(signin: SignInSetup) -> None:
