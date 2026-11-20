@@ -349,13 +349,13 @@ Loops and "not your own lines" cannot be checked by a single-row constraint, so 
 |---|---|---|
 | `id` | `BINARY(16)` | primary key |
 | `company_id` | `BINARY(16)` | required |
-| `kind` | `VARCHAR(24)` | `role_assignment`, `owner_add`, `owner_remove`, `account_change`; later features add their own |
+| `kind` | `VARCHAR(24)` | `role_assignment`, `owner_add`, `owner_remove`, `account_change`; later features add their own (`time_off`, `coverage`) |
 | `requested_by` | `BINARY(16)` | company-aware foreign key to `users` |
 | `subject_user_id` | `BINARY(16)` | company-aware foreign key to `users`: the person the request is about |
 | `payload` | `JSON` | what will happen on approval, e.g. the role and scope; validated against the kind |
 | `status` | `VARCHAR(12)` | `pending`, `approved`, `denied`, or `cancelled` |
 | `required_approvals` | `SMALLINT` | how many approvals it needs (1 for a same-level grant; the number of owners who must agree for owner changes) |
-| `review_by` | `DATETIME(6)` | the review deadline: 7 days after creation for role grants, owner changes, and account changes; features set their own (time off: the start of the first day) |
+| `review_by` | `DATETIME(6)` | the review deadline: 7 days after creation for role grants, owner changes, and account changes; features set their own (time off: the start of the first day; coverage: the shift's start) |
 | `not_reviewed` | `BOOLEAN` | true when the request was declined because nobody decided by `review_by`; recorded as "not reviewed" in the audit log |
 | `decided_at` | `DATETIME(6)` | null while pending |
 
@@ -448,6 +448,7 @@ Primary key: `(company_id, module, setting_key)`. A missing row means "use the d
 |---|---|---|---|---|
 | `auth.password_min_length` | `app/settings/registry.py` | 15 | 15 to 64 (longer is stricter) | every password a person sets (`check_password(min_length=password_min_length(db))`): changing one's own password (`PUT /api/me/password`) and the demo seed |
 | `time_off.required_approvals` | `app/modules/time_off/settings.py` | 1 | 1 to 5 (more is stricter) | time-off approval ([time off](../features/time-off.md)), when it is built |
+| `coverage.answers_close_hours` | `app/modules/coverage/settings.py` | 12 | 12 to 72 (more is stricter: reviewers get longer) | when coworkers' answering closes, and how late a coverage request can be made ([coverage](../features/coverage.md)), when it is built |
 
 "From the default to the limit" means a company that chose 20 may later go back to 16, but never below 15. Two changes of the same setting at the same moment take turns on an existing row; the very first change of a setting by two requests at once would make one of them fail on the primary key, which matters only once the settings endpoint exists.
 
