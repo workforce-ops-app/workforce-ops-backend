@@ -9,4 +9,11 @@ PERMISSIONS = [
     PermissionDef(
         "time_off.review", Kind.PERSON, "Approve or deny the requests of people you are above"
     ),
+    # Shift swaps and coverage (coverage.md): answering a coworker's time-off request asked
+    # with offers. Asking is time_off.request_self; choosing offers is time_off.review.
+    PermissionDef(
+        "coverage.respond_self",
+        Kind.SELF,
+        "Offer to cover or swap a coworker's shift during their time off",
+    ),
 ]

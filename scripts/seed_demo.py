@@ -45,6 +45,22 @@ assigns a shift to someone who has not set up their account.
 Reporting lines (Z2) come right after the company: REPORTING_LINES below, added through the
 same service the application uses, once per company.
 
+Time-off requests (SD2) come right after the shifts: DEMO_TIME_OFF below, one in every
+state, asked for, decided, and cancelled through the time-off service as the people in the
+plan, so each passes the same checks as on the website (only a current reviewer decides)
+and approving one opens the shifts on its days. They wait for the shifts, and are added
+once. One is asked for tomorrow and never reviewed, so it reads as declined as not
+reviewed from tomorrow on: another reason to seed a few days before a demo. Then come two
+Kitchen requests asked with "Offer Shift Swap / Coverage" (DEMO_COVERAGE below,
+docs/features/coverage.md): one still collecting, with a cover, a swap, and a decline
+from coworkers, and one already sent up with a cover offer, so the demo shows offering,
+sending up, and choosing an offer.
+
+Announcements (AN3) come after the shifts: DEMO_ANNOUNCEMENTS below, posted, read, corrected,
+and archived through the announcements service as the people in the plan, so each passes
+the same checks as on the website and is audited under its poster's name. Added once: a
+company that already has announcements is left alone.
+
 Security events (DT6) come last, so the security page has something to show before any
 real traffic exists: DEMO_ATTACKS below, over the last 30 days, by several people, of every
 attack type, plus one burst that the rate cap cuts short (a detection.summary row). Each
@@ -61,14 +77,17 @@ from __future__ import annotations
 
 import sys
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from sqlalchemy import Engine, create_engine, func, select
 from sqlalchemy.orm import Session
 
+import app.modules.time_off.approval  # noqa: F401  (registers what a time-off decision does)
 from app.audit import Actor
 from app.auth.passwords import PasswordRejected, check_password, hash_password
 from app.authz.chain import ReportingLineError, add_reporting_line
@@ -77,6 +96,14 @@ from app.authz.roles import assign_role, create_starting_roles
 from app.core.config import get_settings
 from app.db.base import utcnow
 from app.detection.detector import inspect
+from app.modules.announcements.models import Announcement
+from app.modules.announcements.schemas import AnnouncementCreate, AnnouncementUpdate
+from app.modules.announcements.service import (
+    archive_announcement,
+    edit_announcement,
+    mark_read,
+    post_announcement,
+)
 from app.modules.org.models import Company, Department, Team, TeamMember, User
 from app.modules.schedules import repository as shift_repository
 from app.modules.schedules.models import Shift
@@ -84,6 +111,11 @@ from app.modules.schedules.schemas import ShiftCreate
 from app.modules.schedules.service import create_shift
 from app.modules.security.models import PlatformSecurityEvent, SecurityEvent
 from app.modules.security.writer import PER_MINUTE, Event, EventWriter
+from app.modules.time_off import offers as coverage
+from app.modules.time_off import service as time_off_service
+from app.modules.time_off.days import zone_of
+from app.modules.time_off.models import TimeOffRequest
+from app.modules.time_off.schemas import OfferBody, TimeOffCreate
 from app.settings.service import password_min_length
 from app.tenancy.context import set_company
 
@@ -279,6 +311,242 @@ WEEK_PATTERN = (
 
 # How many days of shifts each company gets, starting on the day the script runs.
 DEMO_DAYS = 14
+
+
+# --- Demo announcements (AN3) ---------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AnnouncementPlan:
+    """One demo announcement: who posts it, to whom, its text, who has read it, and what
+    happens to it afterwards (corrected, or archived)."""
+
+    author: int  # place in the company's list of people (as in REPORTING_LINES)
+    # "company", or the name of a department or a team (DEPARTMENTS above).
+    audience: str
+    title: str
+    body: str
+    # The people who have opened it, by their place in the list; each must be in the
+    # audience, or the application refuses the read mark and the script stops.
+    readers: tuple[int, ...] = ()
+    # A corrected body, sent afterwards as an edit by the author (shown as "Edited").
+    corrected_body: str | None = None
+    # Archived afterwards by the author: readers no longer see it; managers still do.
+    archived: bool = False
+
+
+# Posted in this order, so the last one is the newest. They show every case the screens
+# handle (announcements.md, demo data): each kind of audience, one edited and one archived,
+# bold text, text that would run if shown unsafely, and read counts that differ. Who is in
+# each audience: everyone for the company; the Kitchen's four (its manager, the two cooks,
+# the crew lead) for the Kitchen; the Weekend Crew's three (the two cooks and the crew
+# lead) for the crew.
+DEMO_ANNOUNCEMENTS = (
+    AnnouncementPlan(
+        author=OWNER,
+        audience="company",
+        title="Holiday hours",
+        body="We close early on the holiday. Your manager will post the shorter shifts.",
+        readers=(OWNER, ADMINISTRATOR, KITCHEN_MANAGER),
+        # Out of date now, so the owner archived it: managers still see it in their list.
+        archived=True,
+    ),
+    AnnouncementPlan(
+        author=OWNER,
+        audience="company",
+        title="Welcome to the new schedule",
+        body=(
+            "Your shifts, time off, and announcements are now in one place.\n"
+            "Check **My week** when you start each day, and ask your manager if anything "
+            "looks wrong."
+        ),
+        readers=(OWNER, ADMINISTRATOR, KITCHEN_MANAGER, FRONT_MANAGER, KITCHEN_A, FRONT_A),
+    ),
+    AnnouncementPlan(
+        author=KITCHEN_MANAGER,
+        audience="Kitchen",
+        title="New allergen labels",
+        # The tag is here on purpose: the screens must show it as the plain text it is,
+        # never as an image that runs code (threat T5).
+        body=(
+            "From Monday, label every container with **the date and its allergens**.\n"
+            "For the security demo, this should show as plain text: "
+            "<img src=x onerror=alert(1)>"
+        ),
+        readers=(KITCHEN_MANAGER, KITCHEN_A),
+    ),
+    AnnouncementPlan(
+        author=CREW_LEAD,
+        audience="Weekend Crew",
+        title="Sunday brunch rush",
+        body="Brunch starts at 8:00 this Sunday. Please be in by 7:45.",
+        readers=(CREW_LEAD,),
+        # The time was wrong, so the crew lead corrected it.
+        corrected_body="Brunch starts at 7:30 this Sunday. Please be in by **7:15**.",
+    ),
+)
+
+
+# --- Demo time off (SD2) -----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TimeOffPlan:
+    """One demo time-off request: who asks, which days (counted from today in their
+    workplace), why, and what happens to it afterwards, in order."""
+
+    employee: int  # place in the company's list of people (as in REPORTING_LINES)
+    starts_in: int  # the first day, this many days from today (1 is tomorrow)
+    days: int  # how many days, the first included
+    reason: str | None = None
+    # What happens next, in order: (who, "approve" | "deny" | "cancel", comment). The
+    # reviewers are worked out by the application (review.py), so each step must be by
+    # someone it allows, or the script stops and says which one.
+    steps: tuple[tuple[int, str, str | None], ...] = ()
+
+
+# One request in every state the screens show (time-off.md, states), the same in both
+# companies. Who reviews whom comes from REPORTING_LINES: the cooks report to the crew lead
+# (Ben also to the Kitchen manager), Diego to the Front of House manager, and Ella to
+# nobody, so only the owner reviews hers.
+DEMO_TIME_OFF = (
+    # Waiting for review, by the Front of House manager.
+    TimeOffPlan(FRONT_A, starts_in=10, days=2, reason="Family visit"),
+    # Declined, with a comment.
+    TimeOffPlan(
+        FRONT_A,
+        starts_in=4,
+        days=1,
+        reason="Concert",
+        steps=((FRONT_MANAGER, "deny", "We are short that day; could you swap with Ella?"),),
+    ),
+    # Moved up: Ben's two managers disagree, so it waits for the nearest manager above
+    # both of them (the administrator).
+    TimeOffPlan(
+        KITCHEN_A,
+        starts_in=6,
+        days=2,
+        reason="Moving house",
+        steps=((CREW_LEAD, "deny", None), (KITCHEN_MANAGER, "approve", None)),
+    ),
+    # Approved, with the shifts on those days opened (Cara works four days a week, so
+    # any three days in a row hold at least one of her shifts).
+    TimeOffPlan(
+        KITCHEN_B,
+        starts_in=8,
+        days=3,
+        reason="Wedding",
+        steps=((CREW_LEAD, "approve", "Have a great time."),),
+    ),
+    # Cancelled by the person who asked.
+    TimeOffPlan(FRONT_B, starts_in=5, days=1, steps=((FRONT_B, "cancel", None),)),
+    # Asked for tomorrow and reviewed by nobody: waiting today, and from tomorrow declined
+    # as not reviewed in time, which is why a demo database is seeded a few days ahead.
+    TimeOffPlan(FRONT_B, starts_in=1, days=1, reason="Doctor's appointment"),
+)
+
+
+@dataclass(frozen=True)
+class CoveragePlan:
+    """One demo time-off request asked with offers (docs/features/coverage.md): who asks,
+    for which days, and how coworkers answer."""
+
+    employee: int  # place in the company's list of people (as in REPORTING_LINES)
+    starts_in: int  # days from today; at least 2, so offers are still open
+    days: int
+    reason: str | None
+    # (coworker, "cover" | "swap" | "decline"). The shift each answer is about, and for a
+    # swap the coworker's shift given in exchange, are the first that the application
+    # accepts (offers.offer_problem), since which shifts fall on those days depends on the
+    # weekday the script runs. An answer no shift allows is left out.
+    answers: tuple[tuple[int, str], ...] = ()
+    send_up: bool = False  # the employee sends it up to the managers afterwards
+
+
+# Both in the Kitchen, the same in both companies. Cara's request is still collecting:
+# Ben offers to cover, the Kitchen manager offers a swap, and the crew lead declines; her
+# reviewer (the crew lead) can choose Ben's cover once she sends it up. Ben's request
+# already went up with Cara's cover offer, waiting for his managers. Five and three days:
+# Cara works four days a week and Ben four, so the days always hold one of their shifts.
+# Neither overlaps their requests in DEMO_TIME_OFF.
+DEMO_COVERAGE = (
+    CoveragePlan(
+        KITCHEN_B,
+        starts_in=2,
+        days=5,
+        reason="Family trip",
+        answers=((KITCHEN_A, "cover"), (KITCHEN_MANAGER, "swap"), (CREW_LEAD, "decline")),
+    ),
+    CoveragePlan(
+        KITCHEN_A,
+        starts_in=11,
+        days=3,
+        reason="Camping trip",
+        answers=((KITCHEN_B, "cover"),),
+        send_up=True,
+    ),
+)
+
+
+def _first_allowed_answer(
+    session: Session, request: TimeOffRequest, coworker: User, answer: str
+) -> tuple[Shift, Shift | None] | None:
+    """The first of the request's shifts (and, for a swap, the first of the coworker's own
+    shifts to give) that the application would accept for this answer, or None."""
+    shifts = sorted(coverage.takeable(session, coworker, request), key=lambda s: s.starts_at)
+    gives: list[Shift | None] = [None]
+    if answer == "swap":
+        gives = list(
+            session.scalars(
+                select(Shift)
+                .where(Shift.employee_id == coworker.id, Shift.status == "scheduled")
+                .order_by(Shift.starts_at)
+            )
+        )
+    for shift in shifts:
+        for given in gives:
+            if coverage.offer_problem(session, request, shift, coworker, answer, given) is None:
+                return shift, given
+    return None
+
+
+def _seed_coverage(session: Session, person: Callable[[int], User], company: str) -> None:
+    """Ask, answer, and send up DEMO_COVERAGE through the services, as the people involved."""
+    for item in DEMO_COVERAGE:
+        employee = person(item.employee)
+        today = datetime.now(zone_of(session, employee)).date()
+        first = today + timedelta(days=item.starts_in)
+        body = TimeOffCreate(
+            first_day=first,
+            last_day=first + timedelta(days=item.days - 1),
+            reason=item.reason,
+            offer_coverage=True,
+        )
+        step = f"asking with offers for {body.first_day} to {body.last_day}"
+        try:
+            asked = time_off_service.ask(session, employee, body)
+            for coworker_index, answer in item.answers:
+                coworker = person(coworker_index)
+                found = _first_allowed_answer(session, asked, coworker, answer)
+                if found is None:
+                    continue  # no shift on these days allows it this week
+                shift, given = found
+                step = f"{answer} by {coworker.display_name}"
+                coverage.answer(
+                    session,
+                    coworker,
+                    asked.id,
+                    shift.id,
+                    OfferBody(answer=answer, swap_shift_id=given.id if given else None),
+                )
+            if item.send_up:
+                step = "sending it up"
+                time_off_service.send_up(session, employee, asked.id)
+        except HTTPException as refused:
+            raise SeedRefused(
+                f"{company}: time off with offers for {employee.display_name}, {step}: "
+                f"{refused.status_code} {refused.detail}"
+            ) from refused
 
 
 # --- Demo security events (DT6) -------------------------------------------------------
@@ -771,6 +1039,151 @@ def seed_shifts(engine: Engine, plan: CompanyPlan, now: datetime | None = None) 
         return added
 
 
+def seed_announcements(engine: Engine, plan: CompanyPlan) -> int:
+    """Give a company its demo announcements (DEMO_ANNOUNCEMENTS), unless it already has
+    some. Returns how many were added: 0 if it had announcements already.
+
+    Each step goes through the announcements service, as the person in the plan, exactly
+    as on the website: posting (authorize() checks the author may post to that audience,
+    and the entry announcement.posted is written under their name), the read marks (only
+    people in the audience may add one), the correction, and the archiving. A step the
+    application refuses stops the script and says which one. All or nothing, like the
+    shifts: one transaction for the whole company.
+    """
+    # Find the company, as platform code (no company on the session).
+    with Session(engine) as platform:
+        company_id = platform.scalars(select(Company.id).where(Company.name == plan.name)).one()
+
+    # The service commits after each step, as it does for a request; "rollback_only" keeps
+    # those commits inside this one transaction (see seed_shifts).
+    with (
+        engine.begin() as connection,
+        Session(connection, join_transaction_mode="rollback_only") as session,
+    ):
+        set_company(session, company_id)
+        # Already has announcements (an earlier run): leave them as they are. Counting a
+        # column of the model lets the company filter apply.
+        if session.scalar(select(func.count(Announcement.company_id))):
+            return 0
+
+        people = {u.display_name: u for u in session.scalars(select(User))}
+        departments = {d.name: d.id for d in session.scalars(select(Department))}
+        teams = {t.name: t.id for t in session.scalars(select(Team))}
+
+        def person(index: int) -> User:
+            return people[plan.people[index].name]
+
+        for item in DEMO_ANNOUNCEMENTS:
+            # The request body the website sends: the audience's type and its one ID.
+            if item.audience == "company":
+                audience: dict[str, Any] = {"audience_type": "company"}
+            elif item.audience in departments:
+                audience = {
+                    "audience_type": "department",
+                    "department_id": departments[item.audience],
+                }
+            else:
+                audience = {"audience_type": "team", "team_id": teams[item.audience]}
+            author = person(item.author)
+            step = "posting"
+            try:
+                posted = post_announcement(
+                    session,
+                    author,
+                    AnnouncementCreate(**audience, title=item.title, body=item.body),
+                )
+                # Read before it is archived: once archived, readers can no longer open it.
+                step = "a read mark"
+                for reader in item.readers:
+                    mark_read(session, person(reader), posted.id)
+                if item.corrected_body is not None:
+                    step = "the correction"
+                    edit_announcement(
+                        session,
+                        author,
+                        posted.id,
+                        AnnouncementUpdate(body=item.corrected_body),
+                    )
+                if item.archived:
+                    step = "archiving"
+                    archive_announcement(session, author, posted.id)
+            except HTTPException as refused:
+                # Name the announcement and the step, so a broken plan is easy to fix.
+                raise SeedRefused(
+                    f"{plan.name}: announcement {item.title!r} by {author.display_name}, "
+                    f"{step}: {refused.status_code} {refused.detail}"
+                ) from refused
+        return len(DEMO_ANNOUNCEMENTS)
+
+
+def seed_time_off(engine: Engine, plan: CompanyPlan) -> int:
+    """Give a company its demo time-off requests (DEMO_TIME_OFF), unless it already has
+    some. Returns how many were added: 0 if it had requests already.
+
+    Each step goes through the time-off service, as the person who takes it, exactly as on
+    the website: asking (the days must start tomorrow or later, and may not overlap), each
+    decision (only a current reviewer may decide, as review.py works them out from the
+    reporting lines), and cancelling. Approving opens the employee's shifts on those days,
+    each audited as shift.opened. A step the application refuses stops the script and
+    says which one. All or nothing: one transaction for the whole company.
+
+    The days count from today in each person's workplace, on the real clock, since the
+    application refuses days that have started; so a database seeded on another day has
+    its requests on other days, like its shifts.
+    """
+    # Find the company, as platform code (no company on the session).
+    with Session(engine) as platform:
+        company_id = platform.scalars(select(Company.id).where(Company.name == plan.name)).one()
+
+    # The service commits after each step; "rollback_only" keeps those commits inside this
+    # one transaction (see seed_shifts).
+    with (
+        engine.begin() as connection,
+        Session(connection, join_transaction_mode="rollback_only") as session,
+    ):
+        set_company(session, company_id)
+        # Already has requests (an earlier run): leave them as they are. Counting a column
+        # of the model lets the company filter apply.
+        if session.scalar(select(func.count(TimeOffRequest.company_id))):
+            return 0
+
+        people = {u.display_name: u for u in session.scalars(select(User))}
+
+        def person(index: int) -> User:
+            return people[plan.people[index].name]
+
+        for item in DEMO_TIME_OFF:
+            employee = person(item.employee)
+            # Today where the employee works, as the service counts it.
+            today = datetime.now(zone_of(session, employee)).date()
+            first = today + timedelta(days=item.starts_in)
+            body = TimeOffCreate(
+                first_day=first,
+                last_day=first + timedelta(days=item.days - 1),
+                reason=item.reason,
+            )
+            step = f"asking for {body.first_day} to {body.last_day}"
+            try:
+                asked = time_off_service.ask(session, employee, body)
+                for actor, action, comment in item.steps:
+                    who = person(actor)
+                    step = f"{action} by {who.display_name}"
+                    if action == "cancel":
+                        time_off_service.cancel(session, who, asked.id)
+                    else:
+                        time_off_service.decide_request(session, who, asked.id, action, comment)
+            except HTTPException as refused:
+                # Name the request and the step, so a broken plan is easy to find and fix.
+                raise SeedRefused(
+                    f"{plan.name}: time off for {employee.display_name}, {step}: "
+                    f"{refused.status_code} {refused.detail}"
+                ) from refused
+        # Then the requests asked with offers, after the others (so the swap checks see
+        # Cara's approved days off), in the same transaction.
+        _seed_coverage(session, person, plan.name)
+        return len(DEMO_TIME_OFF) + len(DEMO_COVERAGE)
+
+
 def _planner(item: ShiftPlan) -> int:
     """Who creates a shift: its own planner, or else its department's manager."""
     return item.planner if item.planner is not None else DEPARTMENT_MANAGER[item.department]
@@ -860,10 +1273,24 @@ def seed(
         added = seed_shifts(engine, plan, now)
         shifts = "shifts wait for passwords" if added is None else f"{added} shifts added"
 
+        # Time off after the shifts: approving a request opens the shifts on its days, so
+        # the requests wait until the company has its shifts (they wait for passwords).
+        if added is None:
+            time_off = "time off waits for shifts"
+        else:
+            time_off = f"{seed_time_off(engine, plan)} time-off requests added"
+
+        # Announcements need only the people (invited people are in audiences too), so
+        # they never wait; a company seeded before them gets them on the next run.
+        news = f"{seed_announcements(engine, plan)} announcements added"
+
         # Security events need only the people, but come last: they are the least
         # important part, and a demo database without them still works.
         events = f"{seed_security_events(engine, plan, now)} security events added"
-        lines.append(f"{plan.name}: {state}; {reporting}; {passwords}; {shifts}; {events}")
+        lines.append(
+            f"{plan.name}: {state}; {reporting}; {passwords}; {shifts}; {time_off}; {news}; "
+            f"{events}"
+        )
     # Events of people not signed in belong to no company: added once, for the platform.
     lines.append(f"Platform: {seed_platform_events(engine, now)} security events added")
     return lines

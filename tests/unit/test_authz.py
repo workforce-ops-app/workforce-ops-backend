@@ -39,6 +39,8 @@ CORE = {
     "audit.view": "company",
     "audit.verify": "company",
     "security.view": "company",
+    "announcement.create": "record",
+    "coverage.respond_self": "self",  # coverage.md
     "company.transfer_ownership": "company",
 }
 
@@ -111,6 +113,8 @@ def test_the_starting_roles_grant_what_the_authorization_page_says(org: Org) -> 
         "time_off.review",
         "user.view",
         "account.change_self",
+        "announcement.create",
+        "coverage.respond_self",
     }
     assert granted["employee"] == {
         "schedule.view_self",
@@ -118,6 +122,7 @@ def test_the_starting_roles_grant_what_the_authorization_page_says(org: Org) -> 
         "time_off.request_self",
         "time_off.cancel_self",
         "account.change_self",
+        "coverage.respond_self",
     }
 
 
@@ -132,6 +137,7 @@ def test_effective_permissions_combine_every_active_role(org: Org) -> None:
                 "time_off.request_self",
                 "time_off.cancel_self",
                 "account.change_self",
+                "coverage.respond_self",
             ]
         )
         # Deactivated people and archived roles grant nothing.

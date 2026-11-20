@@ -72,6 +72,28 @@ APP_RIGHTS: dict[str, frozenset[str]] = {
     # marked used (UPDATE), and deleted when a newer link for the person replaces it
     # (DELETE). So all four.
     "one_time_tokens": DATA,
+    # Approval requests (app/approvals/): added when someone asks, then changed in place
+    # as they are decided, cancelled, or lapse (UPDATE; also needed to lock the row with
+    # SELECT ... FOR UPDATE while that happens). Never removed: they are history.
+    "approval_requests": frozenset({"SELECT", "INSERT", "UPDATE"}),
+    # One person's decision: added once and never changed or removed.
+    "approval_decisions": frozenset({"SELECT", "INSERT"}),
+    # Time-off requests (app/modules/time_off/): added when asked, then changed in place as
+    # they are decided, cancelled, or lapse (UPDATE). Never removed: they are history.
+    "time_off_requests": frozenset({"SELECT", "INSERT", "UPDATE"}),
+    # Coworkers' offers on a request (docs/features/coverage.md): added when offered,
+    # changed in place when the answer changes or the request ends (UPDATE), and removed
+    # when a coworker takes their answer back (DELETE; the audit log keeps the record).
+    "coverage_offers": DATA,
+    # A department's own setting values (docs/features/coverage.md): added, then changed in
+    # place (UPDATE, also for the lock while it changes). Never removed.
+    "department_settings": frozenset({"SELECT", "INSERT", "UPDATE"}),
+    # Announcements (docs/features/announcements.md): posted (INSERT), corrected and
+    # archived (UPDATE; also needed to lock a row with SELECT ... FOR UPDATE while it
+    # changes). Archived, never deleted (decision 0020), so no DELETE.
+    "announcements": frozenset({"SELECT", "INSERT", "UPDATE"}),
+    # Read marks are added once and never changed or removed.
+    "announcement_reads": frozenset({"SELECT", "INSERT"}),
 }
 
 # Alembic's own bookkeeping: only the migrations user needs it.

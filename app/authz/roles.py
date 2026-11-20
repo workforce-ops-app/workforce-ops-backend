@@ -30,6 +30,10 @@ _MANAGER = [
     "time_off.review",
     "user.view",
     "account.change_self",
+    # Posting to the department or team the manager is assigned to (announcements.md).
+    "announcement.create",
+    # Offering to cover or swap a coworker's shift during their time off (coverage.md).
+    "coverage.respond_self",
     # No role.view: it is a company permission, so a department or team assignment could
     # never use it. Managers see the roles of people in their scope through user.view.
 ]
@@ -39,6 +43,7 @@ _EMPLOYEE = [
     "time_off.request_self",
     "time_off.cancel_self",
     "account.change_self",
+    "coverage.respond_self",  # offering to cover or swap a coworker's shift (coverage.md)
 ]
 _OWNER_ONLY = ["company.transfer_ownership"]
 
