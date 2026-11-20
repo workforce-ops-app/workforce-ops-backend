@@ -104,7 +104,7 @@ def sign_up(engine: Engine, body: SignUpRequest) -> SignedUp:
         logger.info("sign-up refused: email already has an account")
         raise
     except (IntegrityError, OperationalError) as error:
-        # Only without migration 0011's head: the platform chain had no head yet, so the
+        # Only without migration 0013's head: the platform chain had no head yet, so the
         # lock in step 2 had no row to hold, and another first sign-up ran at the same
         # moment. Either the head's primary key
         # let only the other one create it (IntegrityError), or MySQL saw both waiting on
@@ -127,7 +127,7 @@ def _create(engine: Engine, body: SignUpRequest, password_hash: str) -> SignedUp
     with engine.begin() as connection:
         # Step 2: platform code. Lock the platform chain's head so sign-ups take turns,
         # then count this hour's new companies while holding it. The head always exists
-        # in MySQL (migration 0011 creates it empty), so the lock always has a row.
+        # in MySQL (migration 0013 creates it empty), so the lock always has a row.
         with Session(connection) as platform:
             platform.scalars(
                 select(AuditChainHead)

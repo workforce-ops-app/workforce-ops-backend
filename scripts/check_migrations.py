@@ -842,7 +842,7 @@ def _sign_up_race_problems(engine: Engine) -> list[str]:
     place left, four sign-ups sent together must give exactly one new company; the other
     three are refused (429). Nothing else in this check writes to the platform chain, so
     these are the first sign-ups on a new platform: the lock holds the empty head that
-    migration 0011 creates (without it, MySQL stopped the racers as deadlocks).
+    migration 0013 creates (without it, MySQL stopped the racers as deadlocks).
     """
     import threading
 

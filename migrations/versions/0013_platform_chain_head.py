@@ -1,7 +1,7 @@
 """Create the platform audit chain's head, empty, so it always exists.
 
-Revision: 0011
-Revises: 0010
+Revision: 0013
+Revises: 0012
 
 Company sign-up (docs/features/organization.md) makes sign-ups take turns by locking the
 platform chain's head row (SELECT ... FOR UPDATE) before it counts this hour's new
@@ -22,8 +22,8 @@ from datetime import UTC, datetime
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0011"
-down_revision: str | None = "0010"
+revision: str = "0013"
+down_revision: str | None = "0012"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
