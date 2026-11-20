@@ -100,18 +100,18 @@ def upgrade() -> None:
     # Step 3: the new permission, then a grant of it on every company's starting roles
     # that does not have it yet (so running this on a fresh database is harmless too).
     connection = op.get_bind()
+    now = datetime.now(UTC).replace(tzinfo=None)
     known = connection.execute(
         sa.text("SELECT 1 FROM permissions WHERE code = :code"), {"code": PERMISSION}
     ).first()
     if known is None:
         connection.execute(
             sa.text(
-                "INSERT INTO permissions (code, module, description) "
-                "VALUES (:code, 'time_off', :description)"
+                "INSERT INTO permissions (code, module, description, created_at, updated_at) "
+                "VALUES (:code, 'time_off', :description, :now, :now)"
             ),
-            {"code": PERMISSION, "description": DESCRIPTION},
+            {"code": PERMISSION, "description": DESCRIPTION, "now": now},
         )
-    now = datetime.now(UTC).replace(tzinfo=None)
     connection.execute(
         sa.text(
             "INSERT INTO role_permissions "
