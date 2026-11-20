@@ -45,7 +45,14 @@ CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # - Redeeming a setup or reset link: its proof is the one-time token in the body, not a
 #   session. Someone opening a reset link in a browser with an old session cookie must
 #   reach the link check, not a 403.
-ORIGIN_ONLY = frozenset({("POST", "/api/sessions"), ("POST", "/api/password-links/redeem")})
+# - Company sign-up starts a session too, for a new company (docs/features/organization.md).
+ORIGIN_ONLY = frozenset(
+    {
+        ("POST", "/api/sessions"),
+        ("POST", "/api/password-links/redeem"),
+        ("POST", "/api/sign-up"),
+    }
+)
 
 # One answer for every refusal: it does not tell an attacker which check failed.
 REFUSED = "This request did not come from the application's own pages."
