@@ -126,6 +126,21 @@ Every answer names the employee (`employee_name`), and each decision its reviewe
 
 **In the code:** rules for asking, cancelling, and deciding in `app/modules/time_off/service.py`; who reviews and what the decisions add up to in `review.py` (the shared layer calls it through the handler's `outcome` hook, instead of its own "one denial denies"); the approval record's hooks in `approval.py`; days and time zones in `days.py`; where a request belongs (its employee) in `scope.py`. A decision locks, in order, the company's reporting lines, the employee, the request, its approval record, and the shifts it opens, and only then writes audit entries: the same order as every schedule change, so the two never wait on each other. For that reason time-off requests are decided only on their own endpoints; `/api/approval-requests/{id}/approve` answers 409 for them. Reviewers' comments are kept with the approval record (plain text, at most 500 characters) and never in the audit log. Each person's requests take turns through a lock on their user row, so two requests sent at once cannot both pass the overlap check. The reason never goes into the audit log, which is kept for good.
 
+### Demo data
+
+Built in SD2 as `DEMO_TIME_OFF` in `scripts/seed_demo.py` (workforce-ops-app/workforce-ops-backend#68), the same in both companies (in Northwind Cafe; days counted from the day the script runs):
+
+| Who asks | Days | Reason | Afterwards | State |
+|---|---|---|---|---|
+| Ella Novak | day 1 | Doctor's appointment | nobody reviews it (only the owner could: she has no manager) | waiting; declined as not reviewed from day 1 on |
+| Diego Ruiz | day 4 | Concert | declined by Priya Shah, with a comment | declined |
+| Ella Novak | day 5 | | cancelled by Ella | cancelled |
+| Ben Okafor | days 6 and 7 | Moving house | denied by Felix Grant, approved by Ana Diaz (his two managers) | moved up to Marcus Lee, the nearest manager above both |
+| Cara Lund | days 8 to 10 | Wedding | approved by Felix Grant, with a comment | approved; her shift on those days is open |
+| Diego Ruiz | days 10 and 11 | Family visit | | waiting for Priya Shah |
+
+Each step (asking, each decision, cancelling) goes through this module's service as the person who takes it, exactly as on the website, so the same rules apply: only a current reviewer decides (worked out from the [reporting lines](organization.md#demo-data)), approving opens the shifts on those days with their `shift.opened` entries, and everything is audited under that person's name. The days count from the real today, since the application refuses days that have started, and the requests come right after the shifts (which they wait for). Added once per company; a step the application refuses stops the script and keeps none of that company's requests (`tests/unit/test_seed_demo.py`, checked also against MySQL).
+
 ### Audit and security
 
 **Audit events:** `time_off.requested`, `time_off.approved`, `time_off.denied`, `time_off.escalated` (details: who it went to), `time_off.cancelled`, `time_off.not_reviewed` (actor `system`; the request is declined), and `shift.opened` for each shift opened by an approval (details: the request).

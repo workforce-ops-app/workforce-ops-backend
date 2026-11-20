@@ -15,6 +15,7 @@ from argon2 import PasswordHasher
 from sqlalchemy import Engine, create_engine, func, select
 from sqlalchemy.orm import Session
 
+from app.approvals.models import ApprovalDecision, ApprovalRequest
 from app.audit import Actor
 from app.audit.models import AuditChainHead, AuditEvent
 from app.auth import passwords
@@ -30,6 +31,7 @@ from app.modules.org.models import Company, Department, Team, TeamMember, User
 from app.modules.schedules import service as shift_service
 from app.modules.schedules.models import Shift
 from app.modules.security.models import PlatformSecurityEvent, SecurityEvent
+from app.modules.time_off.models import TimeOffRequest
 from app.settings.models import CompanySetting
 from app.settings.service import PASSWORD_MIN_LENGTH, change_setting
 from app.tenancy.context import set_company
@@ -59,6 +61,9 @@ ORG_TABLES = [
         PlatformSecurityEvent,
         Announcement,
         AnnouncementRead,
+        ApprovalRequest,
+        ApprovalDecision,
+        TimeOffRequest,
     )
 ]
 
@@ -83,6 +88,9 @@ NO_EVENTS = "0 security events added"
 # The demo announcements (AN3), added once per company.
 NEWS = f"{len(seed_demo.DEMO_ANNOUNCEMENTS)} announcements added"
 NO_NEWS = "0 announcements added"
+# The demo time-off requests (SD2), added once the company has its shifts.
+TIME_OFF = f"{len(seed_demo.DEMO_TIME_OFF)} time-off requests added"
+TIME_OFF_WAITS = "time off waits for shifts"
 # The platform's line: its events of people not signed in, plus one drop count.
 PLATFORM_EVENTS = (
     sum(len(seed_demo.inspect([(a[3], a[4])])) for a in seed_demo.PLATFORM_ATTACKS) + 1
@@ -98,7 +106,7 @@ LINES = len(seed_demo.REPORTING_LINES)
 # The end of a company's line when a rerun has nothing left to add.
 NOTHING_NEW = (
     "0 reporting lines added; demo password set for 0 accounts; 0 shifts added; "
-    "0 announcements added; 0 security events added"
+    "0 time-off requests added; 0 announcements added; 0 security events added"
 )
 # Every account given the demo password.
 ALL_PASSWORDS = f"demo password set for {PEOPLE} accounts"
@@ -166,9 +174,9 @@ def test_it_creates_two_alike_companies(engine: Engine) -> None:
 
     assert lines == [
         f"Northwind Cafe: created; {LINES} reporting lines added; {NO_PASSWORD}; {WAITING}; "
-        f"{NEWS}; {EVENTS}",
+        f"{TIME_OFF_WAITS}; {NEWS}; {EVENTS}",
         f"Summit Outfitters: created; {LINES} reporting lines added; {NO_PASSWORD}; {WAITING}; "
-        f"{NEWS}; {EVENTS}",
+        f"{TIME_OFF_WAITS}; {NEWS}; {EVENTS}",
         PLATFORM,
     ]
     ids = company_ids(engine)
@@ -269,9 +277,9 @@ def test_a_demo_password_is_hashed_for_every_account(engine: Engine) -> None:
 
     assert lines == [
         f"Northwind Cafe: created; {LINES} reporting lines added; {ALL_PASSWORDS}; {ADDED}; "
-        f"{NEWS}; {EVENTS}",
+        f"{TIME_OFF}; {NEWS}; {EVENTS}",
         f"Summit Outfitters: created; {LINES} reporting lines added; {ALL_PASSWORDS}; {ADDED}; "
-        f"{NEWS}; {EVENTS}",
+        f"{TIME_OFF}; {NEWS}; {EVENTS}",
         PLATFORM,
     ]
     users = all_users(engine)
@@ -289,7 +297,7 @@ def test_a_rerun_only_fills_in_missing_passwords(engine: Engine) -> None:
 
     assert lines[0] == (
         "Northwind Cafe: already there; 0 reporting lines added; "
-        f"demo password set for {PEOPLE} accounts; {ADDED}; {NO_NEWS}; {NO_EVENTS}"
+        f"demo password set for {PEOPLE} accounts; {ADDED}; {TIME_OFF}; {NO_NEWS}; {NO_EVENTS}"
     )
     # A third run changes nothing: everyone already has a password, and the shifts exist.
     assert seed_demo.seed(engine, DEMO_PASSWORD, NOW)[0] == (
@@ -646,7 +654,7 @@ def test_a_company_seeded_before_shifts_gets_them_on_the_next_run(engine: Engine
 
     assert lines[0] == (
         f"Northwind Cafe: already there; {LINES} reporting lines added; "
-        f"demo password set for {PEOPLE} accounts; {ADDED}; {NEWS}; {EVENTS}"
+        f"demo password set for {PEOPLE} accounts; {ADDED}; {TIME_OFF}; {NEWS}; {EVENTS}"
     )
     for company_id in company_ids(engine).values():
         assert count(engine, company_id, Shift) == SHIFTS_PER_COMPANY
@@ -1034,3 +1042,169 @@ def test_a_step_the_application_refuses_stops_the_seed_and_keeps_no_announcement
     for company_id in company_ids(engine).values():
         assert count(engine, company_id, Announcement) == 0
         assert count(engine, company_id, AnnouncementRead) == 0
+
+
+# --- Demo time off (SD2) -----------------------------------------------------------------
+
+
+@pytest.fixture
+def real_clock(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    """Seed at the real moment: the time-off service counts days from the real today (it
+    refuses days that have started), so the shifts must be from today too for approving a
+    request to open some. The schedules service's clock goes back to the real one."""
+    monkeypatch.setattr(shift_service, "utcnow", lambda: datetime.now(UTC).replace(tzinfo=None))
+    return datetime.now(UTC)
+
+
+def requests_of(engine: Engine, company_id: uuid.UUID) -> dict[str, list[TimeOffRequest]]:
+    """A company's time-off requests by the employee's name, soonest first."""
+    with Session(engine) as session:
+        set_company(session, company_id)
+        names = {u.id: u.display_name for u in session.scalars(select(User))}
+        found: dict[str, list[TimeOffRequest]] = {}
+        for row in session.scalars(select(TimeOffRequest).order_by(TimeOffRequest.first_day)):
+            found.setdefault(names[row.employee_id], []).append(row)
+        session.expunge_all()
+        return found
+
+
+def test_each_company_gets_a_time_off_request_in_every_state(
+    engine: Engine, real_clock: datetime
+) -> None:
+    seed_demo.seed(engine, DEMO_PASSWORD, real_clock)
+    for plan in seed_demo.DEMO_COMPANIES:
+        found = requests_of(engine, company_ids(engine)[plan.name])
+        name = [person.name for person in plan.people].__getitem__
+        statuses = {who: [r.status for r in rows] for who, rows in found.items()}
+        assert statuses == {
+            # Denied (day 4), then waiting (day 10).
+            name(seed_demo.FRONT_A): ["denied", "pending"],
+            # Moved up: the crew lead denied, the Kitchen manager approved.
+            name(seed_demo.KITCHEN_A): ["escalated"],
+            name(seed_demo.KITCHEN_B): ["approved"],
+            # Tomorrow's, not reviewed yet, then the cancelled one (day 5).
+            name(seed_demo.FRONT_B): ["pending", "cancelled"],
+        }
+
+
+def test_approving_the_demo_request_opens_the_shifts_on_its_days(
+    engine: Engine, real_clock: datetime
+) -> None:
+    seed_demo.seed(engine, DEMO_PASSWORD, real_clock)
+    for plan in seed_demo.DEMO_COMPANIES:
+        company_id = company_ids(engine)[plan.name]
+        cara = plan.people[seed_demo.KITCHEN_B].name
+        approved = requests_of(engine, company_id)[cara][0]
+        with Session(engine) as session:
+            set_company(session, company_id)
+            cara_id = session.scalars(select(User.id).where(User.display_name == cara)).one()
+            opened = session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action == "shift.opened", AuditEvent.company_id == company_id
+                )
+            ).all()
+        # Cara works four days a week, so her three days off hold at least one shift; each
+        # is now open, with its own audit entry, and none of hers is left on those days.
+        assert opened
+        shifts = {s.id: s for s in shifts_of(engine, company_id)}
+        for event in opened:
+            assert shifts[event.target_id].employee_id is None
+        days = {approved.first_day + timedelta(days=n) for n in range(3)}
+        zone = ZoneInfo(plan.timezone)
+        for shift in shifts.values():
+            local = shift.starts_at.replace(tzinfo=UTC).astimezone(zone).date()
+            assert not (shift.employee_id == cara_id and local in days)
+
+
+def test_tomorrows_request_is_declined_as_not_reviewed_once_its_day_begins(
+    engine: Engine, real_clock: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.approvals import service as approval_service
+    from app.modules.time_off import service as time_off_service
+
+    seed_demo.seed(engine, DEMO_PASSWORD, real_clock)
+    plan = seed_demo.DEMO_COMPANIES[0]
+    company_id = company_ids(engine)[plan.name]
+    ella = plan.people[seed_demo.FRONT_B].name
+    tomorrow = requests_of(engine, company_id)[ella][0]
+    assert tomorrow.status == "pending"
+
+    # Two days later, someone looks: nobody reviewed it before its first day began.
+    later = datetime.now(UTC).replace(tzinfo=None) + timedelta(days=2)
+    monkeypatch.setattr(approval_service, "utcnow", lambda: later)
+    with Session(engine) as session:
+        set_company(session, company_id)
+        row = session.get(TimeOffRequest, tomorrow.id)
+        assert row is not None
+        time_off_service.refresh(session, [row])
+        approval = session.get(ApprovalRequest, row.approval_request_id)
+        assert row.status == "denied"
+        assert approval is not None and approval.not_reviewed
+
+
+def test_each_time_off_step_is_audited_under_the_person_who_took_it(
+    engine: Engine, real_clock: datetime
+) -> None:
+    seed_demo.seed(engine, DEMO_PASSWORD, real_clock)
+    plan = seed_demo.DEMO_COMPANIES[0]
+    company_id = company_ids(engine)[plan.name]
+    with Session(engine) as session:
+        set_company(session, company_id)
+        names = {u.id: u.display_name for u in session.scalars(select(User))}
+        events = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.action.in_(
+                    ("time_off.requested", "time_off.approved", "time_off.cancelled")
+                ),
+                AuditEvent.company_id == company_id,
+            )
+        ).all()
+    steps: dict[str, list[str]] = {}
+    for event in events:
+        assert event.actor_id is not None
+        steps.setdefault(event.action, []).append(names[event.actor_id])
+
+    def person(index: int) -> str:
+        return plan.people[index].name
+
+    # Asked by each employee, approved by the crew lead, cancelled by Ella herself.
+    assert sorted(steps["time_off.requested"]) == sorted(
+        person(item.employee) for item in seed_demo.DEMO_TIME_OFF
+    )
+    assert steps["time_off.approved"] == [person(seed_demo.CREW_LEAD)]
+    assert steps["time_off.cancelled"] == [person(seed_demo.FRONT_B)]
+
+
+def test_time_off_waits_for_the_shifts_and_is_added_once(
+    engine: Engine, real_clock: datetime
+) -> None:
+    # Without passwords there are no shifts yet, so no time off either.
+    lines = seed_demo.seed(engine, now=real_clock)
+    assert all(f"; {TIME_OFF_WAITS};" in line for line in lines[:2])
+    for company_id in company_ids(engine).values():
+        assert count(engine, company_id, TimeOffRequest) == 0
+    # With them, the shifts come and the time off with them; a third run adds nothing.
+    lines = seed_demo.seed(engine, DEMO_PASSWORD, real_clock)
+    assert all(f"; {TIME_OFF};" in line for line in lines[:2])
+    lines = seed_demo.seed(engine, DEMO_PASSWORD, real_clock)
+    assert all("; 0 time-off requests added;" in line for line in lines[:2])
+    for company_id in company_ids(engine).values():
+        assert count(engine, company_id, TimeOffRequest) == len(seed_demo.DEMO_TIME_OFF)
+
+
+def test_a_time_off_step_the_application_refuses_stops_the_seed_and_keeps_none(
+    engine: Engine, real_clock: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The Front of House manager is not one of Cara's reviewers (she reports to the crew
+    # lead), so the application refuses the decision (403).
+    wrong = seed_demo.TimeOffPlan(
+        seed_demo.KITCHEN_B,
+        starts_in=3,
+        days=1,
+        steps=((seed_demo.FRONT_MANAGER, "approve", None),),
+    )
+    monkeypatch.setattr(seed_demo, "DEMO_TIME_OFF", (seed_demo.DEMO_TIME_OFF[0], wrong))
+    with pytest.raises(seed_demo.SeedRefused, match=r"time off for .*, approve by "):
+        seed_demo.seed(engine, DEMO_PASSWORD, real_clock)
+    for company_id in company_ids(engine).values():
+        assert count(engine, company_id, TimeOffRequest) == 0
