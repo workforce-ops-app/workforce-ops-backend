@@ -17,7 +17,7 @@ from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.orm import Session, aliased
 
 from app.authz.models import Role, RoleAssignment
-from app.modules.org.models import Company, Department, Team, User
+from app.modules.org.models import Company, Department, Team, TeamMember, User
 from app.modules.schedules.models import Shift
 
 
@@ -51,8 +51,11 @@ def has_overlap(
     starts_at: datetime,
     ends_at: datetime,
     ignore: uuid.UUID | None,
+    also_ignore: uuid.UUID | None = None,
 ) -> bool:
     """Whether the person already has a (not cancelled) shift overlapping this time.
+    `ignore` (and `also_ignore`) leave shifts out: the one being changed, or the two
+    shifts of a swap (coverage.md), which trade places and so never clash with each other.
 
     Two time ranges overlap when each starts before the other ends.
 
@@ -76,12 +79,39 @@ def has_overlap(
         Shift.starts_at < ends_at,
         Shift.ends_at > starts_at,
     ]
-    if ignore is not None:
-        conditions.append(Shift.id != ignore)
+    for left_out in (ignore, also_ignore):
+        if left_out is not None:
+            conditions.append(Shift.id != left_out)
     # read=True makes it FOR SHARE: other readers may share the lock, but nobody can
     # change these rows until this transaction ends.
     found = select(Shift.id).where(*conditions).limit(1).with_for_update(read=True)
     return db.scalar(found) is not None
+
+
+def assignable(db: Session, person: User | None, department_id: uuid.UUID) -> bool:
+    """Whether the person could be given a shift in this department (schedules.md, states
+    and rules): active, set up (not just "invited"), and the department is their home or
+    they are on an active team in it. An archived team keeps its member list for history
+    (organization.md), but being listed on it no longer makes anyone eligible.
+
+    Shared by assigning (service.py) and by coworkers' offers (app/modules/time_off/
+    offers.py), so the two can never disagree about who may work a shift.
+    """
+    if person is None or person.deactivated_at is not None or person.password_hash is None:
+        return False
+    if person.department_id == department_id:
+        return True
+    on_team = db.execute(
+        select(TeamMember.user_id, Team.id)
+        .join(Team, Team.id == TeamMember.team_id)
+        .where(
+            TeamMember.user_id == person.id,
+            Team.department_id == department_id,
+            Team.archived_at.is_(None),
+        )
+        .limit(1)
+    ).first()
+    return on_team is not None
 
 
 def on_time_off(db: Session, person: User, starts_at: datetime, ends_at: datetime) -> bool:

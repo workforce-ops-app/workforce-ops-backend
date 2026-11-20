@@ -129,10 +129,11 @@ def nearest_shared(db: Session, deciders: set[uuid.UUID], employee: User) -> set
 
 
 def reviewers(db: Session, approval: ApprovalRequest) -> set[uuid.UUID]:
-    """Who may decide now: step 2 when escalated, otherwise step 1."""
+    """Who may decide now: nobody while collecting (still with the coworkers,
+    coverage.md), step 2 when escalated, otherwise step 1."""
     request = request_for(db, approval)
     employee = db.get(User, approval.subject_user_id)
-    if request is None or employee is None:
+    if request is None or employee is None or request.status == "collecting":
         return set()
     if request.status == "escalated":
         return nearest_shared(db, _escalated_from(approval), employee)

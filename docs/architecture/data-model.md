@@ -448,7 +448,7 @@ Primary key: `(company_id, module, setting_key)`. A missing row means "use the d
 |---|---|---|---|---|
 | `auth.password_min_length` | `app/settings/registry.py` | 15 | 15 to 64 (longer is stricter) | every password a person sets (`check_password(min_length=password_min_length(db))`): changing one's own password (`PUT /api/me/password`) and the demo seed |
 | `time_off.required_approvals` | `app/modules/time_off/settings.py` | 1 | 1 to 5 (more is stricter) | time-off approval ([time off](../features/time-off.md)), when it is built |
-| `coverage.answers_close_hours` | `app/modules/coverage/settings.py` | 12 | 12 to 72 (more is stricter: reviewers get longer) | when coworkers' answering closes, and how late a coverage request can be made ([coverage](../features/coverage.md)), when it is built |
+| `time_off.offers_close_days` | `app/modules/time_off/settings.py` | 1 | 1 to 14 (more is stricter: reviewers get longer) | how many days before the first day a request asked with offers goes up by itself, and so how late one can be asked with offers ([coverage](../features/coverage.md)); a department may raise it (CV3) |
 
 "From the default to the limit" means a company that chose 20 may later go back to 16, but never below 15. Two changes of the same setting at the same moment take turns on an existing row; the very first change of a setting by two requests at once would make one of them fail on the primary key, which matters only once the settings endpoint exists.
 
