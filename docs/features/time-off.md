@@ -49,6 +49,8 @@ In the core tier, requests and their status are shown on the pages; notification
 ---
 ## Details
 
+**Offering shift swaps and coverage** (agreed 2026-11-20): the request form has an optional **Offer Shift Swap / Coverage** box. Ticked, the request first **collects offers** from coworkers (status `collecting`) and goes to the managers when the employee sends it up or at the send-up deadline; the manager then chooses none or one offer per shift when approving. The whole flow, its states, and its rules are on [shift swaps and coverage](coverage.md).
+
 ### States and rules
 
 ```mermaid
