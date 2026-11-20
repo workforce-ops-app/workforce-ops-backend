@@ -76,6 +76,7 @@ from app.modules.time_off.schemas import Choice, TimeOffCreate
 from app.settings.service import (
     TIME_OFF_OFFERS_CLOSE_DAYS,
     TIME_OFF_REQUIRED_APPROVALS,
+    department_value,
     setting_value,
 )
 
@@ -339,7 +340,8 @@ def ask(db: Session, user: User, body: TimeOffCreate) -> TimeOffRequest:
     # the day that many days before the first day. Already past it: too late to ask them.
     offers_close_at = None
     if body.offer_coverage:
-        days = setting_value(db, TIME_OFF_OFFERS_CLOSE_DAYS)
+        # The employee's home department may give reviewers longer than the company.
+        days = department_value(db, TIME_OFF_OFFERS_CLOSE_DAYS, me.department_id)
         offers_close_at = day_starts(zone, body.first_day - timedelta(days=days))
         if offers_close_at <= utcnow():
             raise Conflict(TOO_LATE)

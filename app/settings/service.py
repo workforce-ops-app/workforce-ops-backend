@@ -20,8 +20,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.audit import Actor, record
-from app.settings.models import CompanySetting
-from app.settings.registry import SettingDef, SettingRejected, get_setting_def
+from app.settings.models import CompanySetting, DepartmentSetting
+from app.settings.registry import SettingDef, SettingRejected, Stricter, get_setting_def
 from app.tenancy.context import get_company
 
 logger = logging.getLogger(__name__)
@@ -103,3 +103,90 @@ def _checked_or_default(setting: SettingDef, stored: object) -> int:
 def password_min_length(db: Session) -> int:
     """The company's minimum password length, for check_password(min_length=...)."""
     return setting_value(db, PASSWORD_MIN_LENGTH)
+
+
+# --- A department's own value (docs/features/coverage.md) -------------------------------
+
+
+def _department_row(
+    db: Session, setting: SettingDef, department_id: uuid.UUID, *, lock: bool = False
+) -> DepartmentSetting | None:
+    query = select(DepartmentSetting).where(
+        DepartmentSetting.company_id == _company(db),
+        DepartmentSetting.department_id == department_id,
+        DepartmentSetting.module == setting.module,
+        DepartmentSetting.setting_key == setting.key,
+    )
+    if lock:
+        query = query.with_for_update()
+    return db.scalars(query).one_or_none()
+
+
+def own_department_value(db: Session, name: str, department_id: uuid.UUID) -> int | None:
+    """The department's own value, if it chose one the rules allow."""
+    setting = get_setting_def(name)
+    row = _department_row(db, setting, department_id)
+    if row is None:
+        return None
+    try:
+        return setting.check(row.value)
+    except SettingRejected:
+        logger.warning("ignoring a stored value the rules refuse for setting %s", setting.name)
+        return None
+
+
+def department_value(db: Session, name: str, department_id: uuid.UUID | None) -> int:
+    """The value in force in a department: the stricter of the company's and the
+    department's own (so neither can undercut the other). Without a department, or for a
+    setting not declared per_department, the company's value."""
+    setting = get_setting_def(name)
+    company = setting_value(db, name)
+    if department_id is None or not setting.per_department:
+        return company
+    own = own_department_value(db, name, department_id)
+    if own is None:
+        return company
+    return max(company, own) if setting.stricter is Stricter.HIGHER else min(company, own)
+
+
+def change_department_setting(
+    db: Session,
+    name: str,
+    department_id: uuid.UUID,
+    value: int,
+    *,
+    actor: Actor,
+    requested_by: uuid.UUID | None = None,
+) -> int:
+    """Write a department's own value (already checked by the caller against the
+    company's) and audit it. Does not commit."""
+    setting = get_setting_def(name)
+    new = setting.check(value)  # within the platform's bounds, whatever the caller did
+    row = _department_row(db, setting, department_id, lock=True)
+    old = department_value(db, name, department_id)
+    if row is None:
+        db.add(
+            DepartmentSetting(
+                department_id=department_id,
+                module=setting.module,
+                setting_key=setting.key,
+                value=new,
+            )
+        )
+    else:
+        row.value = new
+    db.flush()
+    record(
+        db,
+        actor=actor,
+        action="settings.department_changed",
+        target_type="department",
+        target_id=department_id,
+        details={
+            "setting": setting.name,
+            "old": old,
+            "new": new,
+            "requested_by": str(requested_by) if requested_by else None,
+        },
+    )
+    return new

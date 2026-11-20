@@ -24,5 +24,6 @@ SETTINGS = [
         limit=14,
         stricter=Stricter.HIGHER,
         description="Days before time off starts that coworkers' offers close",
+        per_department=True,  # a department's managers may raise it for their department
     ),
 ]

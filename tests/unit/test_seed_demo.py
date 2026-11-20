@@ -32,7 +32,7 @@ from app.modules.schedules import service as shift_service
 from app.modules.schedules.models import Shift
 from app.modules.security.models import PlatformSecurityEvent, SecurityEvent
 from app.modules.time_off.models import CoverageOffer, TimeOffRequest
-from app.settings.models import CompanySetting
+from app.settings.models import CompanySetting, DepartmentSetting
 from app.settings.service import PASSWORD_MIN_LENGTH, change_setting
 from app.tenancy.context import set_company
 from scripts import seed_demo
@@ -65,6 +65,7 @@ ORG_TABLES = [
         ApprovalDecision,
         TimeOffRequest,
         CoverageOffer,  # deciding time off ends any coworkers' offers (coverage.md)
+        DepartmentSetting,  # asking with offers reads the department's minimum
     )
 ]
 
