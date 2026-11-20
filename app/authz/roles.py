@@ -30,6 +30,8 @@ _MANAGER = [
     "time_off.review",
     "user.view",
     "account.change_self",
+    # Posting to the department or team the manager is assigned to (announcements.md).
+    "announcement.create",
     # No role.view: it is a company permission, so a department or team assignment could
     # never use it. Managers see the roles of people in their scope through user.view.
 ]

@@ -52,6 +52,7 @@ def test_the_owner_creates_an_account_with_no_password_yet(people: ShiftSetup) -
         "team_ids": [],
         "status": "invited",
         "locked": False,
+        "you_are_above": True,  # the owner is above everyone
     }
     with people.db() as db:
         row = db.get(User, uuid.UUID(created["id"]))
