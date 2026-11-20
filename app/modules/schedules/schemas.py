@@ -110,9 +110,21 @@ class DepartmentRef(BaseModel):
     name: str
 
 
+class RoleRef(BaseModel):
+    """One of a person's roles, as the schedule shows it: the name, and which starting role
+    it is (null for a role the company added). Nothing else: no permissions, no scopes."""
+
+    name: str
+    built_in: str | None
+
+
 class EmployeeRef(BaseModel):
     id: uuid.UUID
     display_name: str
+    # The person's active roles in the shift's department, in the people menu's order
+    # (repository.roles_of). Everyone who can see the shift sees them, employees included
+    # (decision 0038, 2026-11-17).
+    roles: list[RoleRef] = []
 
 
 class ShiftOut(BaseModel):

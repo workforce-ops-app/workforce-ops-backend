@@ -169,5 +169,6 @@ def test_the_session_lists_the_persons_permissions(signin: SignInSetup) -> None:
             "time_off.request_self",
             "time_off.cancel_self",
             "account.change_self",
+            "coverage.respond_self",
         ]
     )

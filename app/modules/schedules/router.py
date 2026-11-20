@@ -29,6 +29,7 @@ from app.modules.schedules.models import Shift
 from app.modules.schedules.schemas import (
     DepartmentRef,
     EmployeeRef,
+    RoleRef,
     ShiftAssign,
     ShiftBatch,
     ShiftBatchOut,
@@ -42,13 +43,23 @@ from app.modules.schedules.schemas import (
 router = APIRouter(prefix="/api/shifts", tags=["shifts"])
 
 
-def _out(item: Shift, department_name: str, employee_name: str | None) -> ShiftOut:
-    """A shift in the agreed answer shape."""
+def _out(
+    item: Shift, department_name: str, employee_name: str | None, roles: repository.RolesByPerson
+) -> ShiftOut:
+    """A shift in the agreed answer shape. roles holds everyone's roles in the departments
+    of the answer's shifts, looked up once for all of them (repository.roles_of)."""
     return ShiftOut(
         id=item.id,
         department=DepartmentRef(id=item.department_id, name=department_name),
         employee=(
-            EmployeeRef(id=item.employee_id, display_name=employee_name or "")
+            EmployeeRef(
+                id=item.employee_id,
+                display_name=employee_name or "",
+                roles=[
+                    RoleRef(name=name, built_in=built_in)
+                    for name, built_in in roles.get((item.employee_id, item.department_id), [])
+                ],
+            )
             if item.employee_id is not None
             else None
         ),
@@ -63,8 +74,20 @@ def _out(item: Shift, department_name: str, employee_name: str | None) -> ShiftO
     )
 
 
-def _one(db: Database, item: Shift) -> ShiftOut:
-    return _out(item, *repository.names(db, item))
+def _people(items: list[Shift]) -> list[repository.PersonInDepartment]:
+    """Who works these shifts and in which department, each pair once (open shifts have
+    nobody). Roles are shown for the shift's department (repository.roles_of)."""
+    return list(
+        {(item.employee_id, item.department_id) for item in items if item.employee_id is not None}
+    )
+
+
+def _one(db: Database, item: Shift, roles: repository.RolesByPerson | None = None) -> ShiftOut:
+    """One shift in the answer shape. A batch passes the roles it already looked up for all
+    its shifts; a single shift looks up its own person's."""
+    if roles is None:
+        roles = repository.roles_of(db, _people([item]))
+    return _out(item, *repository.names(db, item), roles)
 
 
 @router.get("")
@@ -89,7 +112,9 @@ def list_shifts(
         cursor=cursor,
         limit=limit,
     )
-    items = [_out(row[0], row[2], row[4]) for row in rows]
+    # The roles of everyone on this page, in one query.
+    roles = repository.roles_of(db, _people([row[0] for row in rows]))
+    items = [_out(row[0], row[2], row[4], roles) for row in rows]
     return ShiftPage(items=items, next_cursor=next_cursor)
 
 
@@ -98,8 +123,10 @@ def batch(body: ShiftBatch, current: SignedInPerson, db: Database) -> ShiftBatch
     """Several shifts at once, all or nothing. 200 for every action (a create batch too),
     since the answer is the batch's result rather than one new resource."""
     items = service.batch(db, current.user, body)
+    # The roles of everyone in the batch, in one query.
+    roles = repository.roles_of(db, _people(items))
     return ShiftBatchOut(
-        action=body.action, count=len(items), items=[_one(db, item) for item in items]
+        action=body.action, count=len(items), items=[_one(db, item, roles) for item in items]
     )
 
 
