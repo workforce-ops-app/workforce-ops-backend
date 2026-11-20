@@ -292,6 +292,55 @@ def test_a_reviewer_who_decided_no_longer_sees_it_as_waiting(people: ShiftSetup)
     assert decide(people, "chef", denied_first, "approve") == 409
 
 
+def test_an_open_request_says_who_decided_and_who_is_left(people: ShiftSetup) -> None:
+    # Reported in review: after one of two managers denied a request, it still read
+    # "Waiting for review". Every answer about an open request now carries its progress:
+    # who decided (and how) and who still has to, for the reviewers and the employee.
+    with people.db() as db:
+        db.add(TeamMember(team_id=people.ids["crew"], user_id=people.ids["ana"]))
+        db.commit()
+    also_reports_to(people, "ana", "lead")
+    needs_two(people)
+    request_id = ask(people.browser("ana"), 2, 2)
+
+    def progress(who: str, path: str) -> dict:
+        response = people.browser(who).get(path)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        items = body.get("items", [body])
+        return next(item for item in items if item["id"] == request_id)["progress"]
+
+    # Nobody has decided yet: both managers are still to decide.
+    fresh = progress("ana", f"{URL}/{request_id}")
+    assert fresh["decided"] == []
+    assert {p["id"] for p in fresh["waiting_for"]} == {
+        str(people.ids["chef"]),
+        str(people.ids["lead"]),
+    }
+
+    assert decide(people, "chef", request_id, "deny") == 200
+    expected_decided = [{"approver_id": str(people.ids["chef"]), "decision": "deny"}]
+    # The same picture on every screen: the team list, the other reviewer's waiting list,
+    # the request itself, and the employee's own list.
+    for who, path in (
+        ("chef", URL),
+        ("lead", f"{URL}/waiting"),
+        ("ana", f"{URL}/{request_id}"),
+        ("ana", f"{URL}?mine=true"),
+    ):
+        now = progress(who, path)
+        assert [
+            {"approver_id": d["approver_id"], "decision": d["decision"]} for d in now["decided"]
+        ] == expected_decided, (who, path)
+        assert [p["id"] for p in now["waiting_for"]] == [str(people.ids["lead"])], (who, path)
+        assert now["decided"][0]["approver_name"] and now["waiting_for"][0]["display_name"]
+
+    # Settled: no progress any more.
+    assert decide(people, "lead", request_id, "deny") == 200
+    assert status(people, request_id) == "denied"
+    assert progress("ana", f"{URL}/{request_id}") is None
+
+
 def test_with_no_shared_manager_the_owner_settles_it(people: ShiftSetup) -> None:
     # ana reports to chef and to admin, and admin no longer reports to anyone: nobody is
     # above both of them through lines, so the owner decides.

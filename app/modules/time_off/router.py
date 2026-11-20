@@ -33,6 +33,9 @@ from app.modules.time_off.schemas import (
     AffectedShift,
     Decision,
     DecisionBody,
+    Person,
+    Progress,
+    Step,
     TimeOffCreate,
     TimeOffDetail,
     TimeOffList,
@@ -50,7 +53,39 @@ def _names(db: Database, ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
     return {person_id: name for person_id, name in rows}
 
 
-def _out(item: TimeOffRequest, not_reviewed: bool, names: dict[uuid.UUID, str]) -> TimeOffOut:
+def _names_in(found: dict[uuid.UUID, service.Progress]) -> set[uuid.UUID]:
+    """Everyone a set of Progress answers names: who decided and who still has to."""
+    return {d.approver_id for p in found.values() for d in p.decided} | {
+        person for p in found.values() for person in p.waiting_for
+    }
+
+
+def _progress(found: service.Progress | None, names: dict[uuid.UUID, str]) -> Progress | None:
+    """A request's Progress in the answer shape (None once it is settled)."""
+    if found is None:
+        return None
+    return Progress(
+        decided=[
+            Step(
+                approver_id=d.approver_id,
+                approver_name=names.get(d.approver_id, "Unknown"),
+                decision=d.decision,
+            )
+            for d in found.decided
+        ],
+        waiting_for=[
+            Person(id=person, display_name=names.get(person, "Unknown"))
+            for person in found.waiting_for
+        ],
+    )
+
+
+def _out(
+    item: TimeOffRequest,
+    not_reviewed: bool,
+    names: dict[uuid.UUID, str],
+    progress: service.Progress | None = None,
+) -> TimeOffOut:
     return TimeOffOut(
         id=item.id,
         employee_id=item.employee_id,
@@ -62,6 +97,7 @@ def _out(item: TimeOffRequest, not_reviewed: bool, names: dict[uuid.UUID, str]) 
         not_reviewed=not_reviewed,
         created_at=item.created_at,
         decided_at=item.decided_at,
+        progress=_progress(progress, names),
     )
 
 
@@ -69,9 +105,12 @@ def _detail(db: Database, detail: service.Detail) -> TimeOffDetail:
     item = detail.request
     flags = service.not_reviewed(db, [item])
     comments = service.comments(db, item)
-    names = _names(db, {item.employee_id} | {d.approver_id for d in detail.decisions})
+    found = service.progress(db, [item])
+    names = _names(
+        db, {item.employee_id} | {d.approver_id for d in detail.decisions} | _names_in(found)
+    )
     return TimeOffDetail(
-        **_out(item, flags[item.id], names).model_dump(),
+        **_out(item, flags[item.id], names, found.get(item.id)).model_dump(),
         affected_shifts=[
             AffectedShift(
                 id=s.id, department_id=s.department_id, starts_at=s.starts_at, ends_at=s.ends_at
@@ -93,8 +132,10 @@ def _detail(db: Database, detail: service.Detail) -> TimeOffDetail:
 
 def _list(db: Database, rows: list[TimeOffRequest]) -> TimeOffList:
     flags = service.not_reviewed(db, rows)
-    names = _names(db, {row.employee_id for row in rows})
-    return TimeOffList(items=[_out(row, flags[row.id], names) for row in rows])
+    # Where each open request stands, and every name the answer needs, in one lookup.
+    found = service.progress(db, rows)
+    names = _names(db, {row.employee_id for row in rows} | _names_in(found))
+    return TimeOffList(items=[_out(row, flags[row.id], names, found.get(row.id)) for row in rows])
 
 
 def _one(db: Database, request: TimeOffRequest) -> TimeOffOut:
