@@ -66,12 +66,12 @@ def test_the_owner_holds_permissions_added_after_the_roles_were_created(
 ) -> None:
     # A later module adds a permission; existing companies' roles were created before it.
     # The owner holds it at once; nobody else does until a role grants it.
-    added = PermissionDef("announcement.create", Kind.COMPANY, "Post announcements", "news")
+    added = PermissionDef("newsletter.send", Kind.COMPANY, "Send newsletters", "news")
     monkeypatch.setitem(registry.all_permissions(), added.code, added)
-    assert allowed(org, "owner", "announcement.create")
-    assert not allowed(org, "admin", "announcement.create")
+    assert allowed(org, "owner", "newsletter.send")
+    assert not allowed(org, "admin", "newsletter.send")
     with org.a() as db:
-        assert "announcement.create" in effective_permissions(db, org.user(db, "owner"))
+        assert "newsletter.send" in effective_permissions(db, org.user(db, "owner"))
 
 
 def test_a_narrower_role_does_not_narrow_the_owners_late_permission(

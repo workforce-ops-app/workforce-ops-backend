@@ -62,7 +62,7 @@ def has_overlap(
     (its session and permission checks), so after waiting for the lock it would still
     miss a shift that the other request committed meanwhile, and both would be saved.
     A locking read (FOR SHARE) always sees the newest committed rows, so this query is
-    one. The same fix as for reporting lines (app/authz/chain.py, _is_above_fresh).
+    one. The same fix as for reporting lines (app/authz/chain.py, is_above_in_chain_fresh).
 
     The read locks only this person's shifts in the time range (it uses the
     company, employee, start index), so other people's bookings are not held up.
