@@ -313,8 +313,8 @@ def _race_problems(url: str) -> list[str]:
 def _reporting_line_race_problems(engine: Engine) -> list[str]:
     """Two requests changing reporting lines at the same moment; return what failed.
 
-    add_reporting_line() locks the company first and then checks with fresh, locking
-    reads (app/authz/chain.py).
+    add_reporting_line() and end_reporting_line() lock the company first and then check
+    with fresh, locking reads (app/authz/chain.py).
     """
     import threading
 
@@ -322,7 +322,12 @@ def _reporting_line_race_problems(engine: Engine) -> list[str]:
     from sqlalchemy.orm import Session
 
     from app.audit import Actor
-    from app.authz.chain import ReportingLineError, add_reporting_line, lock_reporting_lines
+    from app.authz.chain import (
+        ReportingLineError,
+        add_reporting_line,
+        end_reporting_line,
+        lock_reporting_lines,
+    )
     from app.authz.models import ReportingLine
     from app.modules.org.models import Company, Department, User
     from app.tenancy.context import set_company
@@ -387,7 +392,28 @@ def _reporting_line_race_problems(engine: Engine) -> list[str]:
     if not refused_after_late_commit(("b", "c"), ("c", "b")):
         problems.append("a reporting line loop committed meanwhile was not seen")
 
-    # 3. Two changes in one company take turns: while request 1 holds the company lock,
+    # 3. One line ended by two requests (#56): the second must see that it has ended,
+    # not end it twice. Line a -> b was added in race 1.
+    with session() as db:
+        line_ab = db.scalars(
+            select(ReportingLine.id).where(
+                ReportingLine.manager_id == ids["a"],
+                ReportingLine.employee_id == ids["b"],
+                ReportingLine.ended_at.is_(None),
+            )
+        ).one()
+    with session() as request_2:
+        request_2.scalars(select(ReportingLine)).all()  # its view is now fixed
+        with session() as request_1:
+            end_reporting_line(request_1, Actor.system(), line_ab)
+            request_1.commit()
+        try:
+            end_reporting_line(request_2, Actor.system(), line_ab)
+            problems.append("a reporting line ended meanwhile was ended a second time")
+        except ReportingLineError:
+            pass
+
+    # 4. Two changes in one company take turns: while request 1 holds the company lock,
     # request 2 (in another thread) must wait, and go ahead once request 1 commits.
     # Request 1 only takes the lock and writes nothing: adding a line also locks the
     # audit log's chain head, which would make request 2 wait even without the

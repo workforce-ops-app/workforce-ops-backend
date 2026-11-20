@@ -72,6 +72,12 @@ APP_RIGHTS: dict[str, frozenset[str]] = {
     # marked used (UPDATE), and deleted when a newer link for the person replaces it
     # (DELETE). So all four.
     "one_time_tokens": DATA,
+    # Approval requests (app/approvals/): added when someone asks, then changed in place
+    # as they are decided, cancelled, or lapse (UPDATE; also needed to lock the row with
+    # SELECT ... FOR UPDATE while that happens). Never removed: they are history.
+    "approval_requests": frozenset({"SELECT", "INSERT", "UPDATE"}),
+    # One person's decision: added once and never changed or removed.
+    "approval_decisions": frozenset({"SELECT", "INSERT"}),
 }
 
 # Alembic's own bookkeeping: only the migrations user needs it.
