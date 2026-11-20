@@ -173,7 +173,7 @@ Lock order: the platform chain's head first, then the new company's rows (which 
 | Method and path | Permission | Does |
 |---|---|---|
 | `POST /sign-up` | anyone not signed in (rate limited) | create a company and its owner account, and sign the owner in ([sign-up](#company-sign-up)) |
-| `GET /departments?cursor=&limit=` | signed in | page through active departments by name (built early in #88) |
+| `GET /departments?cursor=&limit=` | signed in | page through active departments by name (built early in #88); each with `id`, `name`, and `timezone` (null: the company's, #170) |
 | `GET /teams?department_id=&cursor=&limit=` | signed in | page through active teams by name, optionally of one department |
 | `POST /departments`, `PATCH /departments/{id}`, `POST /departments/{id}/archive` | `org.manage` | create, rename or set the time zone, archive |
 | `POST /teams`, `PATCH /teams/{id}`, `POST /teams/{id}/archive` | `org.manage` | create, rename, archive |
@@ -195,7 +195,7 @@ Lock order: the platform chain's head first, then the new company's rows (which 
 | `GET /approval-requests` | signed in | requests you made and requests waiting for you |
 | `POST /approval-requests/{id}/approve`, `.../deny`, `.../cancel` | the eligible approver, or the requester for cancel | decide or withdraw |
 
-A person in an answer: `id`, `display_name`, `email`, `department_id`, `team_ids` (archived teams included), `status` (`invited`, `active`, or `deactivated`), and `locked`. Never the password hash or the count of wrong passwords.
+A person in an answer: `id`, `display_name`, `email`, `department_id`, `team_ids` (archived teams included), `status` (`invited`, `active`, or `deactivated`), `locked`, and `you_are_above`: whether the signed-in person is above them (the Owner is above everyone but themselves; anyone else above the people below them through reporting lines; worked out once per page of people). `you_are_above` is a hint for the interface, which shows action buttons only for people the user is above (#168); every action is still checked by the API. Never the password hash or the count of wrong passwords.
 
 Setup and reset links are on the [authentication](../architecture/authentication.md#endpoints) page.
 

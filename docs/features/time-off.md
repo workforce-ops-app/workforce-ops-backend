@@ -1,6 +1,6 @@
 # Time-off requests
 
-- **Status:** planned (core tier)
+- **Status:** asking, cancelling, and following requests are built (TO1: `app/modules/time_off/`, migration `0012`); reviewing, escalation, and opening shifts follow in TO2 (#64)
 - **Related:** workforce-ops-app/workforce-ops-backend#10; frontend page: time-off screens (workforce-ops-app/workforce-ops-frontend#3); design: [authorization](../architecture/authorization.md), [data model](../architecture/data-model.md#approval_requests), [schedules](schedules.md)
 
 ## In short
@@ -120,7 +120,9 @@ stateDiagram-v2
 
 **Scope resolver:** a request belongs to its employee, and through them to their home department and teams.
 
-**Background job:** at least once an hour, requests still pending or escalated whose first day has begun in the employee's workplace zone are declined as not reviewed (actor `system`). The API also refuses decisions after that moment, so the outcome does not depend on when the job last ran.
+**Not reviewed in time, without a background job** (agreed 2026-11-19 for the final; see [authorization](../architecture/authorization.md#approval-request-endpoints)): the approval record's deadline (`review_by`) is the start of the first day in the employee's workplace zone. The first read or action on a request after that moment declines it as not reviewed (actor `system`, `decided_at` = the deadline itself), through the shared approval layer and the time-off handler's `lapsed` hook (`app/modules/time_off/approval.py`). Every list and view does this first, so the answer never shows a stale status, and no decision can arrive late. A scheduled job can replace it later without changing any endpoint.
+
+**In the code:** rules in `app/modules/time_off/service.py`; the approval record's hooks in `approval.py`; where a request belongs (its employee) in `scope.py`. Each person's requests take turns through a lock on their user row, so two requests sent at once cannot both pass the overlap check. The reason never goes into the audit log, which is kept for good.
 
 ### Audit and security
 
