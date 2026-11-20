@@ -305,6 +305,7 @@ def _race_problems(url: str) -> list[str]:
             + _people_race_problems(engine)
             + _lockout_race_problems(engine)
             + _link_race_problems(engine)
+            + _sign_up_race_problems(engine)
         )
     finally:
         engine.dispose()
@@ -828,6 +829,74 @@ def _lockout_race_problems(engine: Engine) -> list[str]:
         problems.append(
             f"{guesses} wrong passwords at the same moment counted {counted} (expected 5, "
             f"then locked), locked={locked}"
+        )
+    return problems
+
+
+def _sign_up_race_problems(engine: Engine) -> list[str]:
+    """Sign-ups racing for the last place under the platform limit; return what failed.
+
+    Each sign-up locks the platform audit chain's head before it counts this hour's new
+    companies (app/modules/sign_up/service.py). Without that, sign-ups sent together
+    would each count the same number and each add a company, past the limit. With one
+    place left, four sign-ups sent together must give exactly one new company; the other
+    three are refused (429). Nothing else in this check writes to the platform chain, so
+    these are the first sign-ups on a new platform: the lock holds the empty head that
+    migration 0011 creates (without it, MySQL stopped the racers as deadlocks).
+    """
+    import threading
+
+    from fastapi import HTTPException
+    from pydantic import SecretStr
+    from sqlalchemy import func, select
+    from sqlalchemy.orm import Session
+
+    from app.modules.org.models import Company
+    from app.modules.sign_up import service
+    from app.modules.sign_up.schemas import SignUpRequest
+
+    with Session(engine) as platform:
+        made_before = platform.scalar(select(func.count(Company.id))) or 0
+    racers = 4
+    # Every company in this throwaway database was made in the last hour: one place left.
+    limit_before = service.PLATFORM_PER_HOUR
+    service.PLATFORM_PER_HOUR = made_before + 1
+    start = threading.Barrier(racers)
+    outcomes: list[str] = []
+    errors: list[str] = []
+
+    def sign_up(number: int) -> None:
+        body = SignUpRequest(
+            company_name=f"Racer {number}",
+            timezone="UTC",
+            display_name=f"Racer {number}",
+            email=f"racer-{number}@sign-up-race.example.com",
+            password=SecretStr("lanterns drift over quiet waters"),
+        )
+        start.wait()
+        try:
+            service.sign_up(engine, body)
+            outcomes.append("made")
+        except HTTPException as error:  # TooManyRequests: the limit was reached
+            outcomes.append(str(error.status_code))
+        except Exception as error:  # a 500 in the app: reported below
+            errors.append(f"error: {error!r}"[:300])
+
+    try:
+        threads = [threading.Thread(target=sign_up, args=(n,)) for n in range(racers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+    finally:
+        service.PLATFORM_PER_HOUR = limit_before
+    with Session(engine) as platform:
+        made_after = platform.scalar(select(func.count(Company.id))) or 0
+    problems = [f"sign-ups at the same moment: {error}" for error in errors]
+    if made_after - made_before != 1 or sorted(outcomes) != ["429", "429", "429", "made"]:
+        problems.append(
+            f"{racers} sign-ups racing for one place made {made_after - made_before} "
+            f"companies (expected 1), answers {sorted(outcomes)}"
         )
     return problems
 
