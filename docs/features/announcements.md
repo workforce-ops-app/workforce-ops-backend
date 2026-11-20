@@ -1,6 +1,6 @@
 # Announcements
 
-- **Status:** posting, editing, archiving, and the managed list are built (AN1, #154: `app/modules/announcements/`, migration `0011`, the `team` column of `ScopeColumns` in `app/authz/scope.py`); reading, one announcement, read marks, and the read list are built (AN2, #155, no migration); the demo data follows with AN3 (final demo, [0038](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0038-final-demo-scope.md))
+- **Status:** posting, editing, archiving, and the managed list are built (AN1, #154: `app/modules/announcements/`, migration `0014`, the `team` column of `ScopeColumns` in `app/authz/scope.py`); reading, one announcement, read marks, and the read list are built (AN2, #155, no migration); the demo data follows with AN3 (final demo, [0038](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0038-final-demo-scope.md))
 - **Related:** design workforce-ops-app/workforce-ops-backend#110; backend workforce-ops-app/workforce-ops-backend#120; screens workforce-ops-app/workforce-ops-frontend#65; tracker workforce-ops-app/.github#84; design: [authorization](../architecture/authorization.md), [organization](organization.md)
 
 ## In short

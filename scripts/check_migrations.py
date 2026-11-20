@@ -360,6 +360,7 @@ def _race_problems(url: str) -> list[str]:
             + _people_race_problems(engine)
             + _lockout_race_problems(engine)
             + _link_race_problems(engine)
+            + _sign_up_race_problems(engine)
             + _read_mark_race_problems(engine)
         )
     finally:
@@ -452,8 +453,8 @@ def _read_mark_race_problems(engine: Engine) -> list[str]:
 def _reporting_line_race_problems(engine: Engine) -> list[str]:
     """Two requests changing reporting lines at the same moment; return what failed.
 
-    add_reporting_line() locks the company first and then checks with fresh, locking
-    reads (app/authz/chain.py).
+    add_reporting_line() and end_reporting_line() lock the company first and then check
+    with fresh, locking reads (app/authz/chain.py).
     """
     import threading
 
@@ -461,7 +462,12 @@ def _reporting_line_race_problems(engine: Engine) -> list[str]:
     from sqlalchemy.orm import Session
 
     from app.audit import Actor
-    from app.authz.chain import ReportingLineError, add_reporting_line, lock_reporting_lines
+    from app.authz.chain import (
+        ReportingLineError,
+        add_reporting_line,
+        end_reporting_line,
+        lock_reporting_lines,
+    )
     from app.authz.models import ReportingLine
     from app.modules.org.models import Company, Department, User
     from app.tenancy.context import set_company
@@ -526,7 +532,28 @@ def _reporting_line_race_problems(engine: Engine) -> list[str]:
     if not refused_after_late_commit(("b", "c"), ("c", "b")):
         problems.append("a reporting line loop committed meanwhile was not seen")
 
-    # 3. Two changes in one company take turns: while request 1 holds the company lock,
+    # 3. One line ended by two requests (#56): the second must see that it has ended,
+    # not end it twice. Line a -> b was added in race 1.
+    with session() as db:
+        line_ab = db.scalars(
+            select(ReportingLine.id).where(
+                ReportingLine.manager_id == ids["a"],
+                ReportingLine.employee_id == ids["b"],
+                ReportingLine.ended_at.is_(None),
+            )
+        ).one()
+    with session() as request_2:
+        request_2.scalars(select(ReportingLine)).all()  # its view is now fixed
+        with session() as request_1:
+            end_reporting_line(request_1, Actor.system(), line_ab)
+            request_1.commit()
+        try:
+            end_reporting_line(request_2, Actor.system(), line_ab)
+            problems.append("a reporting line ended meanwhile was ended a second time")
+        except ReportingLineError:
+            pass
+
+    # 4. Two changes in one company take turns: while request 1 holds the company lock,
     # request 2 (in another thread) must wait, and go ahead once request 1 commits.
     # Request 1 only takes the lock and writes nothing: adding a line also locks the
     # audit log's chain head, which would make request 2 wait even without the
@@ -967,6 +994,74 @@ def _lockout_race_problems(engine: Engine) -> list[str]:
         problems.append(
             f"{guesses} wrong passwords at the same moment counted {counted} (expected 5, "
             f"then locked), locked={locked}"
+        )
+    return problems
+
+
+def _sign_up_race_problems(engine: Engine) -> list[str]:
+    """Sign-ups racing for the last place under the platform limit; return what failed.
+
+    Each sign-up locks the platform audit chain's head before it counts this hour's new
+    companies (app/modules/sign_up/service.py). Without that, sign-ups sent together
+    would each count the same number and each add a company, past the limit. With one
+    place left, four sign-ups sent together must give exactly one new company; the other
+    three are refused (429). Nothing else in this check writes to the platform chain, so
+    these are the first sign-ups on a new platform: the lock holds the empty head that
+    migration 0013 creates (without it, MySQL stopped the racers as deadlocks).
+    """
+    import threading
+
+    from fastapi import HTTPException
+    from pydantic import SecretStr
+    from sqlalchemy import func, select
+    from sqlalchemy.orm import Session
+
+    from app.modules.org.models import Company
+    from app.modules.sign_up import service
+    from app.modules.sign_up.schemas import SignUpRequest
+
+    with Session(engine) as platform:
+        made_before = platform.scalar(select(func.count(Company.id))) or 0
+    racers = 4
+    # Every company in this throwaway database was made in the last hour: one place left.
+    limit_before = service.PLATFORM_PER_HOUR
+    service.PLATFORM_PER_HOUR = made_before + 1
+    start = threading.Barrier(racers)
+    outcomes: list[str] = []
+    errors: list[str] = []
+
+    def sign_up(number: int) -> None:
+        body = SignUpRequest(
+            company_name=f"Racer {number}",
+            timezone="UTC",
+            display_name=f"Racer {number}",
+            email=f"racer-{number}@sign-up-race.example.com",
+            password=SecretStr("lanterns drift over quiet waters"),
+        )
+        start.wait()
+        try:
+            service.sign_up(engine, body)
+            outcomes.append("made")
+        except HTTPException as error:  # TooManyRequests: the limit was reached
+            outcomes.append(str(error.status_code))
+        except Exception as error:  # a 500 in the app: reported below
+            errors.append(f"error: {error!r}"[:300])
+
+    try:
+        threads = [threading.Thread(target=sign_up, args=(n,)) for n in range(racers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+    finally:
+        service.PLATFORM_PER_HOUR = limit_before
+    with Session(engine) as platform:
+        made_after = platform.scalar(select(func.count(Company.id))) or 0
+    problems = [f"sign-ups at the same moment: {error}" for error in errors]
+    if made_after - made_before != 1 or sorted(outcomes) != ["429", "429", "429", "made"]:
+        problems.append(
+            f"{racers} sign-ups racing for one place made {made_after - made_before} "
+            f"companies (expected 1), answers {sorted(outcomes)}"
         )
     return problems
 
