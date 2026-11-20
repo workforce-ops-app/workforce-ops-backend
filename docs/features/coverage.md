@@ -127,7 +127,7 @@ The table stores one status, `open`, while a request is asking or in review; whi
 | `POST /coverage-requests` `{shift_id, note?, ask?: [user_id]}` | `coverage.request_self`, own shift | ask (201); leaving `ask` out asks everyone eligible |
 | `GET /coverage-requests?mine=true&cursor=&limit=` | `coverage.request_self` | your own requests, newest first, each with every answer |
 | `GET /coverage-requests/asked?cursor=&limit=` | `coverage.respond_self` | requests you were asked about, unanswered first, each with your own answer only |
-| `GET /coverage-requests/waiting?cursor=&limit=` | signed in | requests in review that you may decide, soonest shift first |
+| `GET /coverage-requests/waiting?cursor=&limit=` | signed in | requests in review that still need your decision, soonest shift first |
 | `GET /coverage-requests/{id}` | the employee, someone asked, or a reviewer | one request; what it includes depends on who asks (below) |
 | `POST /coverage-requests/{id}/answer` `{answer, offered_shift_id?}` | `coverage.respond_self`, asked | answer or change your answer (`accept`, `swap`, `decline`) |
 | `POST /coverage-requests/{id}/send` | the employee | end answering early and send it to review |

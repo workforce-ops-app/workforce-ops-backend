@@ -242,7 +242,7 @@ Built in `app/modules/approval_requests/` (HTTP), on the shared layer `app/appro
 | Endpoint | Who | What it does |
 |---|---|---|
 | `GET /api/approval-requests?view=mine` | anyone | the newest requests you asked for or that are about you |
-| `GET /api/approval-requests?view=to_review` | anyone | the pending requests you may decide now |
+| `GET /api/approval-requests?view=to_review` | anyone | the pending requests still waiting for your decision: one you already decided, still waiting for the other reviewers, is left out (`waits_for()` in `app/approvals/service.py`) |
 | `GET /api/approval-requests/{id}` | the requester, the person it is about, whoever decided it, its current reviewers | one request; 404 for anyone else |
 | `POST /api/approval-requests/{id}/approve`, `.../deny` | a current reviewer, never the requester or the person it is about (AZ7, AZ14); password re-entry for an admin-level role | one denial denies; enough approvals approve, and the role is given in the same transaction |
 | `POST /api/approval-requests/{id}/cancel` | the requester | takes the request back |

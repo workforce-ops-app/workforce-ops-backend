@@ -92,7 +92,7 @@ stateDiagram-v2
 |---|---|---|
 | `GET /time-off-requests?mine=true` | `time_off.request_self` | your own requests |
 | `GET /time-off-requests?status=&employee_id=&from=&to=` | `time_off.view` (scope filter) | requests of people in scope |
-| `GET /time-off-requests/waiting` | signed in | requests waiting for your review |
+| `GET /time-off-requests/waiting` | signed in | requests waiting for your review; once you approve or deny one, it leaves this list even while it still waits for other reviewers |
 | `GET /time-off-requests/{id}` | owner of the request, or `time_off.view` | one request, with its affected shifts and decisions so far |
 | `POST /time-off-requests` `{first_day, last_day, reason}` | `time_off.request_self` | ask for time off |
 | `POST /time-off-requests/{id}/cancel` | `time_off.cancel_self` | cancel your own request |
