@@ -210,7 +210,10 @@ def _escalate(
 
 
 def _denied(db: Session, request: TimeOffRequest, approval: ApprovalRequest) -> str:
+    from app.modules.time_off.offers import drop_offers  # offers.py imports this module
+
     request.status, request.decided_at = "denied", utcnow()
+    drop_offers(db, request)  # coverage.md, endings
     record(
         db,
         actor=Actor.system(),
@@ -247,15 +250,22 @@ def overlapping_shifts(db: Session, request: TimeOffRequest, *, lock: bool = Fal
 
 
 def approve(db: Session, approval: ApprovalRequest, approver: User) -> None:
-    """Approved: the request says so, and the employee's shifts on those days become open,
-    each audited with the request it was opened for. The caller holds the employee's lock.
+    """Approved: the request says so; the offers the settling approver chose move their
+    shifts to the coworkers (coverage.md); and the employee's other shifts on those days
+    become open, each audited with the request it was opened for. The caller holds the
+    employee's lock (and, for choices, the coworkers' and the shifts', offers.choose).
 
     The shifts are locked before the first audit entry, the same order as every schedule
     change (people, then shifts, then writes), so the two can never wait on each other."""
+    from app.modules.time_off.offers import apply_choices  # offers.py imports this module
+
     request = request_for(db, approval)
     if request is None:
         return
     shifts = overlapping_shifts(db, request, lock=True)
+    # Only the choices sent with THIS approval (the one that settles it) apply.
+    mine = approval.payload.get("choices", {}).get(str(approver.id), {})
+    chosen = apply_choices(db, request, approver, mine)
     request.status, request.decided_at = "approved", utcnow()
     record(
         db,
@@ -263,8 +273,11 @@ def approve(db: Session, approval: ApprovalRequest, approver: User) -> None:
         action="time_off.approved",
         target_type="time_off_request",
         target_id=request.id,
+        details={"chosen_offers": [str(offer.id) for offer in chosen]},
     )
     for shift in shifts:
+        if shift.employee_id != request.employee_id:
+            continue  # moved to a coworker by a chosen offer just above
         previous = shift.employee_id
         shift.employee_id, shift.status = None, "open"
         details: dict[str, Any] = {

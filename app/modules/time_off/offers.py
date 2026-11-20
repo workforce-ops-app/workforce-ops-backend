@@ -23,17 +23,36 @@ Locks, in the order every time-off change takes them: the employee's row, the re
 then the coworker's row. Holding the request's row means an offer and sending the request
 up take turns, so no offer slips in after the request went up.
 
-Every change is audited (coverage.offered, coverage.withdrawn) and commits once.
+Choosing at approval (choose, then apply_choices from review.approve):
+- The reviewer whose approval settles the request chooses: none, or one offer per shift.
+  Choices sent with an approval that does not settle it are kept with the approval record
+  but never applied (threat E12: only the deciding approval moves shifts).
+- A choice must be a cover or swap offer on this request, for that shift (422 otherwise).
+  A reviewer may never choose their own offer (403, E12). Choosing needs schedule.edit
+  over every shift it changes (403), checked before anything is written.
+- Locks, after the time-off ones (lines, employee, request, approval): the coworkers'
+  rows in ID order, then every shift involved in ID order (the order of every schedule
+  change). Then each chosen offer is checked again with offer_problem, so a coworker
+  deactivated, newly busy, or newly away, or a swap shift moved meanwhile, is refused
+  with 409 naming the shift, and nothing changes.
+- Applied: chosen covers and swaps reassign their shifts (shift.assigned, with the request
+  and the offer); the employee's other shifts on those days open, as before. Offers end
+  chosen or not_chosen; a declined, cancelled, or not reviewed request drops them.
+
+Every change is audited (coverage.offered, coverage.withdrawn, shift.assigned) and commits
+once.
 """
 
 import uuid
 from dataclasses import dataclass
+from datetime import UTC
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from app.approvals.service import DecisionError
 from app.audit import Actor, record
-from app.authz.check import authorize, grants
+from app.authz.check import Forbidden, authorize, grants
 from app.db.base import utcnow
 from app.modules.org import repository as people
 from app.modules.org.models import User
@@ -43,7 +62,7 @@ from app.modules.schedules.models import Shift
 from app.modules.time_off.days import days_span, zone_of
 from app.modules.time_off.models import CoverageOffer, TimeOffRequest
 from app.modules.time_off.review import overlapping_shifts
-from app.modules.time_off.schemas import OfferBody
+from app.modules.time_off.schemas import Choice, OfferBody
 
 # Why an offer is refused, in words the coworker can act on (409).
 OWN_REQUEST = "You cannot offer on your own request."
@@ -56,6 +75,19 @@ OTHER_DEPARTMENT = "The shift you give must be in the same department."
 DURING = "The shift you give is during the time off."
 EMPLOYEE_CANNOT = "The person asking could not work the shift you give."
 NO_SWAP_SHIFT = "Choose one of your own shifts to give."
+
+# The same reasons, as the reviewer reads them when a chosen offer no longer works.
+FOR_THE_REVIEWER = {
+    CANNOT_TAKE: "they can no longer be assigned this shift",
+    BUSY: "they now have another shift at that time",
+    AWAY: "they now have approved time off at that time",
+    NOT_YOURS: "the shift they give is no longer theirs to give",
+    OTHER_DEPARTMENT: "the shift they give is in another department",
+    DURING: "the shift they give is during the time off",
+    EMPLOYEE_CANNOT: "the employee could not work the shift they give",
+    NO_SWAP_SHIFT: "the shift they give is gone",
+    OWN_REQUEST: "it is the employee's own",
+}
 
 
 # --- Who may offer ---------------------------------------------------------------------
@@ -305,3 +337,156 @@ def withdraw(db: Session, user: User, request_id: uuid.UUID, shift_id: uuid.UUID
         details={"shift_id": str(shift_id)},
     )
     db.commit()
+
+
+# --- Choosing at approval --------------------------------------------------------------
+
+
+def choose(
+    db: Session, user: User, request: TimeOffRequest, choices: list[Choice]
+) -> dict[str, str]:
+    """Check the reviewer's choices and take the locks they need; returns them as
+    {shift ID: offer ID}, as kept with the approval record. The caller holds the time-off
+    locks (lines, employee, request, approval) and has checked the user may decide.
+
+    Nothing is written here: a refused choice (422, 403) leaves everything as it was.
+    """
+    # Step 1: each choice names one of the request's shifts, once, and a cover or swap
+    # offer on this request for that shift.
+    shifts = {shift.id: shift for shift in overlapping_shifts(db, request)}
+    chosen: dict[uuid.UUID, CoverageOffer] = {}
+    for choice in choices:
+        if choice.shift_id not in shifts or choice.shift_id in chosen:
+            raise Invalid("Choose at most one offer for each of this request's shifts.")
+        offer = db.get(CoverageOffer, choice.offer_id)  # another company's: None
+        if (
+            offer is None
+            or offer.time_off_request_id != request.id
+            or offer.shift_id != choice.shift_id
+            or offer.answer == "decline"
+        ):
+            raise Invalid("Choose a cover or swap offer made for that shift.")
+        if offer.status != "offered":
+            raise Conflict("That offer is no longer open.")
+        # Threat E12: a reviewer never hands a shift to themselves.
+        if offer.offered_by == user.id:
+            raise Forbidden()
+        chosen[choice.shift_id] = offer
+    if not chosen:
+        return {}
+
+    # Step 2: the locks, in the order of every schedule change: the coworkers' rows in ID
+    # order, then every shift involved (all of the employee's shifts on those days, and
+    # the shifts given in swaps) in ID order, read fresh.
+    for person_id in sorted({offer.offered_by for offer in chosen.values()}):
+        people.person(db, person_id, lock=True)
+    involved = set(shifts) | {o.swap_shift_id for o in chosen.values() if o.swap_shift_id}
+    locked = {
+        shift.id: shift
+        for shift in db.scalars(
+            select(Shift)
+            .where(Shift.id.in_(involved))
+            .order_by(Shift.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    }
+
+    # Step 3: moving a shift is a schedule change: schedule.edit over each one it moves.
+    for shift_id, offer in chosen.items():
+        authorize(db, user, "schedule.edit", locked[shift_id])
+        if offer.swap_shift_id is not None and offer.swap_shift_id in locked:
+            authorize(db, user, "schedule.edit", locked[offer.swap_shift_id])
+    return {str(shift_id): str(offer.id) for shift_id, offer in sorted(chosen.items())}
+
+
+def _when(db: Session, shift: Shift, employee: User) -> str:
+    """When a shift starts, in the employee's workplace zone, for a message."""
+    local = shift.starts_at.replace(tzinfo=UTC).astimezone(zone_of(db, employee))
+    return f"{local:%a %b} {local.day} at {local:%H:%M}"
+
+
+def apply_choices(
+    db: Session, request: TimeOffRequest, approver: User, choices: dict[str, str]
+) -> list[CoverageOffer]:
+    """The settling approval: check each chosen offer again and move its shifts; every
+    other offer on the request ends not_chosen. Raises DecisionError (409, nothing
+    changes) naming the first shift whose offer no longer works. The caller holds the
+    locks (choose)."""
+    employee = db.get(User, request.employee_id)
+    if employee is None:  # never deleted
+        raise DecisionError("The employee is missing.")
+    applied: list[CoverageOffer] = []
+    for shift_id, offer_id in sorted(choices.items()):
+        shift = db.get(Shift, uuid.UUID(shift_id))
+        offer = db.get(CoverageOffer, uuid.UUID(offer_id))
+        if shift is None or offer is None:
+            raise DecisionError("A chosen offer is gone; choose again.")
+        coworker = db.get(User, offer.offered_by)
+        swap = db.get(Shift, offer.swap_shift_id) if offer.swap_shift_id else None
+        # Step 1: still the employee's shift, the offer still open, and every rule still
+        # met (on fresh, locked reads).
+        problem = None
+        if offer.status != "offered" or shift.employee_id != employee.id:
+            problem = "the offer or the shift changed meanwhile"
+        elif coworker is None:
+            problem = FOR_THE_REVIEWER[CANNOT_TAKE]
+        elif (found := offer_problem(db, request, shift, coworker, offer.answer, swap)) is not None:
+            problem = FOR_THE_REVIEWER.get(found, found)
+        if problem is not None:
+            name = coworker.display_name if coworker is not None else "a coworker"
+            raise DecisionError(
+                f"The offer from {name} for the shift on {_when(db, shift, employee)} "
+                f"can no longer be used: {problem}. Choose another offer or none."
+            )
+        if coworker is None:  # refused just above; this tells the type checker
+            raise DecisionError("A chosen offer is gone; choose again.")
+        # Step 2: move the shifts, each audited with the request and the offer.
+        _reassign(db, shift, coworker.id, approver, request, offer)
+        if swap is not None:
+            _reassign(db, swap, employee.id, approver, request, offer)
+        db.flush()  # the next offer's checks see this one's moves
+        offer.status = "chosen"
+        applied.append(offer)
+    # Step 3: every other open offer on the request was not chosen.
+    _end_open_offers(db, request, "not_chosen")
+    return applied
+
+
+def _reassign(
+    db: Session,
+    shift: Shift,
+    to: uuid.UUID,
+    approver: User,
+    request: TimeOffRequest,
+    offer: CoverageOffer,
+) -> None:
+    previous, shift.employee_id = shift.employee_id, to
+    record(
+        db,
+        actor=Actor.user(approver.id),
+        action="shift.assigned",
+        target_type="shift",
+        target_id=shift.id,
+        details={
+            "employee_id": str(to),
+            "previous_employee_id": str(previous) if previous else None,
+            "time_off_request_id": str(request.id),
+            "offer_id": str(offer.id),
+        },
+    )
+
+
+def _end_open_offers(db: Session, request: TimeOffRequest, status: str) -> None:
+    """Every offer on the request still open ends with this status."""
+    db.execute(
+        update(CoverageOffer)
+        .where(CoverageOffer.time_off_request_id == request.id, CoverageOffer.status == "offered")
+        .values(status=status, updated_at=utcnow())
+        .execution_options(synchronize_session="fetch")
+    )
+
+
+def drop_offers(db: Session, request: TimeOffRequest) -> None:
+    """Declined, cancelled, or not reviewed: the offers stay as a record, dropped."""
+    _end_open_offers(db, request, "dropped")
