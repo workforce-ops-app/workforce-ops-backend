@@ -61,6 +61,9 @@ class Handler:
         enough approvals approve": called after each decision is recorded, it answers
         "approved", "denied", or None (still waiting). Time off uses it to send a
         disagreement up the chain instead of deciding it.
+    ready(db, request, approvers): whether the approvals so far are enough. Without it,
+        `required_approvals` approvals are enough; owner changes instead need every
+        current reviewer, worked out again now, so an owner added meanwhile must agree too.
     """
 
     reviewers: Callable[[Session, ApprovalRequest], set[uuid.UUID]]
@@ -69,6 +72,7 @@ class Handler:
     describe: Callable[[Session, ApprovalRequest], dict[str, Any]]
     lapsed: Callable[[Session, ApprovalRequest], None] | None = None
     outcome: Callable[[Session, ApprovalRequest], str | None] | None = None
+    ready: Callable[[Session, ApprovalRequest, set[uuid.UUID]], bool] | None = None
 
 
 _handlers: dict[str, Handler] = {}
@@ -233,18 +237,37 @@ def decide(db: Session, user: User, request: ApprovalRequest, decision: str) -> 
         )
         return
 
+    handler = handler_for(request)
     if rule is None:
+        # The usual rule: enough approvals approve. A kind with its own rule (time off)
+        # has already decided above, so it skips this count.
         db.flush()  # the decision is counted below
-        approvals = db.scalars(
-            select(ApprovalDecision.approver_id).where(
-                ApprovalDecision.request_id == request.id, ApprovalDecision.decision == "approve"
+        approvals = set(
+            db.scalars(
+                select(ApprovalDecision.approver_id).where(
+                    ApprovalDecision.request_id == request.id,
+                    ApprovalDecision.decision == "approve",
+                )
             )
-        ).all()
-        if len(approvals) < request.required_approvals:
+        )
+        enough = (
+            handler.ready(db, request, approvals)
+            if handler.ready is not None
+            else len(approvals) >= request.required_approvals
+        )
+        if not enough:
+            record(
+                db,
+                actor=Actor.user(user.id),
+                action="approval.approved",
+                target_type="approval_request",
+                target_id=request.id,
+                details={**details, "final": False},
+            )
             return  # more approvals needed; it stays pending
     # Approved: the change is made in this same transaction, so either both happen or
     # neither does.
-    handler_for(request).apply(db, request, user)
+    handler.apply(db, request, user)
     request.status, request.decided_at = "approved", now
     record(
         db,
@@ -252,7 +275,7 @@ def decide(db: Session, user: User, request: ApprovalRequest, decision: str) -> 
         action="approval.approved",
         target_type="approval_request",
         target_id=request.id,
-        details=details,
+        details={**details, "final": True},
     )
 
 

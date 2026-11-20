@@ -17,7 +17,8 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Query
 
-# Registers what role requests do on approval, before any request is decided.
+# Registers what each kind of request does on approval, before any request is decided.
+import app.modules.owners.approval  # noqa: F401
 import app.modules.roles.approval  # noqa: F401
 import app.modules.time_off.approval  # noqa: F401
 from app.auth.dependencies import Database, SignedInPerson
@@ -35,26 +36,26 @@ def list_requests(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> ApprovalRequestList:
     rows = service.list_requests(db, current.user, view=view, limit=limit)
-    return ApprovalRequestList(items=[shown(row) for row in rows])
+    return ApprovalRequestList(items=[shown(db, row) for row in rows])
 
 
 @router.get("/{request_id}")
 def view_request(
     request_id: uuid.UUID, current: SignedInPerson, db: Database
 ) -> ApprovalRequestOut:
-    return shown(service.view_request(db, current.user, request_id))
+    return shown(db, service.view_request(db, current.user, request_id))
 
 
 @router.post("/{request_id}/approve")
 def approve(request_id: uuid.UUID, current: SignedInPerson, db: Database) -> ApprovalRequestOut:
-    return shown(service.approve(db, current.user, request_id, session=current.session))
+    return shown(db, service.approve(db, current.user, request_id, session=current.session))
 
 
 @router.post("/{request_id}/deny")
 def deny(request_id: uuid.UUID, current: SignedInPerson, db: Database) -> ApprovalRequestOut:
-    return shown(service.deny(db, current.user, request_id, session=current.session))
+    return shown(db, service.deny(db, current.user, request_id, session=current.session))
 
 
 @router.post("/{request_id}/cancel")
 def cancel(request_id: uuid.UUID, current: SignedInPerson, db: Database) -> ApprovalRequestOut:
-    return shown(service.cancel_request(db, current.user, request_id))
+    return shown(db, service.cancel_request(db, current.user, request_id))
