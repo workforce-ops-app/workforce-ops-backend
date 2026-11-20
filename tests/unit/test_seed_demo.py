@@ -24,6 +24,8 @@ from app.authz.models import Permission, ReportingLine, Role, RoleAssignment, Ro
 from app.core.config import get_settings
 from app.db.base import Base
 from app.detection.patterns import KINDS
+from app.modules.announcements import repository as announcement_repository
+from app.modules.announcements.models import Announcement, AnnouncementRead
 from app.modules.org.models import Company, Department, Team, TeamMember, User
 from app.modules.schedules import service as shift_service
 from app.modules.schedules.models import Shift
@@ -55,6 +57,8 @@ ORG_TABLES = [
         CompanySetting,
         SecurityEvent,
         PlatformSecurityEvent,
+        Announcement,
+        AnnouncementRead,
     )
 ]
 
@@ -76,6 +80,9 @@ EVENTS_PER_COMPANY = (
 )
 EVENTS = f"{EVENTS_PER_COMPANY} security events added"
 NO_EVENTS = "0 security events added"
+# The demo announcements (AN3), added once per company.
+NEWS = f"{len(seed_demo.DEMO_ANNOUNCEMENTS)} announcements added"
+NO_NEWS = "0 announcements added"
 # The platform's line: its events of people not signed in, plus one drop count.
 PLATFORM_EVENTS = (
     sum(len(seed_demo.inspect([(a[3], a[4])])) for a in seed_demo.PLATFORM_ATTACKS) + 1
@@ -91,7 +98,7 @@ LINES = len(seed_demo.REPORTING_LINES)
 # The end of a company's line when a rerun has nothing left to add.
 NOTHING_NEW = (
     "0 reporting lines added; demo password set for 0 accounts; 0 shifts added; "
-    "0 security events added"
+    "0 announcements added; 0 security events added"
 )
 # Every account given the demo password.
 ALL_PASSWORDS = f"demo password set for {PEOPLE} accounts"
@@ -159,9 +166,9 @@ def test_it_creates_two_alike_companies(engine: Engine) -> None:
 
     assert lines == [
         f"Northwind Cafe: created; {LINES} reporting lines added; {NO_PASSWORD}; {WAITING}; "
-        f"{EVENTS}",
+        f"{NEWS}; {EVENTS}",
         f"Summit Outfitters: created; {LINES} reporting lines added; {NO_PASSWORD}; {WAITING}; "
-        f"{EVENTS}",
+        f"{NEWS}; {EVENTS}",
         PLATFORM,
     ]
     ids = company_ids(engine)
@@ -262,9 +269,9 @@ def test_a_demo_password_is_hashed_for_every_account(engine: Engine) -> None:
 
     assert lines == [
         f"Northwind Cafe: created; {LINES} reporting lines added; {ALL_PASSWORDS}; {ADDED}; "
-        f"{EVENTS}",
+        f"{NEWS}; {EVENTS}",
         f"Summit Outfitters: created; {LINES} reporting lines added; {ALL_PASSWORDS}; {ADDED}; "
-        f"{EVENTS}",
+        f"{NEWS}; {EVENTS}",
         PLATFORM,
     ]
     users = all_users(engine)
@@ -282,7 +289,7 @@ def test_a_rerun_only_fills_in_missing_passwords(engine: Engine) -> None:
 
     assert lines[0] == (
         "Northwind Cafe: already there; 0 reporting lines added; "
-        f"demo password set for {PEOPLE} accounts; {ADDED}; {NO_EVENTS}"
+        f"demo password set for {PEOPLE} accounts; {ADDED}; {NO_NEWS}; {NO_EVENTS}"
     )
     # A third run changes nothing: everyone already has a password, and the shifts exist.
     assert seed_demo.seed(engine, DEMO_PASSWORD, NOW)[0] == (
@@ -639,7 +646,7 @@ def test_a_company_seeded_before_shifts_gets_them_on_the_next_run(engine: Engine
 
     assert lines[0] == (
         f"Northwind Cafe: already there; {LINES} reporting lines added; "
-        f"demo password set for {PEOPLE} accounts; {ADDED}; {EVENTS}"
+        f"demo password set for {PEOPLE} accounts; {ADDED}; {NEWS}; {EVENTS}"
     )
     for company_id in company_ids(engine).values():
         assert count(engine, company_id, Shift) == SHIFTS_PER_COMPANY
@@ -877,3 +884,153 @@ def test_a_demo_value_the_detector_does_not_flag_stops_the_seed(
     monkeypatch.setattr(seed_demo, "DEMO_ATTACKS", (harmless,))
     with pytest.raises(seed_demo.SeedRefused, match="does not flag"):
         seed_demo.seed(engine, now=NOW)
+
+
+# --- Demo announcements (AN3) ---------------------------------------------------------
+
+
+def announcements_of(engine: Engine, company_id: uuid.UUID) -> dict[str, Announcement]:
+    """A company's announcements by title, in its own session."""
+    with Session(engine) as session:
+        set_company(session, company_id)
+        rows = {a.title: a for a in session.scalars(select(Announcement))}
+        session.expunge_all()
+        return rows
+
+
+def test_each_company_gets_every_kind_of_announcement(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    for plan in seed_demo.DEMO_COMPANIES:
+        company_id = company_ids(engine)[plan.name]
+        rows = announcements_of(engine, company_id)
+        assert set(rows) == {a.title for a in seed_demo.DEMO_ANNOUNCEMENTS}
+        with Session(engine) as session:
+            set_company(session, company_id)
+            names = {u.id: u.display_name for u in session.scalars(select(User))}
+            departments = {d.id: d.name for d in session.scalars(select(Department))}
+            teams = {t.id: t.name for t in session.scalars(select(Team))}
+
+        for item in seed_demo.DEMO_ANNOUNCEMENTS:
+            row = rows[item.title]
+            # Posted by the person in the plan, to the audience in the plan.
+            assert names[row.author_id] == plan.people[item.author].name
+            audience = {
+                "company": "company",
+                "department": departments.get(row.department_id),  # type: ignore[arg-type]
+                "team": teams.get(row.team_id),  # type: ignore[arg-type]
+            }[row.audience_type]
+            assert audience == item.audience
+            # Corrected and archived only where the plan says so.
+            assert (row.edited_at is not None) == (item.corrected_body is not None)
+            assert row.body == (item.corrected_body or item.body)
+            assert (row.archived_at is not None) == item.archived
+
+        # Every kind of audience, one edited, one archived.
+        assert {r.audience_type for r in rows.values()} == {"company", "department", "team"}
+        assert sum(r.edited_at is not None for r in rows.values()) == 1
+        assert sum(r.archived_at is not None for r in rows.values()) == 1
+
+
+def test_a_body_keeps_bold_and_unsafe_looking_text_exactly_as_typed(engine: Engine) -> None:
+    # Stored as typed, never cleaned up or turned into HTML (T5): the screens show the tag
+    # as text, so the demo can point at it.
+    seed_demo.seed(engine, now=NOW)
+    for company_id in company_ids(engine).values():
+        bodies = [a.body for a in announcements_of(engine, company_id).values()]
+        unsafe = [b for b in bodies if "<img src=x onerror=alert(1)>" in b]
+        assert len(unsafe) == 1 and "**the date and its allergens**" in unsafe[0]
+
+
+def test_the_read_counts_differ(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    for company_id in company_ids(engine).values():
+        rows = announcements_of(engine, company_id)
+        with Session(engine) as session:
+            set_company(session, company_id)
+            counts = announcement_repository.counts(session, [r.id for r in rows.values()])
+        by_title = {title: counts[row.id] for title, row in rows.items()}
+        # (read, in the audience): everyone for the company, the Kitchen's 4, the crew's 3.
+        assert by_title == {
+            "Holiday hours": (3, PEOPLE),
+            "Welcome to the new schedule": (6, PEOPLE),
+            "New allergen labels": (2, 4),
+            "Sunday brunch rush": (1, 3),
+        }
+
+
+def test_each_announcement_step_is_audited_under_the_person_who_took_it(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    for plan in seed_demo.DEMO_COMPANIES:
+        company_id = company_ids(engine)[plan.name]
+        rows = {a.id: a for a in announcements_of(engine, company_id).values()}
+        with Session(engine) as session:
+            set_company(session, company_id)
+            names = {u.id: u.display_name for u in session.scalars(select(User))}
+            events = session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action.like("announcement.%"),
+                    AuditEvent.company_id == company_id,
+                )
+            ).all()
+        steps = sorted(
+            (e.action, rows[e.target_id].title, names[e.actor_id])  # type: ignore[index]
+            for e in events
+        )
+        owner = plan.people[seed_demo.OWNER].name
+        lead = plan.people[seed_demo.CREW_LEAD].name
+        kitchen = plan.people[seed_demo.KITCHEN_MANAGER].name
+        # One entry per post, correction, and archive; read marks are not audited.
+        assert steps == sorted(
+            [
+                ("announcement.posted", "Holiday hours", owner),
+                ("announcement.posted", "Welcome to the new schedule", owner),
+                ("announcement.posted", "New allergen labels", kitchen),
+                ("announcement.posted", "Sunday brunch rush", lead),
+                ("announcement.edited", "Sunday brunch rush", lead),
+                ("announcement.archived", "Holiday hours", owner),
+            ]
+        )
+
+
+def test_announcements_are_added_once(engine: Engine) -> None:
+    seed_demo.seed(engine, now=NOW)
+    lines = seed_demo.seed(engine, now=NOW)
+    assert all(f"; {NO_NEWS};" in line for line in lines[:2])
+    for company_id in company_ids(engine).values():
+        assert count(engine, company_id, Announcement) == len(seed_demo.DEMO_ANNOUNCEMENTS)
+        assert count(engine, company_id, AnnouncementRead) == sum(
+            len(a.readers) for a in seed_demo.DEMO_ANNOUNCEMENTS
+        )
+
+
+@pytest.mark.parametrize(
+    ("refused", "message"),
+    [
+        # The Front of House manager may not post to the Kitchen (E11).
+        (
+            seed_demo.AnnouncementPlan(seed_demo.FRONT_MANAGER, "Kitchen", "Mine", "Text"),
+            "posting: 403",
+        ),
+        # A Front of House employee is not in the Kitchen's audience (I9).
+        (
+            seed_demo.AnnouncementPlan(
+                seed_demo.KITCHEN_MANAGER, "Kitchen", "Mine", "Text", readers=(seed_demo.FRONT_A,)
+            ),
+            "a read mark: 404",
+        ),
+    ],
+)
+def test_a_step_the_application_refuses_stops_the_seed_and_keeps_no_announcement(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    refused: seed_demo.AnnouncementPlan,
+    message: str,
+) -> None:
+    # A valid one first, so the test shows the earlier announcement is not kept either.
+    plan = (seed_demo.DEMO_ANNOUNCEMENTS[1], refused)
+    monkeypatch.setattr(seed_demo, "DEMO_ANNOUNCEMENTS", plan)
+    with pytest.raises(seed_demo.SeedRefused, match=f"announcement 'Mine'.*{message}"):
+        seed_demo.seed(engine, now=NOW)
+    for company_id in company_ids(engine).values():
+        assert count(engine, company_id, Announcement) == 0
+        assert count(engine, company_id, AnnouncementRead) == 0

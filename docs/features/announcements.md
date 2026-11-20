@@ -1,6 +1,6 @@
 # Announcements
 
-- **Status:** posting, editing, archiving, and the managed list are built (AN1, #154: `app/modules/announcements/`, migration `0014`, the `team` column of `ScopeColumns` in `app/authz/scope.py`); reading, one announcement, read marks, and the read list are built (AN2, #155, no migration); the demo data follows with AN3 (final demo, [0038](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0038-final-demo-scope.md))
+- **Status:** posting, editing, archiving, and the managed list are built (AN1, #154: `app/modules/announcements/`, migration `0014`, the `team` column of `ScopeColumns` in `app/authz/scope.py`); reading, one announcement, read marks, and the read list are built (AN2, #155, no migration); the demo data is built (AN3, #156: `seed_announcements()` in `scripts/seed_demo.py`) (final demo, [0038](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0038-final-demo-scope.md))
 - **Related:** design workforce-ops-app/workforce-ops-backend#110; backend workforce-ops-app/workforce-ops-backend#120; screens workforce-ops-app/workforce-ops-frontend#65; tracker workforce-ops-app/.github#84; design: [authorization](../architecture/authorization.md), [organization](organization.md)
 
 ## In short
@@ -149,6 +149,17 @@ The seed script adds, in each demo company, through the same service the applica
 - one archived announcement, and one edited;
 - an announcement whose body includes `**bold**` and text that would run if shown unsafely (for example `<img src=x onerror=alert(1)>`), so the demo shows both the bold and the plain-text display;
 - read marks for some readers, so the read counts differ.
+
+Built in AN3 as `DEMO_ANNOUNCEMENTS` in `scripts/seed_demo.py`, the same in both companies (in Northwind Cafe):
+
+| Title | From | To | Read by | Afterwards |
+|---|---|---|---|---|
+| Holiday hours | the owner | the company | 3 of 10 | archived by the owner |
+| Welcome to the new schedule | the owner | the company | 6 of 10 | |
+| New allergen labels | the Kitchen manager | Kitchen | 2 of 4 | (has the bold text and the `<img>` tag) |
+| Sunday brunch rush | the Weekend Crew lead | Weekend Crew | 1 of 3 | corrected by the crew lead |
+
+They are posted in that order, so the last is the newest, and read before any is archived (an archived announcement cannot be marked read). Their posted times are the moment the script runs; the script does not backdate them, so the posted time always matches the audit entry. Added once per company; a step the application refuses stops the script and keeps none of that company's announcements (`tests/unit/test_seed_demo.py`).
 
 ### Audit and security
 
