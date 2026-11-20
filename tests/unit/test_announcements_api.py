@@ -595,3 +595,38 @@ def test_an_invalid_reader_cursor_is_refused(announcements: ShiftSetup) -> None:
     for cursor in ("not-a-cursor", "x" * 201):
         response = announcements.browser("ana").get("/api/announcements", params={"cursor": cursor})
         assert response.status_code == 422
+
+
+def test_the_audiences_answer_has_what_the_form_needs(announcements: ShiftSetup) -> None:
+    response = announcements.browser("chef").get("/api/announcements/audiences")
+    assert response.status_code == 200, response.text
+    ids = announcements.ids
+    # Exactly the IDs a POST body needs for each, the name to show, and a team's
+    # department, so the form can say "Weekend Crew (Kitchen)".
+    assert response.json() == {
+        "items": [
+            {
+                "type": "department",
+                "department_id": str(ids["kitchen"]),
+                "team_id": None,
+                "name": "Kitchen",
+                "department_name": None,
+            },
+            {
+                "type": "team",
+                "department_id": None,
+                "team_id": str(ids["crew"]),
+                "name": "Weekend Crew",
+                "department_name": "Kitchen",
+            },
+        ]
+    }
+    # The owner's list starts with the whole company, which has no name.
+    first = announcements.browser("owner").get("/api/announcements/audiences").json()["items"][0]
+    assert first == {
+        "type": "company",
+        "department_id": None,
+        "team_id": None,
+        "name": None,
+        "department_name": None,
+    }
