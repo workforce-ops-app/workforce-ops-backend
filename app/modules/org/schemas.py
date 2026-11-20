@@ -145,6 +145,11 @@ class UserOut(BaseModel):
     status: str
     # Whether wrong passwords have locked the account for now.
     locked: bool
+    # Whether the signed-in person is above them in the reporting chain (the Owner is
+    # above everyone; nobody is above themselves). A hint for the interface, which
+    # shows action buttons only for people the user is above (AZ5); the API checks
+    # every action regardless.
+    you_are_above: bool
 
 
 class UserPage(BaseModel):

@@ -274,3 +274,26 @@ def test_the_audit_log_never_keeps_an_email(people: ShiftSetup) -> None:
         ).all()
     assert len(details) == 2
     assert "quiet" not in str(details)
+
+
+# --- E3: who the interface offers buttons for -------------------------------------------
+
+
+def test_each_person_says_whether_you_are_above_them(people: ShiftSetup) -> None:
+    """A display hint only (the API checks every action): the Owner is above everyone but
+    themselves; anyone else only above the people below them through reporting lines."""
+
+    def above(who: str) -> dict[str, bool]:
+        items = people.browser(who).get("/api/users", params={"limit": 200}).json()["items"]
+        names = {str(person_id): name for name, person_id in people.ids.items()}
+        return {names[item["id"]]: item["you_are_above"] for item in items}
+
+    owner = above("owner")
+    assert owner["owner"] is False and all(v for k, v in owner.items() if k != "owner")
+    chef = above("chef")  # manages Kitchen; above ana, cara, newbie, gone, lead (and ben)
+    assert chef["ana"] and chef["cara"] and not chef["chef"]
+    admin = above("admin")
+    assert admin["chef"] and admin["ana"] and not admin["owner"] and not admin["admin"]
+    assert admin["dana"] is False  # nobody but the owner is above dana
+    one = people.browser("admin").get(f"/api/users/{people.ids['chef']}").json()
+    assert one["you_are_above"] is True

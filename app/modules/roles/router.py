@@ -131,7 +131,7 @@ def give_role(
     given = assignments.give(db, current.user, body, session=current.session)
     if given.assignment is None:
         # Accepted, not done: the role is given only once someone above approves it.
-        content = shown(given.request).model_dump(mode="json")  # type: ignore[arg-type]
+        content = shown(db, given.request).model_dump(mode="json")  # type: ignore[arg-type]
         return JSONResponse(status_code=202, content=content)
     return _assignment(given.assignment, given.role)
 
