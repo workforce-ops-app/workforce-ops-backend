@@ -14,9 +14,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import ColumnElement, and_, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
-from app.modules.org.models import Company, Department, User
+from app.authz.models import Role, RoleAssignment
+from app.modules.org.models import Company, Department, Team, User
 from app.modules.schedules.models import Shift
 
 
@@ -62,7 +63,7 @@ def has_overlap(
     (its session and permission checks), so after waiting for the lock it would still
     miss a shift that the other request committed meanwhile, and both would be saved.
     A locking read (FOR SHARE) always sees the newest committed rows, so this query is
-    one. The same fix as for reporting lines (app/authz/chain.py, _is_above_fresh).
+    one. The same fix as for reporting lines (app/authz/chain.py, is_above_in_chain_fresh).
 
     The read locks only this person's shifts in the time range (it uses the
     company, employee, start index), so other people's bookings are not held up.
@@ -102,6 +103,126 @@ def names(db: Session, item: Shift) -> tuple[str, str | None]:
         employee = db.get(User, item.employee_id)
         person_name = employee.display_name if employee is not None else None
     return (dept.name if dept is not None else ""), person_name
+
+
+# The order of the people menu's sections (frontend #83): the starting roles from the top
+# of a company down, with the roles a company added in between (by name), and Employee
+# last, since nearly everyone holds it.
+_ROLE_RANK = {"owner": 0, "administrator": 1, "manager": 2, None: 3, "employee": 4}
+
+# Who works where: a person and the department of a shift they work.
+PersonInDepartment = tuple[uuid.UUID, uuid.UUID]
+
+# Each person's roles in a department, as roles_of answers: (name, built_in) pairs.
+RolesByPerson = dict[PersonInDepartment, list[tuple[str, str | None]]]
+
+
+def _covers(
+    department_id: uuid.UUID,
+    scope_type: str,
+    scope_department: uuid.UUID | None,
+    team_department: uuid.UUID | None,
+    covered_department: uuid.UUID | None,
+) -> bool:
+    """Whether a role assignment applies in this department (decided 2026-11-17: the
+    calendar shows each person's roles in the department being viewed, not elsewhere).
+
+    A company-wide assignment applies everywhere; a department assignment in its own
+    department; a team assignment in the team's department; an assignment for one person
+    in that person's home department (where their records are).
+    """
+    if scope_type == "company":
+        return True
+    if scope_type == "department":
+        return scope_department == department_id
+    if scope_type == "team":
+        return team_department == department_id
+    return covered_department == department_id  # "employee": one person
+
+
+def roles_of(db: Session, people: list[PersonInDepartment]) -> RolesByPerson:
+    """Each person's active roles in a department, as (name, built_in) pairs in the menu's
+    order: owner, administrator, manager, the company's own roles by name, employee.
+
+    people pairs each person with the department of a shift they work. A role counts there
+    only if its assignment applies in that department (_covers), so a manager of a Kitchen
+    team shows as a manager on Kitchen's calendar and not on Front's.
+
+    "Active" means what it means for permissions (app/authz/check.py, _active_assignments):
+    the role is not archived, the assignment is not for an archived department or team, and
+    the person is not deactivated. A role held in several scopes is listed once; the scopes
+    themselves stay on the server.
+
+    One query for all the people in an answer, not one per shift. The IDs are looked up
+    first and passed in, since the company filter refuses subqueries (tenancy.md). Every
+    joined model (and the alias) has a column in the select list, so the company filter
+    limits each to the session's company. In SQL it is roughly:
+
+        SELECT role_assignments.user_id, roles.name, roles.built_in,
+               role_assignments.scope_type, role_assignments.department_id,
+               teams.department_id, covered.department_id
+          FROM role_assignments
+          JOIN roles ON roles.id = role_assignments.role_id
+          JOIN users ON users.id = role_assignments.user_id
+          LEFT OUTER JOIN departments ON departments.id = role_assignments.department_id
+          LEFT OUTER JOIN teams ON teams.id = role_assignments.team_id
+          LEFT OUTER JOIN users AS covered ON covered.id = role_assignments.employee_id
+         WHERE role_assignments.user_id IN (:people)
+           AND roles.archived_at IS NULL AND users.deactivated_at IS NULL
+           AND departments.archived_at IS NULL AND teams.archived_at IS NULL
+
+    Which department each assignment applies in is then decided in Python (_covers), since
+    one person can work shifts in several departments in the same answer.
+    """
+    # 1. Nobody to look up (a page of open shifts only): no query at all.
+    if not people:
+        return {}
+    # 2. Every pair gets an entry, so someone with no role there gets an empty list.
+    found: dict[PersonInDepartment, set[tuple[str, str | None]]] = {pair: set() for pair in people}
+    departments_of: dict[uuid.UUID, set[uuid.UUID]] = {}
+    for person, department in people:
+        departments_of.setdefault(person, set()).add(department)
+    # 3. The query of the docstring. "covered" is the person an employee-scoped assignment
+    #    is about (a second copy of the users table).
+    covered = aliased(User)
+    rows = db.execute(
+        select(
+            RoleAssignment.user_id,
+            Role.name,
+            Role.built_in,
+            RoleAssignment.scope_type,
+            RoleAssignment.department_id,
+            Team.department_id,
+            covered.department_id,
+            User.id,
+            Department.id,
+        )
+        .join(Role, Role.id == RoleAssignment.role_id)
+        .join(User, User.id == RoleAssignment.user_id)
+        # Outer joins: each assignment has at most one of a department, a team, and a
+        # person, and then the archived_at conditions below are true for the others.
+        .outerjoin(Department, Department.id == RoleAssignment.department_id)
+        .outerjoin(Team, Team.id == RoleAssignment.team_id)
+        .outerjoin(covered, covered.id == RoleAssignment.employee_id)
+        .where(
+            RoleAssignment.user_id.in_(list(departments_of)),
+            Role.archived_at.is_(None),
+            User.deactivated_at.is_(None),
+            Department.archived_at.is_(None),
+            Team.archived_at.is_(None),
+        )
+    )
+    # 4. Each assignment counts in the departments it applies in; a set per pair drops the
+    #    same role held in several scopes.
+    for person, name, built_in, scope_type, scope_dept, team_dept, covered_dept, *_ in rows:
+        for department in departments_of[person]:
+            if _covers(department, scope_type, scope_dept, team_dept, covered_dept):
+                found[(person, department)].add((name, built_in))
+    # 5. The menu's order: by rank, then by name (which only matters among added roles).
+    return {
+        pair: sorted(roles, key=lambda role: (_ROLE_RANK.get(role[1], 3), role[0].casefold()))
+        for pair, roles in found.items()
+    }
 
 
 # --- The list ---------------------------------------------------------------------------

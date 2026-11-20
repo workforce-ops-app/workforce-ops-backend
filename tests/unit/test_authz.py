@@ -39,6 +39,7 @@ CORE = {
     "audit.view": "company",
     "audit.verify": "company",
     "security.view": "company",
+    "announcement.create": "record",
     "company.transfer_ownership": "company",
 }
 
@@ -111,6 +112,7 @@ def test_the_starting_roles_grant_what_the_authorization_page_says(org: Org) -> 
         "time_off.review",
         "user.view",
         "account.change_self",
+        "announcement.create",
     }
     assert granted["employee"] == {
         "schedule.view_self",
