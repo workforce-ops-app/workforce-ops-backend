@@ -151,6 +151,15 @@ In each company, two Kitchen requests asked with offers, through the services as
 - one already **sent up**, with one cover offer, waiting for its reviewer.
 Someone from another department gets no card (not eligible).
 
+Built in CV4 as `DEMO_COVERAGE` in `scripts/seed_demo.py`, after `DEMO_TIME_OFF` and in the same transaction (in Northwind Cafe; days counted from the day the script runs):
+
+| Who asks | Days | Reason | Offers | State |
+|---|---|---|---|---|
+| Cara Lund | days 2 to 6 | Family trip | Ben Okafor covers, Ana Diaz swaps one of her own shifts, Felix Grant declines | collecting; Felix Grant (her reviewer) can choose Ben's cover once she sends it up |
+| Ben Okafor | days 11 to 13 | Camping trip | Cara Lund covers | sent up; waiting for Felix Grant and Ana Diaz |
+
+Which shift each answer is about, and which shift a swap gives, are the first the application accepts (`offers.offer_problem`), since the shifts on those days depend on the weekday the script runs; an answer no shift allows that week is left out (with the demo shift pattern, every one fits). Ana's swap cannot be chosen by Felix, who may not edit her Morning Prep shift (`schedule.edit` is checked on every moved shift), which the demo can show.
+
 ### Audit and security
 
 **Audit events:** `time_off.requested` (details: `offer_coverage`), `coverage.offered` (details: shift, answer, any swap shift; a changed answer writes another), `coverage.withdrawn`, `time_off.sent_up` (details: `by` is `employee` or `deadline`; the deadline one has actor `system` and happens at the deadline itself), `time_off.approved` (details: the chosen offers), `shift.assigned` per reassigned shift (details: request and offer), `shift.opened` as today, `settings.department_changed`, and the approval events for `department_setting`.
