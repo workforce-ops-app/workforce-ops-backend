@@ -190,4 +190,7 @@ class Limits:
     Sign-in and company sign-up both hit sign_in_per_address for the request's address."""
 
     sign_in_per_address: RateLimit = field(default_factory=lambda: RateLimit(limit=20))
+    # Company sign-up: 5 an hour per address (docs/features/organization.md, company
+    # sign-up). The platform-wide limit is counted in the database (app/modules/sign_up).
+    sign_up_per_address: RateLimit = field(default_factory=lambda: RateLimit(limit=5, window=3600))
     requests_per_session: RateLimit = field(default_factory=lambda: RateLimit(limit=300))

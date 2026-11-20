@@ -1,2 +1,2 @@
-"""Time off: asking for it and reviewing it (docs/features/time-off.md). For now only its
-permissions; the requests arrive with the time-off slices."""
+"""Time off: asking for it and reviewing it (docs/features/time-off.md). Asking, cancelling,
+and following requests are built (TO1); reviewing arrives with TO2 (#64)."""
