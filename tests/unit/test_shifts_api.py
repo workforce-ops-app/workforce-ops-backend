@@ -41,7 +41,11 @@ def test_a_created_shift_has_the_agreed_shape(shifts: ShiftSetup) -> None:
         "event_description",
     }
     assert created["department"] == {"id": str(shifts.ids["kitchen"]), "name": "Kitchen"}
-    assert created["employee"] == {"id": str(shifts.ids["ana"]), "display_name": "Ana"}
+    assert created["employee"] == {
+        "id": str(shifts.ids["ana"]),
+        "display_name": "Ana",
+        "roles": [{"name": "Employee", "built_in": "employee"}],
+    }
     assert created["status"] == "scheduled"
     assert created["details"] == "Register 2"
     assert created["starts_at"].endswith("Z") or created["starts_at"].endswith("+00:00")
