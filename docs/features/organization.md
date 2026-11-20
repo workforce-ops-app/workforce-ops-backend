@@ -174,6 +174,7 @@ Lock order: the platform chain's head first, then the new company's rows (which 
 |---|---|---|
 | `POST /sign-up` | anyone not signed in (rate limited) | create a company and its owner account, and sign the owner in ([sign-up](#company-sign-up)) |
 | `GET /departments?cursor=&limit=` | signed in | page through active departments by name (built early in #88); each with `id`, `name`, and `timezone` (null: the company's, #170) |
+| `GET /departments/mine` | signed in | the active departments where you hold a role, by name, each with `id`, `name`, `timezone`, and `permissions` (the codes you hold there). Company-wide roles count in every department, a department role in that one, a team role in the team's department, and a one-person role in that person's home department (`department_permissions()` in `app/authz/check.py`, the same places as the role groups on the department view). For the department picker and the tools each screen offers there; the API still checks every request (found in review, 2026-11-20) |
 | `GET /teams?department_id=&cursor=&limit=` | signed in | page through active teams by name, optionally of one department |
 | `POST /departments`, `PATCH /departments/{id}`, `POST /departments/{id}/archive` | `org.manage` | create, rename or set the time zone, archive |
 | `POST /teams`, `PATCH /teams/{id}`, `POST /teams/{id}/archive` | `org.manage` | create, rename, archive |
