@@ -38,10 +38,11 @@ from app.approvals.service import open_request, pending_like
 from app.audit import Actor, record
 from app.auth.models import UserSession
 from app.auth.reauth import require_reauth
-from app.authz.chain import is_above_in_chain_fresh, lock_reporting_lines
-from app.authz.check import ADMIN_LEVEL, Forbidden, authorize, is_owner
+from app.authz.chain import lock_reporting_lines
+from app.authz.check import ADMIN_LEVEL, Forbidden, authorize
 from app.authz.delegation import (
     held_for,
+    is_above_fresh,
     is_same_level,
     place_problem,
     scope_of,
@@ -106,7 +107,7 @@ def _may_give_all_of(db: Session, user: User, codes: set[str], scope: Scope | No
 def _still_above(db: Session, user: User, person: User) -> None:
     """After the company's lock: the user is still above the person, on fresh reads (a
     line ended while this request waited counts). 403 otherwise."""
-    if not (is_owner(db, user) or is_above_in_chain_fresh(db, user.id, person.id)):
+    if not is_above_fresh(db, user, person):
         raise Forbidden()
 
 
