@@ -46,6 +46,7 @@ stateDiagram-v2
 - **Who can be assigned:** an active person whose home department is the shift's department, or who is on an active team in it (an archived team keeps its member list for history, but it no longer makes anyone eligible). Invited people (who have not set their password yet) and deactivated people cannot be assigned (422).
 - **No double booking:** a person cannot have two shifts that overlap (409). Back-to-back shifts are fine. The person's row is locked while this is checked, and the check reads the newest committed shifts (a locking read, since under MySQL's default isolation an ordinary read can miss a shift committed while the request waited for the lock), so two requests at the same moment cannot both book them. Every change to an existing shift takes its locks in one order (the people it touches, sorted, then the shift, then the writes and the audit entry), so two changes can never wait for each other (deadlock). A shift reassigned by someone else while a change waited is refused (409, reload and try again).
 - **Time off:** a person cannot be assigned during their approved time off (409). Checked once time-off requests exist.
+- **Coverage requests:** reassigning, opening, cancelling, or changing the times of a shift ends its open coverage request in the same transaction (reason `shift_changed`), so a request never outlives the shift it was about. An approved coverage request changes shifts through the same assignment steps as a manager, with every rule above ([coverage](coverage.md)).
 - **Past shifts:** once a shift has ended it cannot be changed or cancelled (409); its notes are history. A shift that has already ended cannot be created either, and a future shift cannot be moved into the past by changing its times (both 422), so the past cannot be written in after the fact.
 - **Archived departments:** no new shift goes into an archived department (409); its existing shifts stay as history ([organization](organization.md#states-and-rules)).
 - **Cancelling** keeps the shift with status `cancelled` ([0020](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md)); it disappears from normal views.
@@ -108,5 +109,5 @@ Every action also takes `confirm_count`. The answer is `{"action": ..., "count":
 ### Known limitations
 - No draft-and-publish yet (next tier): shifts are visible once saved.
 - No repeating shift patterns beyond "the same shift on these days".
-- Rest time between shifts and weekly hour limits are checked with coverage (next tier), not here.
+- Rest time between shifts and weekly hour limits are not checked anywhere yet (stretch, workforce-ops-app/workforce-ops-backend#99, [0038](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0038-final-demo-scope.md)).
 - Times are shown in the workplace's zone, not each viewer's own zone.
