@@ -1,7 +1,7 @@
 """Add the announcements and announcement_reads tables.
 
-Revision: 0011
-Revises: 0010
+Revision: 0014
+Revises: 0013
 
 As in docs/features/announcements.md and app/modules/announcements/models.py. Both are
 company-owned: the author, the department, the team, the announcement, and the reader are
@@ -20,8 +20,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import mysql
 
-revision: str = "0011"
-down_revision: str | None = "0010"
+revision: str = "0014"
+down_revision: str | None = "0013"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
