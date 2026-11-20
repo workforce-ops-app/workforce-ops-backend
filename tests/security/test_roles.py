@@ -187,6 +187,17 @@ def test_a_role_held_only_below_you_can_be_changed(people: ShiftSetup) -> None:
     assert people.browser("chef").post("/api/shifts", json=a_shift(people)).status_code == 403
 
 
+def test_each_role_says_whether_you_may_change_it(people: ShiftSetup) -> None:
+    # The same rule as the change itself (#170), so the screen offers only what can work.
+    may = {k: r["you_may_change"] for k, r in roles_by_kind(people.browser("admin")).items()}
+    # admin holds Administrator; dana (Employee) is outside admin's chain; Manager is held
+    # only by chef and lead, both below admin; Owner never.
+    assert may == {"owner": False, "administrator": False, "manager": True, "employee": False}
+    # An owner may change every role but Owner.
+    may = {k: r["you_may_change"] for k, r in roles_by_kind(people.browser("owner")).items()}
+    assert may == {"owner": False, "administrator": True, "manager": True, "employee": True}
+
+
 def test_a_rename_alone_needs_no_reentry(people: ShiftSetup) -> None:
     admin = people.browser("admin")
     manager = roles_by_kind(admin)["manager"]
