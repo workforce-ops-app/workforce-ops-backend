@@ -43,6 +43,18 @@ class DepartmentOut(BaseModel):
     timezone: str | None  # null: the company's time zone applies (#170)
 
 
+class MyDepartment(DepartmentOut):
+    """A department where the signed-in person holds a role, with what they may do there
+    (GET /api/departments/mine): the department picker lists these, and each screen offers
+    only the tools these permissions allow. The API still checks every request."""
+
+    permissions: list[str]  # sorted permission codes
+
+
+class MyDepartments(BaseModel):
+    items: list[MyDepartment]  # in name order
+
+
 class DepartmentPage(BaseModel):
     """A page of departments; next_cursor is null after the last page."""
 
