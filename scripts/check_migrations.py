@@ -309,6 +309,26 @@ def _database_rule_problems(url: str) -> list[str]:
             ):
                 problems.append("a valid department announcement was refused")
 
+            # 9 and 10. Read marks (AN2): the company-aware keys keep a mark out of another
+            # company's announcement, and the primary key allows one mark per person.
+            posted = announcement(company_a, "department", department_a)
+            connection.execute(text(announcement_sql), posted)
+            read_sql = (
+                "INSERT INTO announcement_reads (company_id, announcement_id, user_id, "
+                "read_at) VALUES (:company, :announcement, :user, NOW(6))"
+            )
+
+            def mark(company: bytes) -> dict[str, object]:
+                return {"company": company, "announcement": posted["id"], "user": ben["id"]}
+
+            if not _refused(connection, read_sql, mark(company_b)):
+                problems.append("a read mark could point at another company's announcement")
+            if _refused(connection, read_sql, mark(company_a)):
+                problems.append("a valid read mark was refused")
+            connection.execute(text(read_sql), mark(company_a))
+            if not _refused(connection, read_sql, mark(company_a)):
+                problems.append("a second read mark by the same person was stored")
+
             transaction.rollback()
     finally:
         engine.dispose()
@@ -341,9 +361,93 @@ def _race_problems(url: str) -> list[str]:
             + _lockout_race_problems(engine)
             + _link_race_problems(engine)
             + _sign_up_race_problems(engine)
+            + _read_mark_race_problems(engine)
         )
     finally:
         engine.dispose()
+
+
+def _read_mark_race_problems(engine: Engine) -> list[str]:
+    """One person marking one announcement read several times at the same moment; return
+    what failed.
+
+    Marking read is idempotent (app/modules/announcements/service.py): it looks for the
+    person's mark and adds one if there is none. Requests sent together (a page sending it
+    twice) can all find none and all add one; the primary key on (announcement, person)
+    then refuses all but the first. Each refused one must be answered as a success, not a
+    500, and exactly one mark must be saved.
+    """
+    import threading
+
+    from sqlalchemy import func, select
+    from sqlalchemy.orm import Session
+
+    from app.modules.announcements import service
+    from app.modules.announcements.models import Announcement, AnnouncementRead
+    from app.modules.org.models import Company, Department, User
+    from app.tenancy.context import set_company
+
+    with Session(engine) as platform:
+        company = Company(name="read mark race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+    with Session(engine) as db:
+        set_company(db, company_id)
+        home = Department(name="Office")
+        db.add(home)
+        db.flush()
+        reader = User(
+            email=f"reader-{company_id.hex}@read-race.example.com",
+            display_name="reader",
+            department_id=home.id,
+        )
+        db.add(reader)
+        db.flush()
+        # Added directly: posting has its own tests, only the read marks matter here.
+        item = Announcement(
+            author_id=reader.id,
+            audience_type="company",
+            title="probe",
+            body="probe",
+        )
+        db.add(item)
+        db.commit()
+        reader_id, announcement_id = reader.id, item.id
+
+    marks = 4
+    start = threading.Barrier(marks)
+    errors: list[str] = []
+
+    def mark_read() -> None:
+        # Each mark is its own request, with its own session for the company.
+        with Session(engine) as db:
+            set_company(db, company_id)
+            person = db.get(User, reader_id)
+            start.wait()
+            try:
+                if person is None:
+                    raise LookupError("the probe's reader was not found")
+                service.mark_read(db, person, announcement_id)
+            except Exception as error:  # a 500 in the app: reported below
+                errors.append(f"error: {error!r}"[:300])
+
+    threads = [threading.Thread(target=mark_read) for _ in range(marks)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+    with Session(engine) as db:
+        set_company(db, company_id)
+        saved = db.scalar(
+            select(func.count(AnnouncementRead.user_id)).where(
+                AnnouncementRead.announcement_id == announcement_id
+            )
+        )
+    problems = [f"read marks at the same moment: {error}" for error in errors]
+    if saved != 1:
+        problems.append(f"{marks} read marks at the same moment saved {saved} (expected 1)")
+    return problems
 
 
 def _reporting_line_race_problems(engine: Engine) -> list[str]:
