@@ -19,6 +19,7 @@ from app.approvals.service import DecisionError, Handler, register_handler
 from app.audit import Actor, record
 from app.modules.org.models import User
 from app.modules.time_off import review
+from app.modules.time_off.models import OPEN
 
 _request_for = review.request_for
 
@@ -46,9 +47,10 @@ def describe(db: Session, approval: ApprovalRequest) -> dict[str, Any]:
 
 
 def lapsed(db: Session, approval: ApprovalRequest) -> None:
-    """Its first day began undecided: the request is declined as not reviewed."""
+    """Its first day began undecided: the request is declined as not reviewed. That
+    includes one still collecting (asked with offers and never sent up)."""
     request = _request_for(db, approval)
-    if request is None or request.status not in ("pending", "escalated"):
+    if request is None or request.status not in OPEN:
         return
     request.status, request.decided_at = "denied", approval.decided_at
     record(

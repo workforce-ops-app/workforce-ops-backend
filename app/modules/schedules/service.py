@@ -33,14 +33,13 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.audit import Actor, record
 from app.authz.check import Forbidden, authorize, scope_filter
 from app.authz.scope import ScopeColumns
 from app.db.base import utcnow
-from app.modules.org.models import Team, TeamMember, User
+from app.modules.org.models import User
 from app.modules.schedules import repository
 from app.modules.schedules import scope as _scope  # noqa: F401  (registers the resolver)
 from app.modules.schedules.models import Shift
@@ -151,23 +150,9 @@ def _lock_for_change(
 def _check_assignable(db: Session, shift: Shift, employee_id: uuid.UUID) -> None:
     """Refuse anyone who cannot work this shift (see the rules at the top)."""
     person = repository.person(db, employee_id, lock=True)
-    # Unknown (or of another company), deactivated, or not set up yet ("invited").
-    if person is None or person.deactivated_at is not None or person.password_hash is None:
-        raise Invalid(CANNOT_ASSIGN)
-    # Home department, or on an active team in the shift's department. An archived team
-    # keeps its member list for history (organization.md), but being listed on it no
-    # longer makes anyone eligible.
-    on_team = db.execute(
-        select(TeamMember.user_id, Team.id)
-        .join(Team, Team.id == TeamMember.team_id)
-        .where(
-            TeamMember.user_id == person.id,
-            Team.department_id == shift.department_id,
-            Team.archived_at.is_(None),
-        )
-        .limit(1)
-    ).first()
-    if person.department_id != shift.department_id and on_team is None:
+    # Unknown (or of another company), deactivated, not set up yet ("invited"), or neither
+    # living in the shift's department nor on an active team in it.
+    if person is None or not repository.assignable(db, person, shift.department_id):
         raise Invalid(CANNOT_ASSIGN)
     if repository.has_overlap(db, person.id, shift.starts_at, shift.ends_at, ignore=shift.id):
         raise Conflict("This person already has a shift at that time.")

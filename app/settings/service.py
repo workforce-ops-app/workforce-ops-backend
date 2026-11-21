@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # The settings other code reads by name.
 PASSWORD_MIN_LENGTH = "auth.password_min_length"  # noqa: S105  (a setting's name, not a password)
 TIME_OFF_REQUIRED_APPROVALS = "time_off.required_approvals"
+TIME_OFF_OFFERS_CLOSE_DAYS = "time_off.offers_close_days"  # coverage.md, the send-up minimum
 
 
 def _company(db: Session) -> uuid.UUID:
