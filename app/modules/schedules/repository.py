@@ -84,6 +84,63 @@ def has_overlap(
     return db.scalar(found) is not None
 
 
+def on_time_off(db: Session, person: User, starts_at: datetime, ends_at: datetime) -> bool:
+    """Whether the person has APPROVED time off overlapping this time (schedules.md, states
+    and rules: nobody is assigned during their approved time off).
+
+    Time off is whole days in the person's workplace zone (time-off.md), so each approved
+    request is turned into the UTC moments where its first day begins and its last day
+    ends, the same way the approval works out which shifts to open
+    (app/modules/time_off/days.py). A shift overlaps it when each starts before the other
+    ends, as in has_overlap(). Only "approved" counts: a request still waiting, declined,
+    or cancelled blocks nothing.
+
+    Races: the caller holds the person's row lock (person(..., lock=True)), and approving
+    time off takes that same lock first (app/modules/time_off/service.py), so an approval
+    and an assignment take turns. As in has_overlap(), the read is FOR SHARE so that, after
+    waiting for the lock, it sees an approval committed meanwhile.
+    """
+    # Imported here, not at the top: the time-off module already imports this one
+    # (days.py uses workplace_zone), and a top-level import both ways would be circular.
+    from app.modules.time_off.models import TimeOffRequest
+
+    # Step 1: the person's workplace zone, and the shift's first and last calendar day in
+    # it. Only requests touching those days (one day either side, for safety at the edges)
+    # can overlap, which keeps the read to a few rows on the (company, employee, first_day)
+    # index.
+    home = db.get(Department, person.department_id)
+    if home is None:  # everyone has a home department of their own company
+        raise RuntimeError("the person's home department is missing")
+    zone = ZoneInfo(workplace_zone(db, home))
+    first = starts_at.replace(tzinfo=UTC).astimezone(zone).date() - timedelta(days=1)
+    last = ends_at.replace(tzinfo=UTC).astimezone(zone).date() + timedelta(days=1)
+    requests = db.scalars(
+        select(TimeOffRequest)
+        .where(
+            TimeOffRequest.employee_id == person.id,
+            TimeOffRequest.status == "approved",
+            TimeOffRequest.first_day <= last,
+            TimeOffRequest.last_day >= first,
+        )
+        .with_for_update(read=True)
+    )
+    # Step 2: compare exactly, with the days turned into UTC moments (stored without a zone,
+    # like the shift times).
+    for request in requests:
+        begins = _day_starts(zone, request.first_day)
+        ends = _day_starts(zone, request.last_day + timedelta(days=1))
+        if starts_at < ends and ends_at > begins:
+            return True
+    return False
+
+
+def _day_starts(zone: ZoneInfo, day: date) -> datetime:
+    """The UTC moment (without zone, as stored) where a day begins in a zone. The same rule
+    as day_starts() in app/modules/time_off/days.py, kept here so this module does not
+    import that one (it imports this one)."""
+    return datetime.combine(day, time(0), zone).astimezone(UTC).replace(tzinfo=None)
+
+
 def shift(db: Session, shift_id: uuid.UUID, *, lock: bool = False) -> Shift | None:
     """One shift of the session's company (another company's looks like none: 404).
 

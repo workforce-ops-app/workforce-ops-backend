@@ -76,6 +76,7 @@ stateDiagram-v2
 - **No self-review:** nobody reviews their own request; a manager's request goes to their own managers.
 - **Reviewers are checked at the moment they decide** (still above the employee, still holding `time_off.review`).
 - **On approval:** every shift of the employee that overlaps the approved days becomes **open** (`employee_id` cleared, status `open`), with an audit entry linking it to the request.
+- **While approved,** nobody can give the employee a shift on those days again (409; [schedules](schedules.md#states-and-rules)).
 - **Cancelling an approved request** does not give the shifts back automatically; the manager reassigns them.
 - **Not reviewed in time:** a request still undecided (pending or escalated) when its **first day begins** (midnight in the employee's workplace zone) is **declined**. It counts as declined for everything, and the audit log records that nobody reviewed it; the employee sees "Declined: not reviewed in time". Role grants, owner changes, and account changes use a 7-day deadline instead ([0032](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md)).
 - **Next tier:**
