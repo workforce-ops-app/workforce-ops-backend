@@ -1,6 +1,6 @@
 # Announcements
 
-- **Status:** design (final demo, [0038](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0038-final-demo-scope.md))
+- **Status:** posting, editing, archiving, and the managed list are built (AN1, #154: `app/modules/announcements/`, migration `0014`, the `team` column of `ScopeColumns` in `app/authz/scope.py`); reading, read marks, and the read list follow with AN2 (final demo, [0038](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0038-final-demo-scope.md))
 - **Related:** design workforce-ops-app/workforce-ops-backend#110; backend workforce-ops-app/workforce-ops-backend#120; screens workforce-ops-app/workforce-ops-frontend#65; tracker workforce-ops-app/.github#84; design: [authorization](../architecture/authorization.md), [organization](organization.md)
 
 ## In short
@@ -90,7 +90,7 @@ stateDiagram-v2
 | `POST /announcements/{id}/read` | in the audience | mark read (204) |
 | `GET /announcements/{id}/reads?cursor=&limit=` | `announcement.create` covering the audience | page through the people in the audience by name, each with when they read it, or not yet |
 
-An announcement in an answer: `id`, `audience` (`{type, department_id, team_id}` with names), `title`, `body`, `author` (`{id, display_name}`), `posted_at`, `edited_at`, `archived`, and for readers `read`, for managers `read_count` and `audience_count`.
+An announcement in an answer: `id`, `audience` (`{type, department_id, department_name, team_id, team_name}`), `title`, `body`, `author` (`{id, display_name}`), `posted_at`, `edited_at`, `archived`, and for readers `read`, for managers `read_count` and `audience_count`. `audience_count` is the people in the audience now (an archived team's audience is empty); `read_count` is how many of them have read it, so it matches the read list. The managed list's answer to someone whose only `announcement.create` assignment is for an archived department or team is 403, as for any list without a permission.
 
 **Table: `announcements`** (feature table)
 
