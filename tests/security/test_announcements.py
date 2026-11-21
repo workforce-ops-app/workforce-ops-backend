@@ -770,3 +770,67 @@ def test_the_reader_list_never_loads_other_audiences(announcements: ShiftSetup) 
     assert total == 44
     assert {str(row[0].id) for row in rows} == mine
     assert len(rows) == 2
+
+
+# --- E11: the audiences the posting form offers -----------------------------------------
+
+
+def audience_keys(setup: ShiftSetup, who: str) -> list[str]:
+    """The audiences GET /api/announcements/audiences offers, as keys of setup.ids (or
+    "company"), in the order given."""
+    response = setup.browser(who).get("/api/announcements/audiences")
+    assert response.status_code == 200, response.text
+    by_id = {str(value): key for key, value in setup.ids.items()}
+    keys = []
+    for choice in response.json()["items"]:
+        if choice["type"] == "company":
+            keys.append("company")
+        else:
+            keys.append(by_id[choice["department_id"] or choice["team_id"]])
+    return keys
+
+
+def test_the_audiences_offered_agree_with_posting_for_every_pair(
+    announcements: ShiftSetup,
+) -> None:
+    # The list is worked out with the same authorize() check posting makes, so for every
+    # manager and audience: offered exactly when posting answers 201.
+    offered = {who: audience_keys(announcements, who) for who in MANAGERS}
+    for who in MANAGERS:
+        for audience in AUDIENCES:
+            expected = 201 if audience in offered[who] else 403
+            assert try_post(announcements, who, audience) == expected, (who, audience)
+    # Spelled out, in the order the form shows: the company, departments, then teams.
+    assert {who: [k for k in keys if k in AUDIENCES] for who, keys in offered.items()} == {
+        "owner": ["company", "front", "kitchen", "patio", "crew"],
+        "chef": ["kitchen", "crew"],
+        "manny": ["front", "patio"],
+        "lead": ["crew"],
+        "pat": ["patio"],
+    }
+
+
+def test_employees_are_offered_no_audience(announcements: ShiftSetup) -> None:
+    # No announcement.create anywhere: 403, as for the managed list.
+    for who in ("ana", "ben"):
+        assert announcements.browser(who).get("/api/announcements/audiences").status_code == 403
+
+
+def test_another_companys_departments_and_teams_are_never_offered(
+    announcements: ShiftSetup,
+) -> None:
+    other = {str(v) for k, v in announcements.ids.items() if k.startswith("b_")}
+    for who in MANAGERS:
+        response = announcements.browser(who).get("/api/announcements/audiences")
+        ids = {c["department_id"] or c["team_id"] for c in response.json()["items"]}
+        assert not ids & other, who
+    # And the other company's manager sees only their own company's.
+    assert audience_keys(announcements, "b_chef") == ["b_kitchen", "b_crew"]
+
+
+def test_archived_departments_and_teams_are_not_offered(announcements: ShiftSetup) -> None:
+    archive(announcements, Team, "crew")
+    assert "crew" not in audience_keys(announcements, "owner")
+    assert audience_keys(announcements, "chef") == ["kitchen"]
+    # The crew's lead holds their role for an archived team only: it covers nothing.
+    assert announcements.browser("lead").get("/api/announcements/audiences").status_code == 403
