@@ -85,6 +85,9 @@ APP_RIGHTS: dict[str, frozenset[str]] = {
     # changed in place when the answer changes or the request ends (UPDATE), and removed
     # when a coworker takes their answer back (DELETE; the audit log keeps the record).
     "coverage_offers": DATA,
+    # A department's own setting values (docs/features/coverage.md): added, then changed in
+    # place (UPDATE, also for the lock while it changes). Never removed.
+    "department_settings": frozenset({"SELECT", "INSERT", "UPDATE"}),
     # Announcements (docs/features/announcements.md): posted (INSERT), corrected and
     # archived (UPDATE; also needed to lock a row with SELECT ... FOR UPDATE while it
     # changes). Archived, never deleted (decision 0020), so no DELETE.

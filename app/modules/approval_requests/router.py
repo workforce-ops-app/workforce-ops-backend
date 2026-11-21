@@ -18,6 +18,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Query
 
 # Registers what each kind of request does on approval, before any request is decided.
+import app.modules.department_settings.approval  # noqa: F401
 import app.modules.owners.approval  # noqa: F401
 import app.modules.roles.approval  # noqa: F401
 import app.modules.time_off.approval  # noqa: F401

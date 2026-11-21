@@ -125,7 +125,7 @@ and the status `collecting` (the `CHECK` lists it). The approval record is opene
 
 Unique `(company_id, time_off_request_id, shift_id, offered_by)`: one answer per coworker per shift.
 
-**Table: `department_settings`** (company-owned): `department_id`, `key`, `value` (JSON), unique `(company_id, department_id, key)`; only for settings a module declares as per-department (`offers_close_days` for now), and only stricter than the company's.
+**Table: `department_settings`** (company-owned, migration `0016`): `department_id` (company-aware foreign key to `departments`), `module` and `setting_key` (as in `company_settings`), `value` (JSON), `created_at`, `updated_at`; primary key `(company_id, department_id, module, setting_key)`. Only for settings a module declares with `per_department=True` (`time_off.offers_close_days` for now), and only stricter than the company's when written; read as the stricter of the two anyway, so a company that later raises its own value is never undercut. (Built in CV3: the design first named one `key` column; `module` and `setting_key` match `company_settings`.)
 
 **Endpoints** (all under `/api`)
 
@@ -138,11 +138,11 @@ Unique `(company_id, time_off_request_id, shift_id, offered_by)`: one answer per
 | `DELETE /time-off-requests/{id}/offers/{shift_id}` | the coworker (`coverage.respond_self`) | take back your answer while collecting (204); the row is removed, and `coverage.withdrawn` keeps the record |
 | `GET /time-off-requests/{id}` | as today | also `offers`: every offer for the employee and the reviewers; only your own for a coworker |
 | `POST /time-off-requests/{id}/approve` `{comment?, choices?: [{shift_id, offer_id}]}` | as today | approve; the choices apply if this approval settles it |
-| `GET /departments/{id}/settings`, `PUT /departments/{id}/settings/offers_close_days` `{value}` | a manager of the department, or `time_off.review` company-wide | read; change (202 when other managers must confirm) |
+| `GET /departments/{id}/settings`, `PUT /departments/{id}/settings/offers_close_days` `{value}` | a manager of the department, or `time_off.review` company-wide | read (each setting with `company_value`, `department_value`, `value` in force, `limit`, and any `pending` change with who it waits for); change: 200 `{value}` at once, or 202 `{approval_request_id}` when other managers must confirm; 409 while another change waits; 422 below the company's value or past the limit. The other managers confirm or refuse through `/api/approval-requests/{id}/approve` and `/deny` |
 
 **Permissions:** `coverage.respond_self` (self), given to every starting role; existing companies get it on their starting roles in the migration. `coverage.request_self` and `coverage.review` from the first design are not used: asking is part of time off, and reviewing is `time_off.review`.
 
-**Code:** `app/modules/time_off/` keeps the request and gains `offers.py` (who may offer, the answers, the lists) and the choices in `review.py`'s `approve`; the department setting goes to `app/settings/` (per-department values) with its approval kind in `app/modules/time_off/approval.py`'s neighbour `department_setting.py`.
+**Code:** `app/modules/time_off/` keeps the request and gains `offers.py` (who may offer, the answers, the lists) and the choices in `review.py`'s `approve`; the per-department values are read and written in `app/settings/` (`department_value`, `change_department_setting`), and the endpoints, the department's managers, and the `department_setting` approval kind live in `app/modules/department_settings/` (built in CV3; the design first put the kind next to the time-off handler, but a module of its own gets its own router).
 
 ### Demo data
 
