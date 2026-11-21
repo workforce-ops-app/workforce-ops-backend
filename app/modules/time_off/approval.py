@@ -20,6 +20,7 @@ from app.audit import Actor, record
 from app.modules.org.models import User
 from app.modules.time_off import review
 from app.modules.time_off.models import OPEN
+from app.modules.time_off.offers import drop_offers
 
 _request_for = review.request_for
 
@@ -53,6 +54,7 @@ def lapsed(db: Session, approval: ApprovalRequest) -> None:
     if request is None or request.status not in OPEN:
         return
     request.status, request.decided_at = "denied", approval.decided_at
+    drop_offers(db, request)  # coverage.md, endings
     record(
         db,
         actor=Actor.system(),
