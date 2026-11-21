@@ -29,7 +29,7 @@ Ended lines do not count.
 
 Changing lines is safe when two requests run at once: each change first locks the
 company (lock_reporting_lines), then checks with reads that see the newest committed
-lines (_is_above_fresh explains why ordinary reads are not enough).
+lines (is_above_in_chain_fresh explains why ordinary reads are not enough).
 """
 
 import uuid
@@ -39,6 +39,7 @@ from sqlalchemy.orm import Session, aliased
 
 from app.audit import Actor, record
 from app.authz.models import ReportingLine
+from app.db.base import utcnow
 from app.modules.org.models import Company
 from app.tenancy.context import get_company
 
@@ -160,7 +161,7 @@ def lock_reporting_lines(db: Session) -> None:
 
 
 def _current_line_exists(db: Session, manager_id: uuid.UUID, employee_id: uuid.UUID) -> bool:
-    """Whether a current line for this pair exists, read fresh (see _is_above_fresh)."""
+    """Whether a current line for this pair exists, read fresh (see is_above_in_chain_fresh)."""
     found = db.scalar(
         select(ReportingLine.id)
         .where(
@@ -173,11 +174,28 @@ def _current_line_exists(db: Session, manager_id: uuid.UUID, employee_id: uuid.U
     return found is not None
 
 
-def _is_above_fresh(db: Session, user_id: uuid.UUID, person_id: uuid.UUID) -> bool:
+def direct_managers_fresh(db: Session, person_ids: set[uuid.UUID]) -> set[uuid.UUID]:
+    """The people these people report to directly, through current lines, read fresh
+    (FOR SHARE: see is_above_in_chain_fresh). One step of a walk up the chain, for finding
+    who reviews a request one level at a time (app/modules/roles/approval.py)."""
+    if not person_ids:
+        return set()
+    return set(
+        db.scalars(
+            select(ReportingLine.manager_id)
+            .where(ReportingLine.employee_id.in_(person_ids), _current())
+            .with_for_update(read=True)
+        )
+    )
+
+
+def is_above_in_chain_fresh(db: Session, user_id: uuid.UUID, person_id: uuid.UUID) -> bool:
     """Whether the user is above the person, reading the newest committed lines.
 
     The same question as is_above_in_chain(), asked step by step with locking reads, for
-    the checks in add_reporting_line(). Why not just reuse is_above_in_chain(): MySQL's
+    checks made after lock_reporting_lines(): add_reporting_line() here, and the role
+    changes (app/authz/delegation.py), which must see a line committed while they waited.
+    Why not just reuse is_above_in_chain(): MySQL's
     default isolation (REPEATABLE READ) lets an ordinary SELECT see the database as it was
     at the transaction's FIRST read, even after we waited for the lock above. A request
     that had already read something (its permission check does) would then miss a line
@@ -233,7 +251,7 @@ def add_reporting_line(
         raise ReportingLineError("this person already reports to this manager")
     # 3. A loop: the employee is already above the new manager, so the manager would end
     #    up above themselves (A reports to B, who reports, directly or not, to A).
-    if _is_above_fresh(db, employee_id, manager_id):
+    if is_above_in_chain_fresh(db, employee_id, manager_id):
         raise ReportingLineError("this line would make a loop in the reporting chain")
 
     line = ReportingLine(manager_id=manager_id, employee_id=employee_id)
@@ -246,5 +264,31 @@ def add_reporting_line(
         target_type="reporting_line",
         target_id=line.id,
         details={"manager_id": str(manager_id), "employee_id": str(employee_id)},
+    )
+    return line
+
+
+def end_reporting_line(db: Session, actor: Actor, line_id: uuid.UUID) -> ReportingLine:
+    """End a current line (it stays as history, decision 0020); audited. The caller commits.
+
+    Takes the company's lock first, before the audit entry, like add_reporting_line(), and
+    then reads the line fresh and locked: if another request ended it while this one
+    waited, it is refused here instead of being ended twice. Who may end it (someone above
+    both people, with reporting_line.manage) is checked by the caller.
+    """
+    lock_reporting_lines(db)
+    line = db.get(ReportingLine, line_id, populate_existing=True, with_for_update=True)
+    if line is None:
+        raise LookupError("no such reporting line")
+    if line.ended_at is not None:
+        raise ReportingLineError("this reporting line has already ended")
+    line.ended_at = utcnow()
+    record(
+        db,
+        actor=actor,
+        action="reporting_line.ended",
+        target_type="reporting_line",
+        target_id=line.id,
+        details={"manager_id": str(line.manager_id), "employee_id": str(line.employee_id)},
     )
     return line
