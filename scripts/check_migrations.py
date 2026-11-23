@@ -17,10 +17,11 @@
    reporting lines at the same moment cannot add a duplicate or a loop, and two requests
    booking one person at the same moment cannot double-book them, account changes
    take turns with team and department changes, wrong passwords sent together are
-   each counted toward the lockout, and one setup link used twice at the same moment
-   sets a password only once. SQLite has no row locks, so this too can only be tried on
-   MySQL. They run as the application user, so they also show its rights are enough
-   for the app's own writes and locking reads.
+   each counted toward the lockout, one setup link used twice at the same moment
+   sets a password only once, and role changes see what other requests committed while
+   they waited (grants, the actor's own access, the role limit). SQLite has no row
+   locks, so this too can only be tried on MySQL. They run as the application user, so
+   they also show its rights are enough for the app's own writes and locking reads.
 6. The application user's rights (_grant_problems, #43): created by the same first-start
    script Docker Compose uses (docker/mysql/init/01-users.sh) and granted by the
    migrations (app/db/grants.py), it cannot change the structure, cannot change or
@@ -305,6 +306,7 @@ def _race_problems(url: str) -> list[str]:
             + _people_race_problems(engine)
             + _lockout_race_problems(engine)
             + _link_race_problems(engine)
+            + _role_race_problems(engine)
         )
     finally:
         engine.dispose()
@@ -779,6 +781,157 @@ def _org_race_problems(engine: Engine) -> list[str]:
         if sorted(outcomes) != ["created", "refused"]:
             problems.append(f"two departments with one name, round {number + 1}: {outcomes}")
             break  # one failing round is enough to show the problem
+    return problems
+
+
+def _role_race_problems(engine: Engine) -> list[str]:
+    """Role changes made while another request changed the same things; return what failed.
+
+    The role service takes the company's lock and then reads everything it depends on
+    fresh (app/modules/roles/service.py, top of the file). Each check below fixes request
+    2's view first (an ordinary read, as its session and permission checks make), lets
+    request 1 commit a change, and then runs request 2 through the service:
+
+    1. Two edits of one role: request 1 adds a permission, request 2 then sends its own full list.
+       Request 2's result must be exactly its list (worked out from request 1's result),
+       never a mix that neither request asked for.
+    2. An administrator whose role was taken away meanwhile: their change is refused.
+    3. The role limit: a company one role short of it, and one role created meanwhile.
+       Request 2 must be refused, so the company never goes past the limit.
+    """
+    from sqlalchemy import delete, select
+    from sqlalchemy.orm import Session
+
+    from app.audit import Actor
+    from app.auth.models import UserSession
+    from app.authz.check import Forbidden
+    from app.authz.delegation import what_role_grants
+    from app.authz.models import Role, RoleAssignment
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.db.base import utcnow
+    from app.modules.org.models import Company, Department, User
+    from app.modules.org.service import Conflict
+    from app.modules.roles import service
+    from app.modules.roles.schemas import RoleCreate, RoleUpdate
+    from app.tenancy.context import set_company
+
+    problems = []
+    # A company of its own, made by platform code (a session with no company).
+    with Session(engine) as platform:
+        company = Company(name="role race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # A sign-in session whose password was just entered again, for the sensitive changes.
+    # It is never saved: require_reauth() only looks at its reauth_at.
+    reauthed = UserSession(reauth_at=utcnow())
+
+    # An owner and an administrator, and a role to edit.
+    with session() as db:
+        home = Department(name="Office")
+        db.add(home)
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        owner = User(
+            email="owner@role-race.example.com", display_name="owner", department_id=home.id
+        )
+        admin = User(
+            email="admin@role-race.example.com", display_name="admin", department_id=home.id
+        )
+        db.add_all([owner, admin])
+        db.flush()
+        assign_role(db, Actor.system(), user_id=owner.id, role=roles["owner"], scope_type="company")
+        assign_role(
+            db, Actor.system(), user_id=admin.id, role=roles["administrator"], scope_type="company"
+        )
+        db.commit()
+        owner_id, admin_id = owner.id, admin.id
+    with session() as db:
+        acting = db.get(User, owner_id)
+        if acting is None:  # made above, in this company
+            raise RuntimeError("the role race probe's owner is missing")
+        edited = service.create_role(
+            db, acting, RoleCreate(name="Edited", permissions=["schedule.view_self"])
+        )
+        db.commit()
+        edited_id = edited.id
+
+    def person(db: Session, user_id: uuid.UUID) -> User:
+        found = db.get(User, user_id)
+        if found is None:  # made above, in this company
+            raise RuntimeError("a role race probe person is missing")
+        return found
+
+    # 1. Two edits of one role.
+    with session() as request_2:
+        request_2.scalars(select(Role)).all()  # its view is now fixed
+        with session() as request_1:
+            service.update_role(
+                request_1,
+                person(request_1, owner_id),
+                edited_id,
+                RoleUpdate(permissions=["schedule.view_self", "schedule.view"]),
+                session=reauthed,
+            )
+            request_1.commit()
+        wanted = ["schedule.view_self", "user.view"]
+        service.update_role(
+            request_2,
+            person(request_2, owner_id),
+            edited_id,
+            RoleUpdate(permissions=wanted),
+            session=reauthed,
+        )
+        request_2.commit()
+    with session() as db:  # a new request, so it sees both commits
+        saved = db.get(Role, edited_id)
+        result = sorted(what_role_grants(db, saved)) if saved is not None else []
+        if result != sorted(wanted):
+            problems.append(f"two role edits mixed their lists: {result}, wanted {wanted}")
+
+    # 2. An administrator whose role was taken away while their request waited.
+    with session() as request_2:
+        acting = person(request_2, admin_id)
+        request_2.scalars(select(RoleAssignment)).all()  # its view is now fixed
+        with session() as request_1:
+            request_1.execute(delete(RoleAssignment).where(RoleAssignment.user_id == admin_id))
+            request_1.commit()
+        try:
+            service.create_role(request_2, acting, RoleCreate(name="Too late", permissions=[]))
+        except Forbidden:
+            pass  # refused: the role taken away meanwhile was seen
+        else:
+            problems.append("an administrator whose role was taken away could still create roles")
+        request_2.rollback()
+
+    # 3. The role limit: fill the company up to one short of it.
+    with session() as db:
+        count = len(db.scalars(select(Role.id)).all())
+        db.add_all(Role(name=f"Filler {n}") for n in range(service.MAX_ROLES - 1 - count))
+        db.commit()
+    with session() as request_2:
+        request_2.scalars(select(Role)).all()  # its view is now fixed
+        with session() as request_1:
+            service.create_role(
+                request_1, person(request_1, owner_id), RoleCreate(name="Last", permissions=[])
+            )
+            request_1.commit()
+        try:
+            service.create_role(
+                request_2, person(request_2, owner_id), RoleCreate(name="Over", permissions=[])
+            )
+        except Conflict:
+            pass  # refused: the role created meanwhile was counted
+        else:
+            problems.append(f"a company went past {service.MAX_ROLES} roles")
+        request_2.rollback()
     return problems
 
 
