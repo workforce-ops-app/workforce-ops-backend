@@ -369,6 +369,40 @@ def test_a_coworker_sees_only_their_own_answers(people: ShiftSetup) -> None:
     assert [a["offered_by"] for a in card[0]["answers"]] == [cara]
 
 
+def test_a_coworker_never_sees_the_reason(people: ShiftSetup) -> None:
+    """Threat I10, review of #188: the reason for time off may be medical or otherwise
+    personal, and a coworker needs only the days and the shifts to decide whether they can
+    help. Every coworker answer leaves the field out entirely (not sent empty), on the card
+    and on the request page, before and after they answer. The employee and the manager
+    still see it."""
+    shift = shift_for(people, "ana", 5)
+    body = ask_body(5, 6) | {"reason": "hospital appointment"}
+    made = people.browser("ana").post(URL, json=body)
+    assert made.status_code == 201, made.json()
+    request_id = made.json()["id"]
+    cara = people.browser("cara")
+
+    def coworker_answers() -> list[dict]:
+        card = cara.get(f"{URL}/offerable").json()["items"]
+        page = cara.get(f"{URL}/{request_id}")
+        assert page.status_code == 200
+        return [item["request"] for item in card] + [page.json()]
+
+    seen = coworker_answers()
+    assert offer(people, "cara", request_id, shift, "cover").status_code == 200
+    seen += coworker_answers()[1:]  # after answering: the request page (the card too)
+    for answer in seen:
+        assert answer["id"] == request_id
+        assert "reason" not in answer
+        assert answer.get("decisions", []) == [] and answer.get("progress") is None
+        assert "hospital" not in str(answer)
+    # The employee and their manager still see why.
+    for who in ("ana", "chef"):
+        assert people.browser(who).get(f"{URL}/{request_id}").json()["reason"] == (
+            "hospital appointment"
+        )
+
+
 def test_the_offerable_list_has_only_requests_you_could_answer(people: ShiftSetup) -> None:
     request_id, shift = setup_request(people)
     assert people.browser("dana").get(f"{URL}/offerable").json()["items"] == []
