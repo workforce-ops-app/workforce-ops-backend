@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select, update
 
 from app.approvals.models import ApprovalRequest
+from app.approvals.service import lapse
 from app.audit import Actor
 from app.audit.models import AuditEvent
 from app.db.base import utcnow
@@ -191,6 +192,59 @@ def test_an_approved_request_is_cancelled_only_before_its_first_day(people: Shif
 
 
 # --- Not reviewed in time --------------------------------------------------------------
+
+
+def overdue(setup: ShiftSetup, request_id: str) -> None:
+    """Move the request's review deadline into the past, as if its first day had begun."""
+    with setup.db() as db:
+        db.execute(
+            update(ApprovalRequest)
+            .where(ApprovalRequest.id == stored(setup, request_id).approval_request_id)
+            .values(review_by=utcnow() - timedelta(seconds=1))
+        )
+        db.commit()
+
+
+def test_a_status_filter_finds_requests_older_than_the_limit(people: ShiftSetup) -> None:
+    """Review of #166: the status filter ran after the limit, so asking for one status
+    could answer nothing while older requests with it existed."""
+    ana, chef = people.browser("ana"), people.browser("chef")
+    cancelled = ask(ana, 3, 3)
+    lapsed = ask(ana, 5, 5)
+    ask(ana, 7, 7)
+    ask(ana, 9, 9)  # the two newest stay pending
+    assert ana.post(f"{URL}/{cancelled['id']}/cancel").status_code == 200
+    overdue(people, lapsed["id"])  # not stored as denied until someone reads it
+
+    def ids(**params: str) -> list[str]:
+        return [item["id"] for item in chef.get(URL, params=params).json()["items"]]
+
+    assert ids(status="cancelled", limit="1") == [cancelled["id"]]
+    # The overdue one counts as declined although it was still stored as pending.
+    assert ids(status="denied", limit="1") == [lapsed["id"]]
+    assert len(ids(status="pending", limit="1")) == 1
+    assert actions(people, "time_off.not_reviewed") == ["time_off.not_reviewed"]
+
+
+def test_a_request_lapses_only_once_when_noticed_twice(people: ShiftSetup) -> None:
+    """Review of #166: two requests reading the same overdue request at once both lapsed
+    it, writing the audit entry twice. Here the second holds a copy read before the first
+    lapsed it (what a request without a lock sees); it must leave the request alone."""
+    made = ask(people.browser("ana"), 3, 3)
+    overdue(people, made["id"])
+    approval_id = stored(people, made["id"]).approval_request_id
+    with people.db() as second:
+        old_copy = second.get(ApprovalRequest, approval_id)
+        assert old_copy is not None and old_copy.status == "pending"
+        with people.db() as first:
+            fresh = first.get(ApprovalRequest, approval_id)
+            assert fresh is not None and lapse(first, fresh)
+            first.commit()
+        assert not lapse(second, old_copy)  # already lapsed: nothing to do
+        assert old_copy.status == "denied"  # and its copy now says so
+        second.commit()
+    assert actions(people, "approval.not_reviewed") == ["approval.not_reviewed"]
+    assert actions(people, "time_off.not_reviewed") == ["time_off.not_reviewed"]
 
 
 def test_a_request_nobody_reviewed_by_its_first_day_is_declined(people: ShiftSetup) -> None:
