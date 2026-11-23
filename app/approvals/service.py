@@ -11,7 +11,8 @@ change. The request grants nothing while it is pending. Then:
               log says so (decision 0032). This happens the next time anyone reads or
               acts on the request, so no background job is needed: nothing can approve a
               lapsed request, because every decision lapses it first. Its decided_at is
-              the deadline itself; the audit entry is written when it is noticed.
+              the deadline itself; the audit entry is written when it is noticed. Two
+              requests noticing it at once lapse it only once.
 
 What a kind of request does, and who may review it, is up to the feature that owns the
 kind: it registers a Handler (register_handler), as roles do for "role_assignment"
@@ -29,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.approvals.models import KINDS, ApprovalDecision, ApprovalRequest
@@ -159,14 +160,36 @@ def _overdue(request: ApprovalRequest) -> bool:
 
 def lapse(db: Session, request: ApprovalRequest) -> bool:
     """Decline the request as not reviewed if its deadline has passed; audited, as the
-    system. Returns whether it lapsed now. The caller commits."""
+    system. Returns whether it lapsed now. The caller commits.
+
+    Safe when two requests notice the same overdue request at the same moment (two
+    people opening their lists, say): only one of them lapses it, so there is one audit
+    entry and the hook runs once. The caller's copy may be old (read without a lock), so
+    the change is made by one UPDATE that only matches while the request is still
+    pending and overdue. The database runs that against the newest committed row and
+    makes a second UPDATE wait for the first to finish; the second then matches nothing
+    and answers "not now".
+    """
+    # 1. The quick answer from the copy we have: not overdue means nothing to do.
     if not _overdue(request):
         return False
-    request.status = "denied"
-    request.not_reviewed = True
-    # Declined at the deadline, not at the moment someone happened to look: the history
-    # then shows exactly when the request ran out of time.
-    request.decided_at = request.review_by
+    # 2. Claim it: one conditional UPDATE. Declined at the deadline, not at the moment
+    #    someone happened to look, so the history shows exactly when it ran out of time.
+    claimed = db.execute(
+        update(ApprovalRequest)
+        .where(
+            ApprovalRequest.id == request.id,
+            ApprovalRequest.status == "pending",
+            ApprovalRequest.review_by <= utcnow(),
+        )
+        .values(status="denied", not_reviewed=True, decided_at=ApprovalRequest.review_by)
+        .execution_options(synchronize_session=False)
+    )
+    # 3. The copy is read again, so it shows the database's state either way.
+    db.refresh(request)
+    if claimed.rowcount != 1:  # type: ignore[attr-defined]
+        return False  # someone else lapsed or decided it first: nothing more to do
+    # 4. Only the request that claimed it writes the audit entry and runs the hook.
     record(
         db,
         actor=Actor.system(),
