@@ -33,14 +33,21 @@ from app.authz.scope import Scope, covers, person_scope
 from app.modules.org.models import Department, Team, User
 
 
-def what_role_grants(db: Session, role: Role) -> set[str]:
+def what_role_grants(db: Session, role: Role, *, fresh: bool = False) -> set[str]:
     """The permission codes the role grants. The Owner role grants every registered
-    permission, whatever its rows say (authorization.md, starting roles)."""
+    permission, whatever its rows say (authorization.md, starting roles).
+
+    fresh=True reads the rows with a locking read (FOR SHARE), for a change made after the
+    company's lock: an ordinary read could still show the grants from before another
+    change committed while this one waited, and the change would then add or remove the
+    wrong codes (the top of this file).
+    """
     if role.built_in == "owner":
         return set(all_permissions())
-    return set(
-        db.scalars(select(RolePermission.permission_code).where(RolePermission.role_id == role.id))
-    )
+    query = select(RolePermission.permission_code).where(RolePermission.role_id == role.id)
+    if fresh:
+        query = query.with_for_update(read=True)  # FOR SHARE: the newest committed rows
+    return set(db.scalars(query))
 
 
 def holders(db: Session, role_id: uuid.UUID) -> set[uuid.UUID]:
@@ -63,7 +70,9 @@ def above_every_holder(db: Session, user: User, role: Role) -> bool:
     role held by a peer, a superior, or themselves. A role nobody holds can be changed by
     anyone with role.manage: it reaches nobody yet.
     """
-    if is_owner(db, user):
+    # Fresh, like the holders below: an owner removed while this request waited is no
+    # longer an owner.
+    if is_owner(db, user, fresh=True):
         return True
     return all(
         holder != user.id and is_above_in_chain_fresh(db, user.id, holder)
