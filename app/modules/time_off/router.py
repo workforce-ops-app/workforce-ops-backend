@@ -42,6 +42,7 @@ from app.modules.time_off.models import CoverageOffer, TimeOffRequest
 from app.modules.time_off.schemas import (
     AffectedShift,
     ApproveBody,
+    CoworkerDetail,
     Decision,
     DecisionBody,
     Offerable,
@@ -55,6 +56,7 @@ from app.modules.time_off.schemas import (
     TimeOffDetail,
     TimeOffList,
     TimeOffOut,
+    TimeOffSummary,
 )
 
 router = APIRouter(prefix="/api/time-off-requests", tags=["time off"])
@@ -174,12 +176,22 @@ def _detail(db: Database, detail: service.Detail) -> TimeOffDetail:
     )
 
 
-def _detail_for(db: Database, detail: service.Detail) -> TimeOffDetail:
-    """The detail, without who is still to decide when seen by a coworker (I10)."""
+def _for_coworker(answer: TimeOffOut) -> TimeOffSummary:
+    """A request in the coworker's shape: the same fields, without the reason (I10)."""
+    return TimeOffSummary(**answer.model_dump(exclude={"reason"}))
+
+
+def _detail_for(db: Database, detail: service.Detail) -> TimeOffDetail | CoworkerDetail:
+    """The detail as this user may see it. A coworker gets their own shape (threat I10,
+    review of #188): no reason, no reviewers' decisions, and nobody still to decide."""
     answer = _detail(db, detail)
-    if detail.as_coworker:
-        answer.progress = None
-    return answer
+    if not detail.as_coworker:
+        return answer
+    return CoworkerDetail(
+        **answer.model_dump(exclude={"reason", "decisions", "progress"}),
+        decisions=[],  # the service sends none to a coworker; never any here either
+        progress=None,
+    )
 
 
 def _list(db: Database, rows: list[TimeOffRequest]) -> TimeOffList:
@@ -235,7 +247,7 @@ def offerable(current: SignedInPerson, db: Database) -> OfferableList:
     return OfferableList(
         items=[
             Offerable(
-                request=_out(item.request, False, names),
+                request=_for_coworker(_out(item.request, False, names)),
                 shifts=[_shift(s) for s in item.shifts],
                 answers=_offers(db, item.answers),
             )
@@ -245,7 +257,9 @@ def offerable(current: SignedInPerson, db: Database) -> OfferableList:
 
 
 @router.get("/{request_id}")
-def view_request(request_id: uuid.UUID, current: SignedInPerson, db: Database) -> TimeOffDetail:
+def view_request(
+    request_id: uuid.UUID, current: SignedInPerson, db: Database
+) -> TimeOffDetail | CoworkerDetail:
     return _detail_for(db, service.view_request(db, current.user, request_id))
 
 

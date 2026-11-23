@@ -5,7 +5,7 @@
 
 ## In short
 
-An employee asking for time off can tick **Offer Shift Swap / Coverage**. Their coworkers in the department then see the request and, for each of the employee's shifts on those days, may **offer to cover** it, **offer to swap** it for one of their own shifts, **decline**, or just ignore it. The employee sends the request to their managers whenever they like; if they have not by a deadline (by default the day before the time off starts), it goes up by itself as it is. The manager sees the time off with every offer and, for each shift, chooses **none or one** offer and approves, or declines the whole request. Nothing on the schedule changes until the time off is approved, and every chosen offer is checked again at that moment.
+An employee asking for time off can tick **Offer Shift Swap / Coverage**. Their coworkers in the department then see the request and, for each of the employee's shifts on those days, may **offer to cover** it, **offer to swap** it for one of their own shifts, **decline**, or just ignore it. The employee sends the request to their managers whenever they like; if they have not by a deadline (by default midnight at the start of the day before the time off starts), it goes up by itself as it is. The manager sees the time off with every offer and, for each shift, chooses **none or one** offer and approves, or declines the whole request. Nothing on the schedule changes until the time off is approved, and every chosen offer is checked again at that moment.
 
 Without the tick, a time-off request works exactly as before ([time off](time-off.md)).
 
@@ -63,7 +63,7 @@ stateDiagram-v2
 ```
 
 **Asking with offers**
-- Only possible while the send-up deadline is still ahead (409 "It is too late to ask coworkers for these days; send the request without offers."). The deadline is the start of the day that is *minimum* days before the first day, in the employee's workplace zone.
+- Only possible while the send-up deadline is still ahead (409 "It is too late to ask coworkers for these days; send the request without offers."). The deadline is the start of the day that is *minimum* days before the first day, in the employee's workplace zone: **midnight at the beginning of that day, not the end of it**. With the default minimum of 1, time off starting on a Friday stops collecting offers at 00:00 on Thursday, so the last moment to offer is late on Wednesday.
 - A request with no shifts on its days can still be asked with the box ticked; nobody can offer anything, and it goes up as usual.
 - The deadline is noticed the next time anyone reads or acts on the request (no background job, as for lapsing in [time off](time-off.md#backend)); the request then goes up as the system, with `sent_up_at` set to the deadline. If nobody looks before the first day begins, it is declined as not reviewed, as any request is.
 
@@ -75,8 +75,8 @@ stateDiagram-v2
 - One answer per coworker per shift; a new answer replaces the old one. "Ignore" means no answer.
 
 **Who sees what** (threat I10)
-- A coworker sees the request (the employee, the days, the reason, the affected shifts) and **only their own answers**, never the others'.
-- The employee and the managers see **every offer**, by name: anyone whose `time_off.view` covers the employee, and the request's reviewer (while collecting a request has no reviewer yet, so "the reviewers" means the people who will review it).
+- A coworker sees only what they need to decide whether they can cover or swap: the employee, the days, the affected shifts, and **only their own answers**, never the others'. **Never the reason** for the time off (it may be medical or otherwise personal; review of #188): the field is left out of every coworker answer (the offerable list and `GET /{id}` seen as a coworker), not sent empty for the screen to hide.
+- The employee and the managers see the reason and **every offer**, by name: anyone whose `time_off.view` covers the employee, and the request's reviewer (while collecting a request has no reviewer yet, so "the reviewers" means the people who will review it).
 - A coworker may see a request they could work a shift of while it is collecting, and afterwards any request they answered. They never see the reviewers' decisions or who is still to decide.
 - On the offer endpoints, someone who could not work any of its shifts (and never answered) gets 404. On `GET /{id}`, anyone else in the company gets 403, as for any time-off request; everyone in another company gets 404. (Built in CV1: the design first said 404 for all of them; 403 keeps `GET /{id}` the same as for every other request.)
 
