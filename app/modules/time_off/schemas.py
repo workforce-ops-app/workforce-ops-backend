@@ -47,8 +47,11 @@ class Progress(BaseModel):
     waiting_for: list[Person]  # reviewers who have not decided yet, by name
 
 
-class TimeOffOut(BaseModel):
-    """A request as its employee and its reviewers see it."""
+class TimeOffSummary(BaseModel):
+    """A request as a coworker asked to cover or swap sees it (coverage.md, threat I10):
+    everything they need to decide whether they can take a shift, and no reason. The
+    reason may be medical or otherwise personal, so it is not part of this shape at all
+    (review of #188): a coworker's answer has no reason field, not an empty one."""
 
     id: uuid.UUID
     employee_id: uuid.UUID
@@ -57,7 +60,6 @@ class TimeOffOut(BaseModel):
     employee_name: str
     first_day: date
     last_day: date
-    reason: str | None
     status: str  # collecting, pending, escalated, approved, denied, cancelled
     not_reviewed: bool  # denied because nobody reviewed it before its first day
     created_at: datetime
@@ -70,6 +72,12 @@ class TimeOffOut(BaseModel):
     # still has to, so a request one manager already denied does not read as untouched.
     # None once it is settled. The employee already sees these decisions on the request.
     progress: Progress | None = None
+
+
+class TimeOffOut(TimeOffSummary):
+    """A request as its employee and its reviewers see it: with the reason."""
+
+    reason: str | None
 
 
 class AffectedShift(BaseModel):
@@ -113,6 +121,16 @@ class TimeOffDetail(TimeOffOut):
     offers: list[OfferOut] = []
 
 
+class CoworkerDetail(TimeOffSummary):
+    """One request as a coworker asked to cover or swap sees it: the shifts it affects and
+    only their own answers. No reason, and no progress (threat I10). decisions is always
+    empty: it is kept so the shape matches TimeOffDetail apart from the reason."""
+
+    affected_shifts: list[AffectedShift]
+    decisions: list[Decision] = []
+    offers: list[OfferOut] = []
+
+
 class OfferBody(Strict):
     """A coworker's answer for one shift. A swap names the shift given; nothing else does."""
 
@@ -129,7 +147,7 @@ class OfferBody(Strict):
 class Offerable(BaseModel):
     """A coworker's card: a collecting request, the shifts they could take, their answers."""
 
-    request: TimeOffOut
+    request: TimeOffSummary  # no reason: coworkers never see it
     shifts: list[AffectedShift]
     answers: list[OfferOut]
 
