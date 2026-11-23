@@ -27,6 +27,15 @@ with or without one.
 
 Permissions are read from the database on every call, so a role change takes effect at
 once (no stale copy in the session).
+
+Fresh reads: grants(), effective_permissions(), is_owner(), and authorize() take
+`fresh=True` for checks made after a lock (for example the company's lock in
+chain.lock_reporting_lines). Under MySQL's default isolation (REPEATABLE READ) an ordinary
+SELECT sees the database as it was at the transaction's first read, so a request that
+waited for the lock could still act on permissions taken away meanwhile. With fresh=True
+the person's row and their role rows are read with locking reads (FOR SHARE), which always
+see the newest committed rows (chain.is_above_in_chain_fresh explains the same problem for
+reporting lines).
 """
 
 import uuid
@@ -34,6 +43,7 @@ import uuid
 from fastapi import HTTPException
 from sqlalchemy import ColumnElement, and_, false, or_, select, true
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.selectable import GenerativeSelect
 
 from app.authz.chain import is_above_in_chain, people_below
 from app.authz.models import Role, RoleAssignment, RolePermission
@@ -56,6 +66,26 @@ class NotFound(HTTPException):
         super().__init__(status_code=404, detail="Not found.")
 
 
+def _maybe_fresh[Q: GenerativeSelect](query: Q, fresh: bool) -> Q:
+    """The query as a locking read (FOR SHARE) when fresh is asked for, otherwise unchanged.
+
+    FOR SHARE reads the newest committed rows and keeps them from changing until this
+    transaction ends, so a check made after a lock cannot act on an old copy (top of this
+    file). SQLite, which the tests use, has no row locks and leaves the clause out.
+    """
+    return query.with_for_update(read=True) if fresh else query
+
+
+def _deactivated(db: Session, user: User, fresh: bool) -> bool:
+    """Whether the user is deactivated; with fresh=True their row is read again first
+    (FOR SHARE), so a deactivation committed while this request waited is seen."""
+    if fresh:
+        # populate_existing replaces the copy this session already holds with the new read.
+        current = db.get(User, user.id, with_for_update={"read": True}, populate_existing=True)
+        return current is None or current.deactivated_at is not None
+    return user.deactivated_at is not None
+
+
 def _active_assignments(user: User) -> list[ColumnElement[bool]]:
     """The conditions for the user's assignments that can grant anything right now.
 
@@ -76,9 +106,10 @@ def _active_assignments(user: User) -> list[ColumnElement[bool]]:
     ]
 
 
-def grants(db: Session, user: User, code: str) -> list[Grant]:
-    """The user's active assignments whose role grants this permission: where each applies."""
-    if user.deactivated_at is not None:
+def grants(db: Session, user: User, code: str, *, fresh: bool = False) -> list[Grant]:
+    """The user's active assignments whose role grants this permission: where each applies.
+    fresh=True reads them with locking reads (top of this file)."""
+    if _deactivated(db, user, fresh):
         return []
     # The Owner holds every permission, including ones a module adds after the company's
     # roles were created (the Owner role is locked, so its rows are never edited to catch
@@ -86,11 +117,11 @@ def grants(db: Session, user: User, code: str) -> list[Grant]:
     # everywhere. This is checked first, not only when nothing else was found: another of
     # the owner's roles may grant the same code for one department, team, or person, and
     # that narrower grant must not take the place of the company-wide one.
-    if is_owner(db, user):
+    if is_owner(db, user, fresh=fresh):
         return [Grant("company", None, None, None)]
     # Every joined model has a column in the select list, so the company filter sees it and
     # limits it to the session's company too (tenancy.md: joins).
-    rows = db.execute(
+    query = (
         select(
             RoleAssignment.scope_type,
             RoleAssignment.department_id,
@@ -108,16 +139,18 @@ def grants(db: Session, user: User, code: str) -> list[Grant]:
         .outerjoin(Team, Team.id == RoleAssignment.team_id)
         .where(*_active_assignments(user), RolePermission.permission_code == code)
     )
+    rows = db.execute(_maybe_fresh(query, fresh))
     return [Grant(*row[:4]) for row in rows]
 
 
-def effective_permissions(db: Session, user: User) -> list[str]:
-    """Every permission the user holds somewhere, sorted (for the interface's menu)."""
-    if user.deactivated_at is not None:
+def effective_permissions(db: Session, user: User, *, fresh: bool = False) -> list[str]:
+    """Every permission the user holds somewhere, sorted (for the interface's menu).
+    fresh=True reads them with locking reads (top of this file)."""
+    if _deactivated(db, user, fresh):
         return []
-    if is_owner(db, user):
+    if is_owner(db, user, fresh=fresh):
         return sorted(all_permissions())  # the Owner holds every permission
-    rows = db.execute(
+    query = (
         select(RolePermission.permission_code, Role.id, RoleAssignment.id, Department.id, Team.id)
         .join(Role, Role.id == RolePermission.role_id)
         .join(RoleAssignment, RoleAssignment.role_id == Role.id)
@@ -125,16 +158,18 @@ def effective_permissions(db: Session, user: User) -> list[str]:
         .outerjoin(Team, Team.id == RoleAssignment.team_id)
         .where(*_active_assignments(user))
     )
+    rows = db.execute(_maybe_fresh(query, fresh))
     return sorted({row[0] for row in rows})
 
 
-def is_owner(db: Session, user: User) -> bool:
-    """Whether the user holds the (active) Owner role for the whole company."""
-    if user.deactivated_at is not None:
+def is_owner(db: Session, user: User, *, fresh: bool = False) -> bool:
+    """Whether the user holds the (active) Owner role for the whole company.
+    fresh=True reads it with a locking read (top of this file)."""
+    if _deactivated(db, user, fresh):
         return False
     # A company-wide assignment has no department or team, but the conditions in
     # _active_assignments name their columns, so the joins are always there.
-    found = db.scalar(
+    query = (
         select(RoleAssignment.id, Role.id, Department.id, Team.id)
         .join(Role, Role.id == RoleAssignment.role_id)
         .outerjoin(Department, Department.id == RoleAssignment.department_id)
@@ -146,6 +181,7 @@ def is_owner(db: Session, user: User) -> bool:
         )
         .limit(1)
     )
+    found = db.scalar(_maybe_fresh(query, fresh))
     return found is not None
 
 
@@ -184,8 +220,16 @@ def _owner_of(db: Session, target: object) -> uuid.UUID | None:
     return resolve(db, target).employee_id
 
 
-def authorize(db: Session, user: User, code: str, target: object | None = None) -> None:
-    """Allow, or raise Forbidden (403) or NotFound (404). See the top of this file."""
+def authorize(
+    db: Session, user: User, code: str, target: object | None = None, *, fresh: bool = False
+) -> None:
+    """Allow, or raise Forbidden (403) or NotFound (404). See the top of this file.
+
+    fresh=True is for a second check after a lock: the grants are read with locking reads,
+    so permissions taken away while the request waited are seen (top of this file). It
+    covers the grants; person checks also ask is_above(), which reads the chain normally,
+    so callers that need a fresh chain use chain.is_above_in_chain_fresh themselves.
+    """
     permission = get_permission(code)  # an unknown code is a bug: LookupError
 
     # 1. Another company's target does not exist for this user.
@@ -193,7 +237,7 @@ def authorize(db: Session, user: User, code: str, target: object | None = None) 
         raise NotFound()
 
     # 2 and 3. The assignments that grant it (none for deactivated people or archived roles).
-    found = grants(db, user, code)
+    found = grants(db, user, code, fresh=fresh)
     if not found:
         raise Forbidden()
 
