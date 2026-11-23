@@ -34,7 +34,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from sqlalchemy import select
+from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
 
 from app.approvals.models import ApprovalDecision, ApprovalRequest
@@ -189,13 +189,46 @@ def list_requests(
         query = query.where(TimeOffRequest.last_day >= first)
     if last is not None:
         query = query.where(TimeOffRequest.first_day <= last)
-    rows = list(
+    # 1. Lapse the overdue requests among these first (every one, not only the newest), so
+    #    their stored status is "denied" before the status filter below looks at it.
+    _lapse_overdue(db, query)
+    # 2. Then filter by status in the database, BEFORE the limit: limiting first and
+    #    filtering after could answer an empty list (the newest rows all another status)
+    #    while older requests with this status exist.
+    if status is not None:
+        query = query.where(TimeOffRequest.status == status)
+    return list(
         db.scalars(
             query.order_by(TimeOffRequest.created_at.desc(), TimeOffRequest.id.desc()).limit(limit)
         )
     )
-    refresh(db, rows)
-    return [row for row in rows if status is None or row.status == status]
+
+
+def _lapse_overdue(db: Session, query: Select[TimeOffRequest]) -> None:
+    """Lapse every request the query matches that is still open past its deadline.
+
+    The open approval records past their deadline are looked up first, by ID (the company
+    filter limits them to this company), and then the query's open requests among them.
+    Usually there are none, or a few: each request lapses only once.
+    """
+    overdue = list(
+        db.scalars(
+            select(ApprovalRequest.id).where(
+                ApprovalRequest.kind == "time_off",
+                ApprovalRequest.status == "pending",
+                ApprovalRequest.review_by <= utcnow(),
+            )
+        )
+    )
+    if not overdue:
+        return
+    rows = db.scalars(
+        query.where(
+            TimeOffRequest.status.in_(("pending", "escalated")),
+            TimeOffRequest.approval_request_id.in_(overdue),
+        )
+    )
+    refresh(db, list(rows))
 
 
 @dataclass
