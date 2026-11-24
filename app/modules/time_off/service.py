@@ -78,6 +78,11 @@ def refresh(db: Session, rows: list[TimeOffRequest]) -> None:
             approval = db.get(ApprovalRequest, row.approval_request_id)
             if approval is not None and lapse(db, approval):
                 changed = True
+            elif approval is not None and approval.status != "pending":
+                # Another request lapsed it first and its hook declined this row. Read the
+                # row again with a locking read, as lapse() does for the approval: an
+                # ordinary read would answer from this transaction's old snapshot.
+                db.refresh(row, with_for_update={"read": True})
     if changed:
         db.commit()
 
