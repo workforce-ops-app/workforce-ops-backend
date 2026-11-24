@@ -17,18 +17,25 @@
    reporting lines at the same moment cannot add a duplicate or a loop, and two requests
    booking one person at the same moment cannot double-book them, account changes
    take turns with team and department changes, wrong passwords sent together are
-   each counted toward the lockout, and one setup link used twice at the same moment
-   sets a password only once. SQLite has no row locks, so this too can only be tried on
-   MySQL. They run as the application user, so they also show its rights are enough
+   each counted toward the lockout, one setup link used twice at the same moment
+   sets a password only once, and role changes see what other requests committed while
+   they waited (grants, the actor's own access, the role limit), and so do giving and
+   removing roles (the giver's access, the role's grants and state, the person's place,
+   the same-level rule), and an overdue request noticed by two requests lapses once,
+   with both seeing it declined. SQLite has no row locks, so this too can only be tried
+   on MySQL. They run as the application user, so they also show its rights are enough
    for the app's own writes and locking reads.
-6. The application user's rights (_grant_problems, #43): created by the same first-start
+6. A company that existed before a migration still works after it
+   (_existing_company_problems): its starting roles get the permissions a migration adds
+   (announcement.create in 0014).
+7. The application user's rights (_grant_problems, #43): created by the same first-start
    script Docker Compose uses (docker/mysql/init/01-users.sh) and granted by the
    migrations (app/db/grants.py), it cannot change the structure, cannot change or
    remove audit entries, and can read every table the app uses.
 
 The database is a throwaway Docker container (removed afterwards), unless
 MIGRATION_CHECK_DATABASE_URL points at an empty database to use instead. That one URL
-is then used for everything, and step 6 is skipped: it needs the two users.
+is then used for everything, and step 7 is skipped: it needs the two users.
 """
 
 from __future__ import annotations
@@ -362,6 +369,9 @@ def _race_problems(url: str) -> list[str]:
             + _link_race_problems(engine)
             + _sign_up_race_problems(engine)
             + _read_mark_race_problems(engine)
+            + _role_race_problems(engine)
+            + _lapse_race_problems(engine)
+            + _assignment_race_problems(engine)
         )
     finally:
         engine.dispose()
@@ -922,6 +932,516 @@ def _org_race_problems(engine: Engine) -> list[str]:
     return problems
 
 
+def _role_race_problems(engine: Engine) -> list[str]:
+    """Role changes made while another request changed the same things; return what failed.
+
+    The role service takes the company's lock and then reads everything it depends on
+    fresh (app/modules/roles/service.py, top of the file). Each check below fixes request
+    2's view first (an ordinary read, as its session and permission checks make), lets
+    request 1 commit a change, and then runs request 2 through the service:
+
+    1. Two edits of one role: request 1 adds a permission, request 2 then sends its own full list.
+       Request 2's result must be exactly its list (worked out from request 1's result),
+       never a mix that neither request asked for.
+    2. An administrator whose role was taken away meanwhile: their change is refused.
+    3. The role limit: a company one role short of it, and one role created meanwhile.
+       Request 2 must be refused, so the company never goes past the limit.
+    """
+    from sqlalchemy import delete, select
+    from sqlalchemy.orm import Session
+
+    from app.audit import Actor
+    from app.auth.models import UserSession
+    from app.authz.check import Forbidden
+    from app.authz.delegation import what_role_grants
+    from app.authz.models import Role, RoleAssignment
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.db.base import utcnow
+    from app.modules.org.models import Company, Department, User
+    from app.modules.org.service import Conflict
+    from app.modules.roles import service
+    from app.modules.roles.schemas import RoleCreate, RoleUpdate
+    from app.tenancy.context import set_company
+
+    problems = []
+    # A company of its own, made by platform code (a session with no company).
+    with Session(engine) as platform:
+        company = Company(name="role race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # A sign-in session whose password was just entered again, for the sensitive changes.
+    # It is never saved: require_reauth() only looks at its reauth_at.
+    reauthed = UserSession(reauth_at=utcnow())
+
+    # An owner and an administrator, and a role to edit.
+    with session() as db:
+        home = Department(name="Office")
+        db.add(home)
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        owner = User(
+            email="owner@role-race.example.com", display_name="owner", department_id=home.id
+        )
+        admin = User(
+            email="admin@role-race.example.com", display_name="admin", department_id=home.id
+        )
+        db.add_all([owner, admin])
+        db.flush()
+        assign_role(db, Actor.system(), user_id=owner.id, role=roles["owner"], scope_type="company")
+        assign_role(
+            db, Actor.system(), user_id=admin.id, role=roles["administrator"], scope_type="company"
+        )
+        db.commit()
+        owner_id, admin_id = owner.id, admin.id
+    with session() as db:
+        acting = db.get(User, owner_id)
+        if acting is None:  # made above, in this company
+            raise RuntimeError("the role race probe's owner is missing")
+        edited = service.create_role(
+            db, acting, RoleCreate(name="Edited", permissions=["schedule.view_self"])
+        )
+        db.commit()
+        edited_id = edited.id
+
+    def person(db: Session, user_id: uuid.UUID) -> User:
+        found = db.get(User, user_id)
+        if found is None:  # made above, in this company
+            raise RuntimeError("a role race probe person is missing")
+        return found
+
+    # 1. Two edits of one role.
+    with session() as request_2:
+        request_2.scalars(select(Role)).all()  # its view is now fixed
+        with session() as request_1:
+            service.update_role(
+                request_1,
+                person(request_1, owner_id),
+                edited_id,
+                RoleUpdate(permissions=["schedule.view_self", "schedule.view"]),
+                session=reauthed,
+            )
+            request_1.commit()
+        wanted = ["schedule.view_self", "user.view"]
+        service.update_role(
+            request_2,
+            person(request_2, owner_id),
+            edited_id,
+            RoleUpdate(permissions=wanted),
+            session=reauthed,
+        )
+        request_2.commit()
+    with session() as db:  # a new request, so it sees both commits
+        saved = db.get(Role, edited_id)
+        result = sorted(what_role_grants(db, saved)) if saved is not None else []
+        if result != sorted(wanted):
+            problems.append(f"two role edits mixed their lists: {result}, wanted {wanted}")
+
+    # 2. An administrator whose role was taken away while their request waited.
+    with session() as request_2:
+        acting = person(request_2, admin_id)
+        request_2.scalars(select(RoleAssignment)).all()  # its view is now fixed
+        with session() as request_1:
+            request_1.execute(delete(RoleAssignment).where(RoleAssignment.user_id == admin_id))
+            request_1.commit()
+        try:
+            service.create_role(request_2, acting, RoleCreate(name="Too late", permissions=[]))
+        except Forbidden:
+            pass  # refused: the role taken away meanwhile was seen
+        else:
+            problems.append("an administrator whose role was taken away could still create roles")
+        request_2.rollback()
+
+    # 3. The role limit: fill the company up to one short of it.
+    with session() as db:
+        count = len(db.scalars(select(Role.id)).all())
+        db.add_all(Role(name=f"Filler {n}") for n in range(service.MAX_ROLES - 1 - count))
+        db.commit()
+    with session() as request_2:
+        request_2.scalars(select(Role)).all()  # its view is now fixed
+        with session() as request_1:
+            service.create_role(
+                request_1, person(request_1, owner_id), RoleCreate(name="Last", permissions=[])
+            )
+            request_1.commit()
+        try:
+            service.create_role(
+                request_2, person(request_2, owner_id), RoleCreate(name="Over", permissions=[])
+            )
+        except Conflict:
+            pass  # refused: the role created meanwhile was counted
+        else:
+            problems.append(f"a company went past {service.MAX_ROLES} roles")
+        request_2.rollback()
+    return problems
+
+
+def _lapse_race_problems(engine: Engine) -> list[str]:
+    """Two requests noticing one overdue request at once; return what failed (review of #166).
+
+    lapse() (app/approvals/service.py) claims the request with one conditional UPDATE, so
+    only one request lapses it. The one that loses then reads the request again, and
+    under MySQL's REPEATABLE READ an ordinary read there answers from its old snapshot:
+    it would still see "pending" after the winner committed the denial. So request 2
+    fixes its view first (an ordinary read, as a list page makes), request 1 lapses the
+    request and commits, and then request 2 runs lapse() and time off's refresh():
+
+    1. Request 2 must not lapse it again (one audit entry, from request 1).
+    2. Request 2's copies must show what was committed: the approval declined as not
+       reviewed, and the time-off request declined.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import func, select, update
+    from sqlalchemy.orm import Session
+
+    import app.modules.time_off.approval  # noqa: F401  (registers the "time_off" handler)
+    from app.approvals.models import ApprovalRequest
+    from app.approvals.service import lapse, open_request
+    from app.audit.models import AuditEvent
+    from app.db.base import utcnow
+    from app.modules.org.models import Company, Department, User
+    from app.modules.time_off.models import TimeOffRequest
+    from app.modules.time_off.service import refresh
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    with Session(engine) as platform:
+        company = Company(name="lapse race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # One person asking for tomorrow off, as time off's ask() records it.
+    with session() as db:
+        home = Department(name="Office")
+        db.add(home)
+        db.flush()
+        asker = User(
+            email="asker@lapse-race.example.com", display_name="asker", department_id=home.id
+        )
+        db.add(asker)
+        db.flush()
+        tomorrow = (utcnow() + timedelta(days=1)).date()
+        approval = open_request(
+            db,
+            kind="time_off",
+            requested_by=asker.id,
+            subject_user_id=asker.id,
+            payload={},
+            details={},
+            review_by=utcnow() + timedelta(days=1),
+        )
+        row = TimeOffRequest(
+            employee_id=asker.id,
+            first_day=tomorrow,
+            last_day=tomorrow,
+            status="pending",
+            approval_request_id=approval.id,
+        )
+        db.add(row)
+        db.flush()
+        approval.payload = {"time_off_request_id": str(row.id)}
+        db.commit()
+        approval_id, row_id = approval.id, row.id
+    # Its deadline passes, as if its first day had begun undecided.
+    with session() as db:
+        db.execute(
+            update(ApprovalRequest)
+            .where(ApprovalRequest.id == approval_id)
+            .values(review_by=utcnow() - timedelta(seconds=1))
+        )
+        db.commit()
+
+    with session() as request_2:
+        copy = request_2.get(ApprovalRequest, approval_id)
+        old_row = request_2.get(TimeOffRequest, row_id)  # its view is now fixed
+        if copy is None or old_row is None:  # made above, in this company
+            raise RuntimeError("the lapse race probe's request is missing")
+        with session() as request_1:
+            first = request_1.get(ApprovalRequest, approval_id)
+            if first is None or not lapse(request_1, first):
+                problems.append("an overdue request did not lapse")
+            request_1.commit()
+        if lapse(request_2, copy):
+            problems.append("an overdue request lapsed twice")
+        if copy.status != "denied" or not copy.not_reviewed:
+            problems.append(
+                f"the request that lost the lapse race saw the approval as {copy.status!r}"
+            )
+        refresh(request_2, [old_row])
+        if old_row.status != "denied":
+            problems.append(
+                f"the request that lost the lapse race saw the time off as {old_row.status!r}"
+            )
+        request_2.rollback()
+    with session() as db:
+        entries = db.scalar(
+            select(func.count()).where(
+                AuditEvent.chain_id == company_id,
+                AuditEvent.action == "approval.not_reviewed",
+                AuditEvent.target_id == approval_id,
+            )
+        )
+        if entries != 1:
+            problems.append(f"an overdue request has {entries} not-reviewed audit entries")
+    return problems
+
+
+def _assignment_race_problems(engine: Engine) -> list[str]:
+    """Giving and removing roles while another request changed what the checks depend on;
+    return what failed (review of #162).
+
+    give() and remove() take the company's lock and then make every check again on fresh
+    reads (app/modules/roles/assignments.py, top of the file). Each check below fixes
+    request 2's view first (an ordinary read, as its session and permission checks make),
+    lets request 1 commit a change, and then runs request 2 through the service. Request
+    2's quick checks before the lock still see the old view, so only the checks after
+    the lock can catch the change:
+
+    1. A role edited meanwhile to grant a permission the giver lacks: refused (AZ3).
+    2. A giver who lost permissions meanwhile, so the role is now at their own level: the
+       role is not given straight away; an approval request is opened instead (AZ14).
+    3. A person moved meanwhile to a department the giver does not cover: refused.
+    4. A role archived meanwhile: refused.
+    5. The giver's role.assign taken away meanwhile: giving and removing are refused.
+
+    Check 3 moves "mover" out of the giver's reach for good, so the later checks give to
+    "worker", with roles nobody gave them yet (so no other refusal can stand in).
+
+    Request 2 always rolls back, so a check that wrongly passes leaves nothing behind.
+    """
+    from sqlalchemy import delete, select, update
+    from sqlalchemy.orm import Session
+
+    from app.audit import Actor
+    from app.auth.models import UserSession
+    from app.authz.chain import add_reporting_line
+    from app.authz.check import Forbidden
+    from app.authz.models import Role, RoleAssignment
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.db.base import utcnow
+    from app.modules.org.models import Company, Department, User
+    from app.modules.org.service import Conflict
+    from app.modules.roles import assignments, service
+    from app.modules.roles.schemas import AssignmentCreate, RoleCreate, RoleUpdate
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    # A company of its own, made by platform code (a session with no company).
+    with Session(engine) as platform:
+        company = Company(name="assignment race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # A sign-in session whose password was just entered again (role.assign is admin
+    # level). It is never saved: require_reauth() only looks at its reauth_at.
+    reauthed = UserSession(reauth_at=utcnow())
+
+    # The owner; a giver who manages the Office department with a role of its own; and two
+    # people in Office who report to the giver.
+    with session() as db:
+        office, elsewhere = Department(name="Office"), Department(name="Elsewhere")
+        db.add_all([office, elsewhere])
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        people = {
+            name: User(
+                email=f"{name}@assignment-race.example.com",
+                display_name=name,
+                department_id=office.id,
+            )
+            for name in ("owner", "giver", "worker", "mover")
+        }
+        db.add_all(people.values())
+        db.flush()
+        assign_role(
+            db,
+            Actor.system(),
+            user_id=people["owner"].id,
+            role=roles["owner"],
+            scope_type="company",
+        )
+        for report in ("worker", "mover"):
+            add_reporting_line(
+                db, Actor.system(), manager_id=people["giver"].id, employee_id=people[report].id
+            )
+        db.commit()
+        ids = {name: person.id for name, person in people.items()}
+        office_id, elsewhere_id = office.id, elsewhere.id
+
+    def person(db: Session, name: str) -> User:
+        found = db.get(User, ids[name])
+        if found is None:  # made above, in this company
+            raise RuntimeError("an assignment race probe person is missing")
+        return found
+
+    # The roles, made by the owner: the giver's own, and one to give for each check.
+    with session() as db:
+        owner = person(db, "owner")
+
+        def role(name: str, codes: list[str]) -> uuid.UUID:
+            return service.create_role(db, owner, RoleCreate(name=name, permissions=codes)).id
+
+        giver_role = role("Giver", ["role.assign", "schedule.view_self", "schedule.view"])
+        edited = role("Edited", ["schedule.view_self"])
+        level = role("Level", ["role.assign", "schedule.view_self"])
+        small = role("Small", ["schedule.view_self"])
+        archived = role("Archived", ["schedule.view_self"])
+        last = role("Last", ["schedule.view_self"])
+        db.commit()
+    with session() as db:
+        for role_id, holder in ((giver_role, "giver"), (small, "worker")):
+            found = db.get(Role, role_id)
+            if found is None:  # made above
+                raise RuntimeError("an assignment race probe role is missing")
+            assign_role(
+                db,
+                Actor.system(),
+                user_id=ids[holder],
+                role=found,
+                scope_type="department",
+                scope_id=office_id,
+            )
+        db.commit()
+        held = db.scalars(
+            select(RoleAssignment.id).where(RoleAssignment.user_id == ids["worker"])
+        ).one()
+
+    def give(db: Session, name: str, role_id: uuid.UUID) -> assignments.Given:
+        """Request 2 gives the role for Office, as the giver."""
+        body = AssignmentCreate(
+            user_id=ids[name], role_id=role_id, scope_type="department", scope_id=office_id
+        )
+        return assignments.give(db, person(db, "giver"), body, session=reauthed)
+
+    def owner_changes(change: Callable[[Session, User], object]) -> None:
+        """Request 1: the owner makes a change and commits."""
+        with session() as request_1:
+            change(request_1, person(request_1, "owner"))
+            request_1.commit()
+
+    # 1. A role edited to grant a permission the giver lacks (schedule.edit).
+    with session() as request_2:
+        request_2.scalars(select(Role)).all()  # its view is now fixed
+        owner_changes(
+            lambda db, owner: service.update_role(
+                db,
+                owner,
+                edited,
+                RoleUpdate(permissions=["schedule.view_self", "schedule.edit"]),
+                session=reauthed,
+            )
+        )
+        try:
+            give(request_2, "worker", edited)
+        except Forbidden:
+            pass  # refused: what the role grants now was seen
+        else:
+            problems.append("a role edited to grant more than the giver holds was still given")
+        request_2.rollback()
+
+    # 2. The giver loses schedule.view, so "Level" now holds everything they hold there.
+    with session() as request_2:
+        request_2.scalars(select(Role)).all()  # its view is now fixed
+        owner_changes(
+            lambda db, owner: service.update_role(
+                db,
+                owner,
+                giver_role,
+                RoleUpdate(permissions=["role.assign", "schedule.view_self"]),
+                session=reauthed,
+            )
+        )
+        try:
+            given = give(request_2, "worker", level)
+        except (Forbidden, Conflict) as error:
+            problems.append(f"a same-level role was refused instead of waiting: {error!r}")
+        else:
+            if given.assignment is not None or given.request is None:
+                problems.append("a role at the giver's own level was given without approval")
+        request_2.rollback()
+
+    # 3. A person moved to a department the giver does not cover.
+    with session() as request_2:
+        request_2.scalars(select(Role)).all()  # its view is now fixed
+        person(request_2, "mover")
+        owner_changes(
+            lambda db, _: db.execute(
+                update(User).where(User.id == ids["mover"]).values(department_id=elsewhere_id)
+            )
+        )
+        try:
+            give(request_2, "mover", small)
+        except Forbidden:
+            pass  # refused: the person's current department was seen
+        else:
+            problems.append("a role was given to someone who had moved out of the giver's reach")
+        request_2.rollback()
+
+    # 4. A role archived.
+    with session() as request_2:
+        request_2.scalars(select(Role)).all()  # its view is now fixed
+        owner_changes(
+            lambda db, _: db.execute(
+                update(Role).where(Role.id == archived).values(archived_at=utcnow())
+            )
+        )
+        try:
+            give(request_2, "worker", archived)
+        except Conflict:
+            pass  # refused: the archive was seen
+        else:
+            problems.append("an archived role was still given")
+        request_2.rollback()
+
+    # 5. The giver's role.assign taken away (their only role), while a give and a remove
+    #    both waited.
+    with session() as giving, session() as removing:
+        giving.scalars(select(Role)).all()  # both views are now fixed
+        removing.scalars(select(Role)).all()
+        owner_changes(
+            lambda db, _: db.execute(
+                delete(RoleAssignment).where(RoleAssignment.user_id == ids["giver"])
+            )
+        )
+        try:
+            give(giving, "worker", last)
+        except Forbidden:
+            pass  # refused: the giver's current grants were seen
+        else:
+            problems.append("a giver whose role.assign was taken away could still give roles")
+        giving.rollback()
+        try:
+            assignments.remove(removing, person(removing, "giver"), held, session=reauthed)
+        except Forbidden:
+            pass
+        else:
+            problems.append("a giver whose role.assign was taken away could still remove roles")
+        removing.rollback()
+    return problems
+
+
 def _lockout_race_problems(engine: Engine) -> list[str]:
     """Wrong passwords for one account sent at the same moment; return what failed.
 
@@ -1474,6 +1994,115 @@ def _grant_problems(app_url: str) -> list[str]:
     return problems
 
 
+def _existing_company_problems(url: str, config: Config) -> list[str]:
+    """A company made before announcements can post after the upgrade; return what failed.
+
+    Migration 0014 gives announcement.create to the Owner, Administrator, and Manager
+    starting roles of companies that already exist (review of #157). This starts from the
+    database as it was just before 0014, adds a company there with its four starting roles
+    and one role of its own (plain SQL, as the app of that time had no announcements),
+    upgrades to the newest migration, and checks:
+    1. exactly those three starting roles now grant it; Employee and the company's own
+       role do not;
+    2. a manager of that company now holds it, through the app's own permission check.
+    main() has upgraded to 0013 before calling this; this upgrades the rest of the way.
+    """
+    import uuid
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    from app.audit import Actor
+    from app.authz.check import effective_permissions
+    from app.authz.models import Role
+    from app.authz.roles import assign_role
+    from app.core.config import get_settings
+    from app.modules.org.models import Department, User
+    from app.tenancy.context import set_company
+
+    # Giving the manager a role below writes a signed audit entry (as in _race_problems).
+    os.environ.setdefault("AUDIT_SIGNING_KEY", secrets.token_urlsafe(32))
+    get_settings.cache_clear()
+
+    company_id = uuid.uuid4()
+    now = datetime.now(UTC).replace(tzinfo=None)
+    engine = create_engine(url)
+    try:
+        # 1. The company as it was made before 0014: four starting roles and one of its own.
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO companies (id, name, timezone, created_at, updated_at) "
+                    "VALUES (:id, 'existing company probe', 'UTC', :now, :now)"
+                ),
+                {"id": company_id.bytes, "now": now},
+            )
+            for built_in, name in (
+                ("owner", "Owner"),
+                ("administrator", "Administrator"),
+                ("manager", "Manager"),
+                ("employee", "Employee"),
+                (None, "Front desk"),
+            ):
+                connection.execute(
+                    text(
+                        "INSERT INTO roles (id, company_id, name, built_in, created_at, updated_at)"
+                        " VALUES (:id, :company, :name, :built_in, :now, :now)"
+                    ),
+                    {
+                        "id": uuid.uuid4().bytes,
+                        "company": company_id.bytes,
+                        "name": name,
+                        "built_in": built_in,
+                        "now": now,
+                    },
+                )
+        # 2. The upgrade, as on a server that already has companies.
+        command.upgrade(config, "head")
+        # 3. Which of the company's roles grant it now.
+        with engine.connect() as connection:
+            granted = connection.execute(
+                text(
+                    "SELECT r.name FROM roles r JOIN role_permissions rp ON rp.role_id = r.id "
+                    "WHERE r.company_id = :company AND rp.permission_code = 'announcement.create'"
+                ),
+                {"company": company_id.bytes},
+            ).scalars()
+            names = sorted(granted)
+        problems = []
+        if names != ["Administrator", "Manager", "Owner"]:
+            problems.append(f"after the upgrade announcement.create is granted by {names}")
+        # 4. A manager of the company, through the app's own check.
+        with Session(engine) as db:
+            set_company(db, company_id)
+            department = Department(name="Kitchen")
+            db.add(department)
+            db.flush()
+            manager = User(
+                email="manager@existing.example.com",
+                display_name="manager",
+                department_id=department.id,
+            )
+            db.add(manager)
+            db.flush()
+            role = db.scalars(select(Role).where(Role.built_in == "manager")).one()
+            assign_role(
+                db,
+                Actor.system(),
+                user_id=manager.id,
+                role=role,
+                scope_type="department",
+                scope_id=department.id,
+            )
+            db.commit()
+            if "announcement.create" not in effective_permissions(db, manager):
+                problems.append("a manager of an existing company cannot post after the upgrade")
+        return problems
+    finally:
+        engine.dispose()
+
+
 def main() -> int:
     config = Config("alembic.ini")
     heads = ScriptDirectory.from_config(config).get_heads()
@@ -1499,14 +2128,17 @@ def main() -> int:
         from app.core.config import get_settings
 
         get_settings.cache_clear()
-        command.upgrade(config, "head")
+        # Up to just before announcements, then an existing company is upgraded the rest
+        # of the way (the function says what it checks).
+        command.upgrade(config, "0013")
+        upgrade_problems = _existing_company_problems(url, config)
         # The race checks commit rows, so they run before the downgrade removes everything.
         # They run as the application user, like the app.
         race_problems = _race_problems(app_url)
         command.downgrade(config, "base")
         command.upgrade(config, "head")
         differences = _differences_from_models(url)
-        rule_problems = _database_rule_problems(url) + race_problems
+        rule_problems = _database_rule_problems(url) + upgrade_problems + race_problems
         # Last, as a refused change that got through could leave the database broken.
         if app_url != url:
             rule_problems += _grant_problems(app_url)

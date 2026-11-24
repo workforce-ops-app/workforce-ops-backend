@@ -24,9 +24,17 @@ created brings new permissions, and a role edit must be able to grant them witho
 anyone reseeding the database.
 
 Role changes take turns with each other, with role assignments, and with reporting-line
-changes, through the company's lock (chain.lock_reporting_lines). After taking it, the
-holders and the chain are read fresh (app/authz/delegation.py), so a role given to a peer,
-or a line ended, while this request waited is seen before the change is made.
+changes, through the company's lock (chain.lock_reporting_lines). After taking it,
+everything the change depends on is read fresh (locking reads, FOR SHARE), because under
+MySQL's REPEATABLE READ an ordinary read would still show the database from before the
+wait:
+- the user's own permissions and owner role (authorize and AZ3 again, fresh=True), so
+  access taken away while they waited stops the change;
+- the holders and the chain (app/authz/delegation.py), so a role given to a peer, or a
+  line ended, meanwhile is seen;
+- what the role grants now, so two edits in a row each start from the other's result;
+- the number of roles, so two creations cannot both pass the limit.
+The checks before the lock stay: they answer quickly without waiting for the lock.
 """
 
 import uuid
@@ -99,10 +107,11 @@ def _known_codes(db: Session, codes: list[str]) -> set[str]:
     return wanted
 
 
-def _only_what_they_hold(db: Session, user: User, codes: set[str]) -> None:
+def _only_what_they_hold(db: Session, user: User, codes: set[str], *, fresh: bool = False) -> None:
     """AZ3: every code must be one the user holds themselves (somewhere). 403 otherwise,
-    with the same message as every other refusal, so it does not list what they lack."""
-    if not codes <= set(effective_permissions(db, user)):
+    with the same message as every other refusal, so it does not list what they lack.
+    fresh=True for the check after the company's lock (the top of this file)."""
+    if not codes <= set(effective_permissions(db, user, fresh=fresh)):
         raise Forbidden()
 
 
@@ -111,8 +120,9 @@ def _changeable_role(db: Session, user: User, role_id: uuid.UUID) -> Role:
 
     1. Allowed to manage roles at all (403), and the role exists in the company (404).
     2. Not the Owner role (409, AZ9), and not archived (409).
-    3. The company's lock, so role changes take turns (the top of this file), then the
-       role read fresh and the holder check on fresh reads (AZ13, 403).
+    3. The company's lock, so role changes take turns (the top of this file), then
+       role.manage checked again on fresh reads (403), the role read fresh, and the holder
+       check on fresh reads (AZ13, 403).
     """
     authorize(db, user, "role.manage")
     role = db.get(Role, role_id)
@@ -121,6 +131,8 @@ def _changeable_role(db: Session, user: User, role_id: uuid.UUID) -> Role:
     if role.built_in == "owner":
         raise Conflict(OWNER_LOCKED)
     lock_reporting_lines(db)
+    # Still allowed? Permissions taken away while this request waited count.
+    authorize(db, user, "role.manage", fresh=True)
     role = db.get(Role, role_id, populate_existing=True, with_for_update=True)
     if role is None:  # roles are never deleted
         raise NotFound()
@@ -148,7 +160,12 @@ def create_role(db: Session, user: User, body: RoleCreate) -> Role:
     _only_what_they_hold(db, user, codes)
     # 2. Take turns with other role changes before the count and name checks.
     lock_reporting_lines(db)
-    if (db.scalar(select(func.count(Role.id))) or 0) >= MAX_ROLES:
+    # 3. Checked again on fresh reads (the top of this file): still allowed, still holds
+    #    every code, and the count includes roles created while this request waited.
+    authorize(db, user, "role.manage", fresh=True)
+    _only_what_they_hold(db, user, codes, fresh=True)
+    count = select(func.count(Role.id)).with_for_update(read=True)  # FOR SHARE: newest rows
+    if (db.scalar(count) or 0) >= MAX_ROLES:
         raise Conflict(f"A company can have at most {MAX_ROLES} roles.")
     if _name_taken(db, body.name):
         raise Conflict(ROLE_NAME_TAKEN)
@@ -184,10 +201,13 @@ def update_role(
     #    above everyone who holds the role, or they could not change it.
     wanted = _known_codes(db, body.permissions) if body.permissions is not None else None
     role = _changeable_role(db, user, role_id)
-    current = what_role_grants(db, role)
+    # What the role grants now, read fresh: another edit may have committed while this one
+    # waited for the lock, and added/removed must be worked out from its result.
+    current = what_role_grants(db, role, fresh=True)
     added = sorted(wanted - current) if wanted is not None else []
     removed = sorted(current - wanted) if wanted is not None else []
-    _only_what_they_hold(db, user, set(added))
+    # AZ3 on fresh reads too: a code the user lost while waiting cannot be added.
+    _only_what_they_hold(db, user, set(added), fresh=True)
     # 2. Changing what a role grants needs the password re-entered (decision 0025).
     if added or removed:
         require_reauth(session)
