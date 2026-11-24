@@ -116,8 +116,17 @@ def refresh(db: Session, rows: list[TimeOffRequest]) -> None:
     """Bring requests up to date and save that at once: collecting requests past their
     send-up deadline go up (locked in the usual order: the employee, then the request),
     and requests whose first day has begun undecided are declined as not reviewed (the
-    approval layer's lapse; its hook updates the request itself)."""
-    changed = False
+    approval layer's lapse; its hook updates the request itself).
+
+    Afterwards the transaction always shows what was committed, whoever lapsed a request:
+    - this request lapsed one: committing saves it, and the next read starts afresh;
+    - another request lapsed one first: this transaction's REPEATABLE READ snapshot is from
+      before that, so every later ordinary read in it (the status filter in
+      list_requests(), the flags in not_reviewed(), a detail page's decisions) would still
+      see "pending". Ending the transaction (a commit with nothing to save) makes the next
+      read take a new snapshot, which includes the other request's lapse (review of #166).
+    """
+    changed = stale = False
     now = utcnow()
     for row in rows:
         if row.status == "collecting" and row.offers_close_at and row.offers_close_at <= now:
@@ -134,7 +143,8 @@ def refresh(db: Session, rows: list[TimeOffRequest]) -> None:
                 # row again with a locking read, as lapse() does for the approval: an
                 # ordinary read would answer from this transaction's old snapshot.
                 db.refresh(row, with_for_update={"read": True})
-    if changed:
+                stale = True
+    if changed or stale:
         db.commit()
 
 

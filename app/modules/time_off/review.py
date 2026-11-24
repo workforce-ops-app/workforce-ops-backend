@@ -128,9 +128,10 @@ def nearest_shared(db: Session, deciders: set[uuid.UUID], employee: User) -> set
     return {p for p, steps in distance.items() if steps == nearest}
 
 
-def reviewers(db: Session, approval: ApprovalRequest) -> set[uuid.UUID]:
+def reviewers(db: Session, approval: ApprovalRequest, *, fresh: bool = False) -> set[uuid.UUID]:
     """Who may decide now: nobody while collecting (still with the coworkers,
-    coverage.md), step 2 when escalated, otherwise step 1."""
+    coverage.md), step 2 when escalated, otherwise step 1. fresh is part of the shared
+    Handler interface (app/approvals/service.py); time off does not use it yet."""
     request = request_for(db, approval)
     employee = db.get(User, approval.subject_user_id)
     if request is None or employee is None or request.status == "collecting":
