@@ -25,8 +25,8 @@ def _request_for(db: Session, approval: ApprovalRequest) -> TimeOffRequest | Non
     ).one_or_none()
 
 
-def reviewers(db: Session, approval: ApprovalRequest) -> set[uuid.UUID]:
-    return set()  # routing arrives with TO2 (#64)
+def reviewers(db: Session, approval: ApprovalRequest, *, fresh: bool = False) -> set[uuid.UUID]:
+    return set()  # routing arrives with TO2 (#64); fresh changes nothing yet
 
 
 def sensitive(db: Session, approval: ApprovalRequest) -> bool:
