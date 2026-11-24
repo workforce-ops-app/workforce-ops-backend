@@ -955,6 +955,10 @@ def _lapse_race_problems(engine: Engine) -> list[str]:
     1. Request 2 must not lapse it again (one audit entry, from request 1).
     2. Request 2's copies must show what was committed: the approval declined as not
        reviewed, and the time-off request declined.
+    3. What request 2 answers must show it too (second review of #166): its own list
+       filtered to "denied" includes the request, and its not-reviewed flag is set. Those
+       are ordinary queries after refresh(), so they would answer from request 2's old
+       snapshot unless refresh() ended it.
     """
     from datetime import timedelta
 
@@ -964,11 +968,13 @@ def _lapse_race_problems(engine: Engine) -> list[str]:
     import app.modules.time_off.approval  # noqa: F401  (registers the "time_off" handler)
     from app.approvals.models import ApprovalRequest
     from app.approvals.service import lapse, open_request
+    from app.audit import Actor
     from app.audit.models import AuditEvent
+    from app.authz.roles import assign_role, create_starting_roles
     from app.db.base import utcnow
     from app.modules.org.models import Company, Department, User
     from app.modules.time_off.models import TimeOffRequest
-    from app.modules.time_off.service import refresh
+    from app.modules.time_off.service import list_requests, not_reviewed, refresh
     from app.tenancy.context import set_company
 
     problems: list[str] = []
@@ -994,6 +1000,16 @@ def _lapse_race_problems(engine: Engine) -> list[str]:
         )
         db.add(asker)
         db.flush()
+        # The Employee role, so the asker may list their own requests (check 3).
+        roles = create_starting_roles(db, Actor.system())
+        assign_role(
+            db,
+            Actor.system(),
+            user_id=asker.id,
+            role=roles["employee"],
+            scope_type="department",
+            scope_id=home.id,
+        )
         tomorrow = (utcnow() + timedelta(days=1)).date()
         approval = open_request(
             db,
@@ -1015,7 +1031,7 @@ def _lapse_race_problems(engine: Engine) -> list[str]:
         db.flush()
         approval.payload = {"time_off_request_id": str(row.id)}
         db.commit()
-        approval_id, row_id = approval.id, row.id
+        approval_id, row_id, asker_id = approval.id, row.id, asker.id
     # Its deadline passes, as if its first day had begun undecided.
     with session() as db:
         db.execute(
@@ -1046,6 +1062,24 @@ def _lapse_race_problems(engine: Engine) -> list[str]:
             problems.append(
                 f"the request that lost the lapse race saw the time off as {old_row.status!r}"
             )
+        # 3. What request 2 answers: its list filtered to "denied", and the flag.
+        me = request_2.get(User, asker_id)
+        if me is None:  # made above
+            raise RuntimeError("the lapse race probe's asker is missing")
+        denied = list_requests(
+            request_2,
+            me,
+            mine=True,
+            status="denied",
+            employee_id=None,
+            first=None,
+            last=None,
+            limit=50,
+        )
+        if row_id not in {row.id for row in denied}:
+            problems.append("a request lapsed by another request was missing from the denied list")
+        if not not_reviewed(request_2, denied or [old_row]).get(row_id):
+            problems.append("a request lapsed by another request was not flagged as not reviewed")
         request_2.rollback()
     with session() as db:
         entries = db.scalar(
