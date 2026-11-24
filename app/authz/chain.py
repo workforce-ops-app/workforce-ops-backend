@@ -173,6 +173,21 @@ def _current_line_exists(db: Session, manager_id: uuid.UUID, employee_id: uuid.U
     return found is not None
 
 
+def direct_managers_fresh(db: Session, person_ids: set[uuid.UUID]) -> set[uuid.UUID]:
+    """The people these people report to directly, through current lines, read fresh
+    (FOR SHARE: see is_above_in_chain_fresh). One step of a walk up the chain, for finding
+    who reviews a request one level at a time (app/modules/roles/approval.py)."""
+    if not person_ids:
+        return set()
+    return set(
+        db.scalars(
+            select(ReportingLine.manager_id)
+            .where(ReportingLine.employee_id.in_(person_ids), _current())
+            .with_for_update(read=True)
+        )
+    )
+
+
 def is_above_in_chain_fresh(db: Session, user_id: uuid.UUID, person_id: uuid.UUID) -> bool:
     """Whether the user is above the person, reading the newest committed lines.
 

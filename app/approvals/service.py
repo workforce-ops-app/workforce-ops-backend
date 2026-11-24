@@ -1,24 +1,107 @@
-"""Opening approval requests (authorization.md, delegation limits; decision 0029).
+"""Opening and deciding approval requests (authorization.md, delegation limits; 0029).
 
 A feature that needs approval from above calls open_request() instead of making the
-change. The request grants nothing while it is pending. Deciding requests (approve, deny,
-cancel, and lapsing after the deadline) arrives with the approval endpoints.
+change. The request grants nothing while it is pending. Then:
+
+- approve():  a reviewer agrees. Once it has `required_approvals` approvals, the request
+              is approved and its kind's handler makes the change, in the same transaction.
+- deny():     a reviewer refuses; one denial is enough (data-model.md, approval_decisions).
+- cancel():   the requester takes it back.
+- lapse():    nobody decided by review_by: it is declined as "not reviewed", and the audit
+              log says so (decision 0032). This happens the next time anyone reads or
+              acts on the request, so no background job is needed: nothing can approve a
+              lapsed request, because every decision lapses it first. Its decided_at is
+              the deadline itself; the audit entry is written when it is noticed.
+
+What a kind of request does, and who may review it, is up to the feature that owns the
+kind: it registers a Handler (register_handler), as roles do for "role_assignment"
+(app/modules/roles/approval.py). Who may decide is worked out again at the moment of each
+decision, never stored, so a reviewer who lost their role or their place above the
+requester since the request was opened can no longer decide it.
+
+Rules for everyone (AZ7, AZ14): nobody decides a request they made, or one about
+themselves; each person decides a request once (the decisions table's key).
+
+Fresh reads (review of #163): a decision waits for the company's lock, and under MySQL's
+REPEATABLE READ an ordinary read after that wait still answers from the transaction's old
+snapshot. So after the lock, may_decide(fresh=True) reads the decider and asks the handler
+for its reviewers with fresh=True (locking reads), and decide() reads the decisions made so
+far with locking reads too, so one committed meanwhile by another reviewer is counted.
 """
 
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
+from typing import Any, Protocol
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from app.approvals.models import KINDS, ApprovalRequest
+from app.approvals.models import KINDS, ApprovalDecision, ApprovalRequest
 from app.audit import Actor, record
 from app.db.base import utcnow
+from app.modules.org.models import User
 
 # A role grant, owner change, or account change nobody decides within this long is
 # declined as not reviewed (decision 0032). Other kinds set their own deadline.
 REVIEW_WITHIN = timedelta(days=7)
+
+
+class DecisionError(ValueError):
+    """A decision that the request's state does not allow (the caller answers 409)."""
+
+
+class Reviewers(Protocol):
+    """A handler's reviewers(): who may decide the request now. fresh=True is asked after
+    the company's lock, and then every read must be a locking read (the top of this file);
+    without it, ordinary reads (lists and pages, which must not wait on row locks)."""
+
+    # db and the request are positional-only (the "/"), so each handler may name them as
+    # it likes (time off calls the request "approval").
+    def __call__(
+        self, db: Session, request: ApprovalRequest, /, *, fresh: bool = False
+    ) -> set[uuid.UUID]: ...
+
+
+@dataclass(frozen=True)
+class Handler:
+    """What one kind of request needs from the feature that owns it.
+
+    reviewers(db, request, fresh=...): the IDs of everyone who may decide it now.
+    sensitive(db, request): whether deciding it needs the password entered again (asked
+        only after the company's lock, so it reads fresh).
+    apply(db, request, approver): make the change once approved; raise DecisionError if
+        it can no longer be made (say, the role was archived meanwhile). Runs after the
+        company's lock, so it reads fresh.
+    describe(db, request): what the audit entries show about it (no personal data).
+    """
+
+    reviewers: Reviewers
+    sensitive: Callable[[Session, ApprovalRequest], bool]
+    apply: Callable[[Session, ApprovalRequest, User], None]
+    describe: Callable[[Session, ApprovalRequest], dict[str, Any]]
+
+
+_handlers: dict[str, Handler] = {}
+
+
+def register_handler(kind: str, handler: Handler) -> None:
+    """Called once by the feature that owns the kind, when its module is imported."""
+    if kind not in KINDS:
+        raise ValueError(f"unknown kind of approval request {kind!r}")
+    _handlers[kind] = handler
+
+
+def handler_for(request: ApprovalRequest) -> Handler:
+    """The handler of the request's kind. A kind without one is a bug, so it raises."""
+    try:
+        return _handlers[request.kind]
+    except KeyError:
+        raise LookupError(f"no handler for approval requests of kind {request.kind!r}") from None
+
+
+# --- Opening ---------------------------------------------------------------------------
 
 
 def pending_like(
@@ -35,7 +118,7 @@ def pending_like(
         )
         .with_for_update(read=True)
     )
-    return next((row for row in rows if row.payload == payload), None)
+    return next((row for row in rows if row.payload == payload and not _overdue(row)), None)
 
 
 def open_request(
@@ -76,3 +159,150 @@ def open_request(
         details={"kind": kind, "subject_user_id": str(subject_user_id), **details},
     )
     return request
+
+
+# --- Lapsing ---------------------------------------------------------------------------
+
+
+def _overdue(request: ApprovalRequest) -> bool:
+    return request.status == "pending" and request.review_by <= utcnow()
+
+
+def lapse(db: Session, request: ApprovalRequest) -> bool:
+    """Decline the request as not reviewed if its deadline has passed; audited, as the
+    system. Returns whether it lapsed now. The caller commits.
+
+    Safe when two requests notice the same overdue request at the same moment (two
+    people opening their lists, say): only one of them lapses it, so there is one audit
+    entry. The caller's copy may be old (read without a lock), so the change is made by
+    one UPDATE that only matches while the request is still pending and overdue. The
+    database runs that against the newest committed row and makes a second UPDATE wait
+    for the first to finish; the second then matches nothing and answers "not now".
+    Either way the copy is then read again with a locking read, so it shows what was
+    committed, not this transaction's old snapshot (reviews of #163 and #166).
+    """
+    # 1. The quick answer from the copy we have: not overdue means nothing to do.
+    if not _overdue(request):
+        return False
+    # 2. Claim it: one conditional UPDATE. Declined at the deadline, not at the moment
+    #    someone happened to look, so the history shows exactly when it ran out of time.
+    claimed = db.execute(
+        update(ApprovalRequest)
+        .where(
+            ApprovalRequest.id == request.id,
+            ApprovalRequest.status == "pending",
+            ApprovalRequest.review_by <= utcnow(),
+        )
+        .values(status="denied", not_reviewed=True, decided_at=ApprovalRequest.review_by)
+        .execution_options(synchronize_session=False)
+    )
+    # 3. Read the copy again with a locking read (FOR SHARE), so it shows the database's
+    #    state either way: an ordinary read would answer from this transaction's old
+    #    snapshot, and the request that lost the race would still see "pending".
+    db.refresh(request, with_for_update={"read": True})
+    if claimed.rowcount != 1:  # type: ignore[attr-defined]
+        return False  # someone else lapsed or decided it first: nothing more to do
+    # 4. Only the request that claimed it writes the audit entry.
+    record(
+        db,
+        actor=Actor.system(),
+        action="approval.not_reviewed",
+        target_type="approval_request",
+        target_id=request.id,
+        details={"kind": request.kind, **handler_for(request).describe(db, request)},
+    )
+    return True
+
+
+# --- Deciding --------------------------------------------------------------------------
+
+
+def may_decide(db: Session, user: User, request: ApprovalRequest, *, fresh: bool = False) -> bool:
+    """Whether the user may approve or deny the request right now. fresh=True after the
+    company's lock: the user and the reviewers are read with locking reads, so a reviewer
+    deactivated or stripped of their role while the decision waited cannot decide."""
+    if request.status != "pending" or _overdue(request):
+        return False
+    if user.id in (request.requested_by, request.subject_user_id):
+        return False  # nobody decides their own request, or one about themselves
+    if fresh:
+        db.refresh(user, with_for_update={"read": True})
+    if user.deactivated_at is not None:
+        return False
+    return user.id in handler_for(request).reviewers(db, request, fresh=fresh)
+
+
+def decide(db: Session, user: User, request: ApprovalRequest, decision: str) -> None:
+    """Record the user's approval or denial (the caller has checked may_decide and taken
+    the company's lock). One denial denies; enough approvals approve and apply it."""
+    # Locking reads (FOR SHARE) for the decisions so far: one another reviewer committed
+    # while this request waited for the lock must be seen, or a second decision by the
+    # same person would hit the table's key (a 500) and a count would come up short.
+    already = db.get(
+        ApprovalDecision,
+        (request.id, user.id),
+        with_for_update={"read": True},
+        populate_existing=True,
+    )
+    if already is not None:
+        raise DecisionError("You have already decided this request.")
+    now = utcnow()
+    db.add(
+        ApprovalDecision(
+            request_id=request.id,
+            approver_type="user",
+            approver_id=user.id,
+            decision=decision,
+            decided_at=now,
+        )
+    )
+    details = {"kind": request.kind, **handler_for(request).describe(db, request)}
+    if decision == "deny":
+        request.status, request.decided_at = "denied", now
+        record(
+            db,
+            actor=Actor.user(user.id),
+            action="approval.denied",
+            target_type="approval_request",
+            target_id=request.id,
+            details=details,
+        )
+        return
+
+    db.flush()  # the decision is counted below
+    approvals = db.scalars(
+        select(ApprovalDecision.approver_id)
+        .where(ApprovalDecision.request_id == request.id, ApprovalDecision.decision == "approve")
+        .with_for_update(read=True)
+    ).all()
+    if len(approvals) < request.required_approvals:
+        return  # more approvals needed; it stays pending
+    # Approved: the change is made in this same transaction, so either both happen or
+    # neither does.
+    handler_for(request).apply(db, request, user)
+    request.status, request.decided_at = "approved", now
+    record(
+        db,
+        actor=Actor.user(user.id),
+        action="approval.approved",
+        target_type="approval_request",
+        target_id=request.id,
+        details=details,
+    )
+
+
+def cancel(db: Session, user: User, request: ApprovalRequest) -> None:
+    """The requester takes back a pending request; audited. The caller commits."""
+    if request.requested_by != user.id:
+        raise PermissionError("only the requester cancels a request")
+    if request.status != "pending":
+        raise DecisionError("This request is no longer pending.")
+    request.status, request.decided_at = "cancelled", utcnow()
+    record(
+        db,
+        actor=Actor.user(user.id),
+        action="approval.cancelled",
+        target_type="approval_request",
+        target_id=request.id,
+        details={"kind": request.kind, **handler_for(request).describe(db, request)},
+    )

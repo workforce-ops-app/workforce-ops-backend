@@ -5,8 +5,7 @@ Requests forbid unknown fields, so a body cannot set built_in, archived_at, or a
 """
 
 import uuid
-from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, StringConstraints
 
@@ -93,18 +92,3 @@ class AssignmentOut(BaseModel):
 
 class AssignmentList(BaseModel):
     items: list[AssignmentOut]
-
-
-class ApprovalRequestOut(BaseModel):
-    """A request waiting for approval from above (the answer 202 to a role at your own
-    level)."""
-
-    id: uuid.UUID
-    kind: str
-    status: str
-    requested_by: uuid.UUID
-    subject_user_id: uuid.UUID
-    payload: dict[str, Any]
-    required_approvals: int
-    review_by: datetime
-    not_reviewed: bool
