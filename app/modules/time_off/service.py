@@ -63,14 +63,29 @@ MAX_DAYS = 30
 
 def refresh(db: Session, rows: list[TimeOffRequest]) -> None:
     """Decline the requests whose first day has begun undecided, as not reviewed, and save
-    that at once (the approval layer's lapse; its hook updates the request itself)."""
-    changed = False
+    that at once (the approval layer's lapse; its hook updates the request itself).
+
+    Afterwards the transaction always shows what was committed, whoever lapsed a request:
+    - this request lapsed one: committing saves it, and the next read starts afresh;
+    - another request lapsed one first: this transaction's REPEATABLE READ snapshot is from
+      before that, so every later ordinary read in it (the status filter in
+      list_requests(), the flags in not_reviewed(), a detail page's decisions) would still
+      see "pending". Ending the transaction (a commit with nothing to save) makes the next
+      read take a new snapshot, which includes the other request's lapse (review of #166).
+    """
+    changed = stale = False
     for row in rows:
         if row.status in ("pending", "escalated"):
             approval = db.get(ApprovalRequest, row.approval_request_id)
             if approval is not None and lapse(db, approval):
                 changed = True
-    if changed:
+            elif approval is not None and approval.status != "pending":
+                # Another request lapsed it first and its hook declined this row. Read the
+                # row again with a locking read, as lapse() does for the approval: an
+                # ordinary read would answer from this transaction's old snapshot.
+                db.refresh(row, with_for_update={"read": True})
+                stale = True
+    if changed or stale:
         db.commit()
 
 
