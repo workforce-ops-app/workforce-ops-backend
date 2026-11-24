@@ -5,7 +5,8 @@ Requests forbid unknown fields, so a body cannot set built_in, archived_at, or a
 """
 
 import uuid
-from typing import Annotated
+from datetime import datetime
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, StringConstraints
 
@@ -62,3 +63,48 @@ class RoleUpdate(Strict):
 
     name: RoleName | None = None
     permissions: Codes | None = None
+
+
+# --- Role assignments ------------------------------------------------------------------
+
+
+class AssignmentCreate(Strict):
+    """Give a person a role for one place: the whole company (no scope_id), a department,
+    a team, or one employee (scope_id names it)."""
+
+    user_id: uuid.UUID
+    role_id: uuid.UUID
+    scope_type: Literal["company", "department", "team", "employee"]
+    scope_id: uuid.UUID | None = None
+
+
+class AssignmentOut(BaseModel):
+    """A role one person holds, and where it applies."""
+
+    id: uuid.UUID
+    user_id: uuid.UUID
+    role_id: uuid.UUID
+    role_name: str
+    built_in: str | None
+    role_archived: bool  # an archived role is still listed, but grants nothing
+    scope_type: str
+    scope_id: uuid.UUID | None
+
+
+class AssignmentList(BaseModel):
+    items: list[AssignmentOut]
+
+
+class ApprovalRequestOut(BaseModel):
+    """A request waiting for approval from above (the answer 202 to a role at your own
+    level)."""
+
+    id: uuid.UUID
+    kind: str
+    status: str
+    requested_by: uuid.UUID
+    subject_user_id: uuid.UUID
+    payload: dict[str, Any]
+    required_approvals: int
+    review_by: datetime
+    not_reviewed: bool
