@@ -55,12 +55,16 @@ MANAGES = "time_off.review"  # what makes someone one of a department's managers
 # --- Who manages a department ----------------------------------------------------------
 
 
-def managers(db: Session, department_id: uuid.UUID) -> set[uuid.UUID]:
+def managers(db: Session, department_id: uuid.UUID, *, fresh: bool = False) -> set[uuid.UUID]:
     """The department's managers: active people holding time_off.review through an
-    active assignment for this department (company-wide holders are not counted)."""
+    active assignment for this department (company-wide holders are not counted).
+
+    fresh: locking reads (FOR SHARE), for checks after the company's lock. Under MySQL's
+    REPEATABLE READ an ordinary read would answer from before the wait, so a manager who
+    lost the role meanwhile would still count (review of #163)."""
     # Every joined model has a column in the select list, so the company filter limits
     # each one to the session's company too (tenancy.md: joins).
-    rows = db.execute(
+    query = (
         select(RoleAssignment.user_id, Role.id, RolePermission.role_id)
         .join(Role, Role.id == RoleAssignment.role_id)
         .join(RolePermission, RolePermission.role_id == Role.id)
@@ -70,10 +74,15 @@ def managers(db: Session, department_id: uuid.UUID) -> set[uuid.UUID]:
             RolePermission.permission_code == MANAGES,
             Role.archived_at.is_(None),
         )
-    ).all()
+    )
+    rows = db.execute(query.with_for_update(read=True) if fresh else query).all()
     found = set()
     for person_id, _, _ in rows:
-        person = db.get(User, person_id)
+        person = (
+            db.get(User, person_id, with_for_update={"read": True}, populate_existing=True)
+            if fresh
+            else db.get(User, person_id)
+        )
         if person is not None and person.deactivated_at is None:
             found.add(person_id)
     return found

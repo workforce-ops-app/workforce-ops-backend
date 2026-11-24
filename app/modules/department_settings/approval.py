@@ -29,12 +29,15 @@ def _department_id(request: ApprovalRequest) -> uuid.UUID:
     return uuid.UUID(request.payload["department_id"])
 
 
-def reviewers(db: Session, request: ApprovalRequest) -> set[uuid.UUID]:
-    return service.managers(db, _department_id(request)) - {request.requested_by}
+def reviewers(db: Session, request: ApprovalRequest, *, fresh: bool = False) -> set[uuid.UUID]:
+    # fresh after the company's lock: the managers are read with locking reads.
+    managers = service.managers(db, _department_id(request), fresh=fresh)
+    return managers - {request.requested_by}
 
 
 def ready(db: Session, request: ApprovalRequest, approvers: set[uuid.UUID]) -> bool:
-    return reviewers(db, request) <= approvers
+    # Only called by decide(), after the company's lock, so the managers are read fresh.
+    return reviewers(db, request, fresh=True) <= approvers
 
 
 def sensitive(db: Session, request: ApprovalRequest) -> bool:

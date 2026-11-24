@@ -23,7 +23,8 @@ from app.modules.org.models import User
 from app.modules.owners.service import make_owner, unmake_owner
 
 
-def reviewers(db: Session, request: ApprovalRequest) -> set[uuid.UUID]:
+def reviewers(db: Session, request: ApprovalRequest, *, fresh: bool = False) -> set[uuid.UUID]:
+    # active_owners() always reads fresh (FOR SHARE), so fresh changes nothing here.
     return active_owners(db) - {request.requested_by, request.subject_user_id}
 
 
