@@ -21,10 +21,11 @@
    sets a password only once, and role changes see what other requests committed while
    they waited (grants, the actor's own access, the role limit), and so do giving and
    removing roles (the giver's access, the role's grants and state, the person's place,
-   the same-level rule), and an overdue request noticed by two requests lapses once,
-   with both seeing it declined. SQLite has no row locks, so this too can only be tried
-   on MySQL. They run as the application user, so they also show its rights are enough
-   for the app's own writes and locking reads.
+   the same-level rule), and so do approval decisions (the reviewer's access, the
+   requested role's grants and state), and an overdue request noticed by two requests
+   lapses once, with both seeing it declined. SQLite has no row locks, so this too can
+   only be tried on MySQL. They run as the application user, so they also show its
+   rights are enough for the app's own writes and locking reads.
 6. A company that existed before a migration still works after it
    (_existing_company_problems): its starting roles get the permissions a migration adds
    (announcement.create in 0014).
@@ -372,6 +373,7 @@ def _race_problems(url: str) -> list[str]:
             + _role_race_problems(engine)
             + _lapse_race_problems(engine)
             + _assignment_race_problems(engine)
+            + _approval_race_problems(engine)
         )
     finally:
         engine.dispose()
@@ -1096,6 +1098,10 @@ def _lapse_race_problems(engine: Engine) -> list[str]:
     1. Request 2 must not lapse it again (one audit entry, from request 1).
     2. Request 2's copies must show what was committed: the approval declined as not
        reviewed, and the time-off request declined.
+    3. What request 2 answers must show it too (second review of #166): its own list
+       filtered to "denied" includes the request, and its not-reviewed flag is set. Those
+       are ordinary queries after refresh(), so they would answer from request 2's old
+       snapshot unless refresh() ended it.
     """
     from datetime import timedelta
 
@@ -1105,11 +1111,13 @@ def _lapse_race_problems(engine: Engine) -> list[str]:
     import app.modules.time_off.approval  # noqa: F401  (registers the "time_off" handler)
     from app.approvals.models import ApprovalRequest
     from app.approvals.service import lapse, open_request
+    from app.audit import Actor
     from app.audit.models import AuditEvent
+    from app.authz.roles import assign_role, create_starting_roles
     from app.db.base import utcnow
     from app.modules.org.models import Company, Department, User
     from app.modules.time_off.models import TimeOffRequest
-    from app.modules.time_off.service import refresh
+    from app.modules.time_off.service import list_requests, not_reviewed, refresh
     from app.tenancy.context import set_company
 
     problems: list[str] = []
@@ -1135,6 +1143,16 @@ def _lapse_race_problems(engine: Engine) -> list[str]:
         )
         db.add(asker)
         db.flush()
+        # The Employee role, so the asker may list their own requests (check 3).
+        roles = create_starting_roles(db, Actor.system())
+        assign_role(
+            db,
+            Actor.system(),
+            user_id=asker.id,
+            role=roles["employee"],
+            scope_type="department",
+            scope_id=home.id,
+        )
         tomorrow = (utcnow() + timedelta(days=1)).date()
         approval = open_request(
             db,
@@ -1156,7 +1174,7 @@ def _lapse_race_problems(engine: Engine) -> list[str]:
         db.flush()
         approval.payload = {"time_off_request_id": str(row.id)}
         db.commit()
-        approval_id, row_id = approval.id, row.id
+        approval_id, row_id, asker_id = approval.id, row.id, asker.id
     # Its deadline passes, as if its first day had begun undecided.
     with session() as db:
         db.execute(
@@ -1187,6 +1205,24 @@ def _lapse_race_problems(engine: Engine) -> list[str]:
             problems.append(
                 f"the request that lost the lapse race saw the time off as {old_row.status!r}"
             )
+        # 3. What request 2 answers: its list filtered to "denied", and the flag.
+        me = request_2.get(User, asker_id)
+        if me is None:  # made above
+            raise RuntimeError("the lapse race probe's asker is missing")
+        denied = list_requests(
+            request_2,
+            me,
+            mine=True,
+            status="denied",
+            employee_id=None,
+            first=None,
+            last=None,
+            limit=50,
+        )
+        if row_id not in {row.id for row in denied}:
+            problems.append("a request lapsed by another request was missing from the denied list")
+        if not not_reviewed(request_2, denied or [old_row]).get(row_id):
+            problems.append("a request lapsed by another request was not flagged as not reviewed")
         request_2.rollback()
     with session() as db:
         entries = db.scalar(
@@ -1439,6 +1475,259 @@ def _assignment_race_problems(engine: Engine) -> list[str]:
         else:
             problems.append("a giver whose role.assign was taken away could still remove roles")
         removing.rollback()
+    return problems
+
+
+def _approval_race_problems(engine: Engine) -> list[str]:
+    """Deciding and lapsing approval requests while another request changed what they
+    depend on; return what failed (review of #163).
+
+    A decision takes the company's lock, then reads the decider, the reviewers, and what
+    approval changes again with locking reads (app/approvals/service.py and
+    app/modules/roles/approval.py, top of each file). Each check below fixes request 2's
+    view first (an ordinary read, as its session and permission checks make), lets
+    request 1 commit a change, and then runs request 2's approval through the service.
+    Request 2's checks before the lock still see the old view, so only the ones after
+    the lock can catch the change:
+
+    1. The reviewer's role.assign taken away meanwhile: the approval is refused.
+    2. The requested role edited meanwhile to grant a permission the reviewer lacks: the
+       reviewer can no longer give it, so the approval is refused (AZ3).
+    3. The requested role archived meanwhile: the approval is refused (409).
+    4. Two requests noticing one overdue request at once: only one lapses it (one
+       not-reviewed audit entry), and the one that lost sees it declined as not reviewed,
+       not its old snapshot's "pending" (lapse() claims it with one conditional UPDATE).
+
+    Request 2 always rolls back, so a check that wrongly passes leaves nothing behind.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import delete, func, select, update
+    from sqlalchemy.orm import Session
+
+    import app.modules.roles.approval  # noqa: F401  (registers the "role_assignment" handler)
+    from app.approvals.models import ApprovalRequest
+    from app.approvals.service import lapse, open_request
+    from app.audit import Actor
+    from app.audit.models import AuditEvent
+    from app.auth.models import UserSession
+    from app.authz.chain import add_reporting_line
+    from app.authz.check import Forbidden
+    from app.authz.models import Role, RoleAssignment
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.db.base import utcnow
+    from app.modules.approval_requests import service as approvals
+    from app.modules.org.models import Company, Department, User
+    from app.modules.org.service import Conflict
+    from app.modules.roles import service
+    from app.modules.roles.schemas import RoleCreate, RoleUpdate
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    # A company of its own, made by platform code (a session with no company).
+    with Session(engine) as platform:
+        company = Company(name="approval race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # A sign-in session whose password was just entered again (role.assign is admin
+    # level). It is never saved: require_reauth() only looks at its reauth_at.
+    reauthed = UserSession(reauth_at=utcnow())
+
+    # The owner; a reviewer who manages a giver, who manages a worker, all in Office.
+    with session() as db:
+        office = Department(name="Office")
+        db.add(office)
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        people = {
+            name: User(
+                email=f"{name}@approval-race.example.com",
+                display_name=name,
+                department_id=office.id,
+            )
+            for name in ("owner", "reviewer", "giver", "worker")
+        }
+        db.add_all(people.values())
+        db.flush()
+        assign_role(
+            db,
+            Actor.system(),
+            user_id=people["owner"].id,
+            role=roles["owner"],
+            scope_type="company",
+        )
+        for manager, employee in (("reviewer", "giver"), ("giver", "worker")):
+            add_reporting_line(
+                db, Actor.system(), manager_id=people[manager].id, employee_id=people[employee].id
+            )
+        db.commit()
+        ids = {name: person.id for name, person in people.items()}
+        office_id = office.id
+
+    def person(db: Session, name: str) -> User:
+        found = db.get(User, ids[name])
+        if found is None:  # made above, in this company
+            raise RuntimeError("an approval race probe person is missing")
+        return found
+
+    # The roles, made by the owner: the reviewer's own (for Office), and one to ask for in
+    # each check. The reviewer holds everything each requested role grants.
+    with session() as db:
+        owner = person(db, "owner")
+
+        def role(name: str, codes: list[str]) -> uuid.UUID:
+            return service.create_role(db, owner, RoleCreate(name=name, permissions=codes)).id
+
+        reviewer_role = role("Reviewer", ["role.assign", "schedule.view_self", "schedule.view"])
+        edited = role("Edited", ["schedule.view_self"])
+        archived = role("Archived", ["schedule.view_self"])
+        revoked = role("Revoked", ["schedule.view_self"])
+        lapsing = role("Lapsing", ["schedule.view_self"])
+        db.commit()
+    with session() as db:
+        found = db.get(Role, reviewer_role)
+        if found is None:  # made above
+            raise RuntimeError("an approval race probe role is missing")
+        assign_role(
+            db,
+            Actor.system(),
+            user_id=ids["reviewer"],
+            role=found,
+            scope_type="department",
+            scope_id=office_id,
+        )
+        db.commit()
+
+    def ask(role_id: uuid.UUID) -> uuid.UUID:
+        """The giver asks for the role for the worker, in Office (as a same-level grant
+        does); committed, so both simulated requests see it."""
+        with session() as db:
+            request = open_request(
+                db,
+                kind="role_assignment",
+                requested_by=ids["giver"],
+                subject_user_id=ids["worker"],
+                payload={
+                    "role_id": str(role_id),
+                    "scope_type": "department",
+                    "scope_id": str(office_id),
+                },
+                details={},
+            )
+            db.commit()
+            return request.id
+
+    def owner_changes(change: Callable[[Session, User], object]) -> None:
+        """Request 1: the owner makes a change and commits."""
+        with session() as request_1:
+            change(request_1, person(request_1, "owner"))
+            request_1.commit()
+
+    def approve(db: Session, request_id: uuid.UUID) -> None:
+        """Request 2 approves, as the reviewer."""
+        approvals.approve(db, person(db, "reviewer"), request_id, session=reauthed)
+
+    # 2 first: edited and archived roles are refused whoever reviews, so they run while
+    # the reviewer still holds role.assign (check 1 takes it away for good).
+    # 2. The requested role edited to grant schedule.edit, which the reviewer lacks.
+    asked = ask(edited)
+    with session() as request_2:
+        request_2.scalars(select(Role)).all()  # its view is now fixed
+        person(request_2, "reviewer")
+        owner_changes(
+            lambda db, owner: service.update_role(
+                db,
+                owner,
+                edited,
+                RoleUpdate(permissions=["schedule.view_self", "schedule.edit"]),
+                session=reauthed,
+            )
+        )
+        try:
+            approve(request_2, asked)
+        except Forbidden:
+            pass  # refused: what the role grants now was seen
+        else:
+            problems.append("a role edited to grant more than the reviewer holds was approved")
+        request_2.rollback()
+
+    # 3. The requested role archived.
+    asked = ask(archived)
+    with session() as request_2:
+        request_2.scalars(select(Role)).all()  # its view is now fixed
+        person(request_2, "reviewer")
+        owner_changes(
+            lambda db, _: db.execute(
+                update(Role).where(Role.id == archived).values(archived_at=utcnow())
+            )
+        )
+        try:
+            approve(request_2, asked)
+        except (Conflict, Forbidden):
+            pass  # refused: the archive was seen
+        else:
+            problems.append("a request for an archived role was approved")
+        request_2.rollback()
+
+    # 1. The reviewer's role.assign taken away (their only role).
+    asked = ask(revoked)
+    with session() as request_2:
+        request_2.scalars(select(RoleAssignment)).all()  # its view is now fixed
+        person(request_2, "reviewer")
+        owner_changes(
+            lambda db, _: db.execute(
+                delete(RoleAssignment).where(RoleAssignment.user_id == ids["reviewer"])
+            )
+        )
+        try:
+            approve(request_2, asked)
+        except Forbidden:
+            pass  # refused: the reviewer's current grants were seen
+        else:
+            problems.append("a reviewer whose role.assign was taken away could still approve")
+        request_2.rollback()
+
+    # 4. Two requests noticing one overdue request at once.
+    asked = ask(lapsing)
+    with session() as db:
+        db.execute(
+            update(ApprovalRequest)
+            .where(ApprovalRequest.id == asked)
+            .values(review_by=utcnow() - timedelta(seconds=1))
+        )
+        db.commit()
+    with session() as request_2:
+        copy = request_2.get(ApprovalRequest, asked)  # its view is now fixed
+        if copy is None:  # made above, in this company
+            raise RuntimeError("the approval race probe's request is missing")
+        with session() as request_1:
+            first = request_1.get(ApprovalRequest, asked)
+            if first is None or not lapse(request_1, first):
+                problems.append("an overdue request did not lapse")
+            request_1.commit()
+        if lapse(request_2, copy):
+            problems.append("an overdue request lapsed twice")
+        if copy.status != "denied" or not copy.not_reviewed:
+            problems.append(f"the request that lost the lapse race saw {copy.status!r}")
+        request_2.rollback()
+    with session() as db:
+        entries = db.scalar(
+            select(func.count()).where(
+                AuditEvent.chain_id == company_id,
+                AuditEvent.action == "approval.not_reviewed",
+                AuditEvent.target_id == asked,
+            )
+        )
+        if entries != 1:
+            problems.append(f"an overdue request has {entries} not-reviewed audit entries")
     return problems
 
 
