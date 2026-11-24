@@ -68,11 +68,23 @@ def resolve(db: Session, target: object) -> Scope:
     return resolver(db, target)
 
 
-@scope_resolver(User)
-def person_scope(db: Session, person: User) -> Scope:
-    """A person belongs to their home department, the teams they are on, and themselves."""
-    teams = db.scalars(select(TeamMember.team_id).where(TeamMember.user_id == person.id))
+def person_scope(db: Session, person: User, *, fresh: bool = False) -> Scope:
+    """A person belongs to their home department, the teams they are on, and themselves.
+
+    fresh=True is for a check made after a lock: the team memberships are read with a
+    locking read (FOR SHARE), which sees the newest committed rows, not this transaction's
+    old snapshot. The caller reads the person's own row fresh first (their department).
+    """
+    query = select(TeamMember.team_id).where(TeamMember.user_id == person.id)
+    if fresh:
+        query = query.with_for_update(read=True)
+    teams = db.scalars(query)
     return Scope(frozenset({person.department_id}), frozenset(teams), person.id)
+
+
+# Registered by a call, not as a decorator, so person_scope keeps its own signature
+# (with fresh) for the callers that pass it.
+scope_resolver(User)(person_scope)
 
 
 @dataclass(frozen=True)
