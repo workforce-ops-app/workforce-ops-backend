@@ -19,7 +19,8 @@
    take turns with team and department changes, wrong passwords sent together are
    each counted toward the lockout, one setup link used twice at the same moment
    sets a password only once, and role changes see what other requests committed while
-   they waited (grants, the actor's own access, the role limit). SQLite has no row
+   they waited (grants, the actor's own access, the role limit), and an overdue
+   request noticed by two requests lapses once, with both seeing it declined. SQLite has no row
    locks, so this too can only be tried on MySQL. They run as the application user, so
    they also show its rights are enough for the app's own writes and locking reads.
 6. The application user's rights (_grant_problems, #43): created by the same first-start
@@ -307,6 +308,7 @@ def _race_problems(url: str) -> list[str]:
             + _lockout_race_problems(engine)
             + _link_race_problems(engine)
             + _role_race_problems(engine)
+            + _lapse_race_problems(engine)
         )
     finally:
         engine.dispose()
@@ -932,6 +934,124 @@ def _role_race_problems(engine: Engine) -> list[str]:
         else:
             problems.append(f"a company went past {service.MAX_ROLES} roles")
         request_2.rollback()
+    return problems
+
+
+def _lapse_race_problems(engine: Engine) -> list[str]:
+    """Two requests noticing one overdue request at once; return what failed (review of #166).
+
+    lapse() (app/approvals/service.py) claims the request with one conditional UPDATE, so
+    only one request lapses it. The one that loses then reads the request again, and
+    under MySQL's REPEATABLE READ an ordinary read there answers from its old snapshot:
+    it would still see "pending" after the winner committed the denial. So request 2
+    fixes its view first (an ordinary read, as a list page makes), request 1 lapses the
+    request and commits, and then request 2 runs lapse() and time off's refresh():
+
+    1. Request 2 must not lapse it again (one audit entry, from request 1).
+    2. Request 2's copies must show what was committed: the approval declined as not
+       reviewed, and the time-off request declined.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import func, select, update
+    from sqlalchemy.orm import Session
+
+    import app.modules.time_off.approval  # noqa: F401  (registers the "time_off" handler)
+    from app.approvals.models import ApprovalRequest
+    from app.approvals.service import lapse, open_request
+    from app.audit.models import AuditEvent
+    from app.db.base import utcnow
+    from app.modules.org.models import Company, Department, User
+    from app.modules.time_off.models import TimeOffRequest
+    from app.modules.time_off.service import refresh
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    with Session(engine) as platform:
+        company = Company(name="lapse race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # One person asking for tomorrow off, as time off's ask() records it.
+    with session() as db:
+        home = Department(name="Office")
+        db.add(home)
+        db.flush()
+        asker = User(
+            email="asker@lapse-race.example.com", display_name="asker", department_id=home.id
+        )
+        db.add(asker)
+        db.flush()
+        tomorrow = (utcnow() + timedelta(days=1)).date()
+        approval = open_request(
+            db,
+            kind="time_off",
+            requested_by=asker.id,
+            subject_user_id=asker.id,
+            payload={},
+            details={},
+            review_by=utcnow() + timedelta(days=1),
+        )
+        row = TimeOffRequest(
+            employee_id=asker.id,
+            first_day=tomorrow,
+            last_day=tomorrow,
+            status="pending",
+            approval_request_id=approval.id,
+        )
+        db.add(row)
+        db.flush()
+        approval.payload = {"time_off_request_id": str(row.id)}
+        db.commit()
+        approval_id, row_id = approval.id, row.id
+    # Its deadline passes, as if its first day had begun undecided.
+    with session() as db:
+        db.execute(
+            update(ApprovalRequest)
+            .where(ApprovalRequest.id == approval_id)
+            .values(review_by=utcnow() - timedelta(seconds=1))
+        )
+        db.commit()
+
+    with session() as request_2:
+        copy = request_2.get(ApprovalRequest, approval_id)
+        old_row = request_2.get(TimeOffRequest, row_id)  # its view is now fixed
+        if copy is None or old_row is None:  # made above, in this company
+            raise RuntimeError("the lapse race probe's request is missing")
+        with session() as request_1:
+            first = request_1.get(ApprovalRequest, approval_id)
+            if first is None or not lapse(request_1, first):
+                problems.append("an overdue request did not lapse")
+            request_1.commit()
+        if lapse(request_2, copy):
+            problems.append("an overdue request lapsed twice")
+        if copy.status != "denied" or not copy.not_reviewed:
+            problems.append(
+                f"the request that lost the lapse race saw the approval as {copy.status!r}"
+            )
+        refresh(request_2, [old_row])
+        if old_row.status != "denied":
+            problems.append(
+                f"the request that lost the lapse race saw the time off as {old_row.status!r}"
+            )
+        request_2.rollback()
+    with session() as db:
+        entries = db.scalar(
+            select(func.count()).where(
+                AuditEvent.chain_id == company_id,
+                AuditEvent.action == "approval.not_reviewed",
+                AuditEvent.target_id == approval_id,
+            )
+        )
+        if entries != 1:
+            problems.append(f"an overdue request has {entries} not-reviewed audit entries")
     return problems
 
 

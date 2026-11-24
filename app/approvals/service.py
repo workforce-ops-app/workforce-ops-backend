@@ -168,7 +168,8 @@ def lapse(db: Session, request: ApprovalRequest) -> bool:
     the change is made by one UPDATE that only matches while the request is still
     pending and overdue. The database runs that against the newest committed row and
     makes a second UPDATE wait for the first to finish; the second then matches nothing
-    and answers "not now".
+    and answers "not now". Either way the copy is then read again with a locking read,
+    so it shows what was committed, not this transaction's old snapshot.
     """
     # 1. The quick answer from the copy we have: not overdue means nothing to do.
     if not _overdue(request):
@@ -185,8 +186,12 @@ def lapse(db: Session, request: ApprovalRequest) -> bool:
         .values(status="denied", not_reviewed=True, decided_at=ApprovalRequest.review_by)
         .execution_options(synchronize_session=False)
     )
-    # 3. The copy is read again, so it shows the database's state either way.
-    db.refresh(request)
+    # 3. The copy is read again, so it shows the database's state either way. A locking
+    #    read (FOR SHARE): under MySQL's REPEATABLE READ an ordinary read answers from this
+    #    transaction's old snapshot, so the request that lost the race would still see
+    #    "pending" after the winner committed the denial. A locking read sees the newest
+    #    committed row (review of #166).
+    db.refresh(request, with_for_update={"read": True})
     if claimed.rowcount != 1:  # type: ignore[attr-defined]
         return False  # someone else lapsed or decided it first: nothing more to do
     # 4. Only the request that claimed it writes the audit entry and runs the hook.
