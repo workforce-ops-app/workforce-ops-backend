@@ -58,8 +58,10 @@ class Reviewers(Protocol):
     the company's lock, and then every read must be a locking read (the top of this file);
     without it, ordinary reads (lists and pages, which must not wait on row locks)."""
 
+    # db and the request are positional-only (the "/"), so each handler may name them as
+    # it likes (time off calls the request "approval").
     def __call__(
-        self, db: Session, request: ApprovalRequest, *, fresh: bool = False
+        self, db: Session, request: ApprovalRequest, /, *, fresh: bool = False
     ) -> set[uuid.UUID]: ...
 
 
