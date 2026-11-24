@@ -28,7 +28,7 @@ with or without one.
 Permissions are read from the database on every call, so a role change takes effect at
 once (no stale copy in the session).
 
-Fresh reads: grants(), effective_permissions(), is_owner(), and authorize() take
+Fresh reads: grants(), effective_permissions(), is_owner(), is_above(), and authorize() take
 `fresh=True` for checks made after a lock (for example the company's lock in
 chain.lock_reporting_lines). Under MySQL's default isolation (REPEATABLE READ) an ordinary
 SELECT sees the database as it was at the transaction's first read, so a request that
@@ -45,10 +45,18 @@ from sqlalchemy import ColumnElement, and_, false, or_, select, true
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.selectable import GenerativeSelect
 
-from app.authz.chain import is_above_in_chain, people_below
+from app.authz.chain import is_above_in_chain, is_above_in_chain_fresh, people_below
 from app.authz.models import Role, RoleAssignment, RolePermission
 from app.authz.registry import Kind, all_permissions, get_permission
-from app.authz.scope import Grant, Scope, ScopeColumns, condition_for, covers, resolve
+from app.authz.scope import (
+    Grant,
+    Scope,
+    ScopeColumns,
+    condition_for,
+    covers,
+    person_scope,
+    resolve,
+)
 from app.modules.org.models import Department, Team, User
 
 
@@ -202,15 +210,20 @@ def holds_admin_level(db: Session, person: User) -> bool:
     return not ADMIN_LEVEL.isdisjoint(effective_permissions(db, person))
 
 
-def is_above(db: Session, user: User, person: User) -> bool:
+def is_above(db: Session, user: User, person: User, *, fresh: bool = False) -> bool:
     """Whether the user is above the person in the reporting chain.
 
     The Owner is above everyone; anyone else only through reporting lines. Nobody is above
-    themselves, and a deactivated user is above nobody.
+    themselves, and a deactivated user is above nobody. fresh=True reads the user's row,
+    their owner role, and the chain with locking reads (top of this file).
     """
-    if user.id == person.id or user.deactivated_at is not None:
+    if user.id == person.id or _deactivated(db, user, fresh):
         return False
-    return is_owner(db, user) or is_above_in_chain(db, user.id, person.id)
+    if is_owner(db, user, fresh=fresh):
+        return True
+    if fresh:
+        return is_above_in_chain_fresh(db, user.id, person.id)
+    return is_above_in_chain(db, user.id, person.id)
 
 
 def _owner_of(db: Session, target: object) -> uuid.UUID | None:
@@ -225,10 +238,10 @@ def authorize(
 ) -> None:
     """Allow, or raise Forbidden (403) or NotFound (404). See the top of this file.
 
-    fresh=True is for a second check after a lock: the grants are read with locking reads,
-    so permissions taken away while the request waited are seen (top of this file). It
-    covers the grants; person checks also ask is_above(), which reads the chain normally,
-    so callers that need a fresh chain use chain.is_above_in_chain_fresh themselves.
+    fresh=True is for a second check after a lock: everything is read with locking reads,
+    so changes committed while the request waited are seen (top of this file). That covers
+    the grants and, for a person check, the person as they are now (their row, their home
+    department, their teams) and the reporting chain.
     """
     permission = get_permission(code)  # an unknown code is a bug: LookupError
 
@@ -263,8 +276,16 @@ def authorize(
     if target is not None:
         if not isinstance(target, User) or target.id == user.id:
             raise Forbidden()
-        scope = resolve(db, target)
-        if not any(covers(grant, scope) for grant in found) or not is_above(db, user, target):
+        if fresh:
+            # The person as now committed: they may have moved department or team while
+            # this request waited. The caller's copy is updated too (FOR SHARE).
+            db.refresh(target, with_for_update={"read": True})
+            scope = person_scope(db, target, fresh=True)
+        else:
+            scope = resolve(db, target)
+        if not any(covers(grant, scope) for grant in found):
+            raise Forbidden()
+        if not is_above(db, user, target, fresh=fresh):
             raise Forbidden()
 
 

@@ -7,6 +7,7 @@
 | [Threat model](threat-model.md) (data flows, attacker profiles, STRIDE threats and protections) | design, core tier |
 | [Security controls](security-controls.md) (every protection, where it lives in the code, and its test; keys, algorithms, and logs) | current for the midterm backend |
 | [Midterm audit](audit-midterm.md) (the backend checked against OWASP ASVS 5.0 Level 2, with its findings) | done 2026-10-12; batch shift changes checked when they merge |
+| [Final audit: the outside attacker](audit-external.md) (profile P1 against every endpoint and page, with ZAP, sqlmap, and Burp Suite; #119) | prepared; run by both teammates on `review/integration` |
 | [Findings log](findings-log.md) (fixed findings only; entries are added after a finding's fix merges, [security policy](https://github.com/workforce-ops-app/.github/blob/main/SECURITY.md)) | started; no fixes merged yet |
 | Detection study (pattern-based detection results) | designed in [detection](../features/detection.md#detection-study-rq1); results will be in the [research repository](https://github.com/workforce-ops-app/workforce-ops-research) |
 
