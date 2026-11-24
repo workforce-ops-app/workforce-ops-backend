@@ -14,7 +14,8 @@ acts on it (app/approvals/service.py, lapse), so it can never be approved late.
 
 Decisions take turns with role, assignment, and reporting-line changes through the
 company's lock (chain.lock_reporting_lines); after it, the request is read fresh and
-locked, and the reviewers are worked out on fresh reads.
+locked, and the decider, the reviewers, and what approval changes are all read again with
+locking reads (may_decide(fresh=True); review of #163).
 """
 
 import uuid
@@ -120,7 +121,7 @@ def _decide(
     db: Session, user: User, request_id: uuid.UUID, decision: str, session: UserSession
 ) -> ApprovalRequest:
     request = _locked(db, user, request_id)
-    if not may_decide(db, user, request):
+    if not may_decide(db, user, request, fresh=True):
         raise Forbidden()  # involved (they asked, or it is about them), but not a reviewer
     if handler_for(request).sensitive(db, request):
         require_reauth(session)
