@@ -26,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.authz.chain import is_above_in_chain_fresh
-from app.authz.check import effective_permissions, grants, is_owner
+from app.authz.check import effective_permissions, grants, is_above, is_owner
 from app.authz.models import Role, RoleAssignment, RolePermission
 from app.authz.registry import all_permissions
 from app.authz.scope import Scope, covers, person_scope
@@ -80,7 +80,17 @@ def above_every_holder(db: Session, user: User, role: Role) -> bool:
     )
 
 
-def scope_of(db: Session, scope_type: str, scope_id: uuid.UUID | None) -> Scope | None:
+def _get[M](db: Session, model: type[M], row_id: uuid.UUID, fresh: bool) -> M | None:
+    """One row by ID. fresh=True makes it a locking read (FOR SHARE) that replaces the copy
+    this session holds, so it shows the newest committed version (the top of this file)."""
+    if fresh:
+        return db.get(model, row_id, with_for_update={"read": True}, populate_existing=True)
+    return db.get(model, row_id)
+
+
+def scope_of(
+    db: Session, scope_type: str, scope_id: uuid.UUID | None, *, fresh: bool = False
+) -> Scope | None:
     """Where an assignment applies, as a Scope; None for the whole company.
 
     - a department:  the department itself;
@@ -88,30 +98,36 @@ def scope_of(db: Session, scope_type: str, scope_id: uuid.UUID | None) -> Scope 
                      covers its teams);
     - one employee:  that person as authorize() sees them: their home department, their
                      teams, and themselves.
-    The caller has already checked that the department, team, or person exists.
+    The caller has already checked that the department, team, or person exists. fresh=True
+    reads the team or the person with locking reads, for a check after the company's lock.
     """
     if scope_type == "company" or scope_id is None:
         return None
     if scope_type == "department":
         return Scope(frozenset({scope_id}), frozenset(), None)
     if scope_type == "team":
-        team = db.get(Team, scope_id)
+        team = _get(db, Team, scope_id, fresh)
         departments = frozenset({team.department_id}) if team is not None else frozenset()
         return Scope(departments, frozenset({scope_id}), None)
-    person = db.get(User, scope_id)
-    return person_scope(db, person) if person is not None else Scope(frozenset(), frozenset(), None)
+    person = _get(db, User, scope_id, fresh)
+    if person is None:
+        return Scope(frozenset(), frozenset(), None)
+    return person_scope(db, person, fresh=fresh)
 
 
-def held_for(db: Session, user: User, codes: set[str], scope: Scope | None) -> set[str]:
+def held_for(
+    db: Session, user: User, codes: set[str], scope: Scope | None, *, fresh: bool = False
+) -> set[str]:
     """Which of these permission codes the user holds for the whole of `scope`.
 
     The whole company (scope None) needs a company-wide grant; anywhere else, a grant whose
     scope covers it (the same covers() authorize() uses). A department grant therefore
-    holds for its teams and its people, but never for the whole company (AZ4).
+    holds for its teams and its people, but never for the whole company (AZ4). fresh=True
+    reads the user's grants with locking reads, for a check after the company's lock.
     """
     held = set()
     for code in codes:
-        found = grants(db, user, code)
+        found = grants(db, user, code, fresh=fresh)
         if scope is None:
             if any(grant.scope_type == "company" for grant in found):
                 held.add(code)
@@ -121,20 +137,27 @@ def held_for(db: Session, user: User, codes: set[str], scope: Scope | None) -> s
 
 
 def place_problem(
-    db: Session, scope_type: str, scope_id: uuid.UUID | None
+    db: Session, scope_type: str, scope_id: uuid.UUID | None, *, fresh: bool = False
 ) -> tuple[int, str] | None:
     """Why an assignment's place is not acceptable, as (status, message), or None.
 
     422 for a place that does not exist: the company filter hides other companies' rows,
     so another company's department looks the same as a missing one. 409 for an archived
     department or team, which covers nothing (authorization.md), or a deactivated person.
+    fresh=True reads the place with a locking read, so a place archived (or a person
+    deactivated) while the request waited for the company's lock is seen.
     """
     if scope_type == "company":
         return None if scope_id is None else (422, "A company-wide role has no scope_id.")
     if scope_id is None:
         return 422, "Say where the role applies (scope_id)."
-    model = {"department": Department, "team": Team, "employee": User}[scope_type]
-    found = db.get(model, scope_id)
+    found: Department | Team | User | None
+    if scope_type == "department":
+        found = _get(db, Department, scope_id, fresh)
+    elif scope_type == "team":
+        found = _get(db, Team, scope_id, fresh)
+    else:
+        found = _get(db, User, scope_id, fresh)
     if found is None:
         return 422, f"Unknown {scope_type}."
     if getattr(found, "archived_at", None) is not None:
@@ -144,7 +167,9 @@ def place_problem(
     return None
 
 
-def is_same_level(db: Session, user: User, codes: set[str], scope: Scope | None) -> bool:
+def is_same_level(
+    db: Session, user: User, codes: set[str], scope: Scope | None, *, fresh: bool = False
+) -> bool:
     """Whether a role granting `codes` at this place would put its receiver at the giver's
     own level there: it includes ALL of the permissions the giver holds for that place
     (decision 0032). Such a grant waits for approval from above the giver (AZ14).
@@ -152,20 +177,26 @@ def is_same_level(db: Session, user: User, codes: set[str], scope: Scope | None)
     An owner is never "at their own level" with anyone: nobody is above an owner to
     approve, and an owner may give any role but Owner (which goes through the owner
     change flow instead).
+
+    fresh=True reads the giver's owner role and permissions with locking reads: a giver
+    who lost permissions while the request waited may now be at the receiver's level, and
+    the grant must then wait for approval instead of going straight through.
     """
-    if is_owner(db, user):
+    if is_owner(db, user, fresh=fresh):
         return False
-    mine_here = held_for(db, user, set(effective_permissions(db, user)), scope)
+    mine = set(effective_permissions(db, user, fresh=fresh))
+    mine_here = held_for(db, user, mine, scope, fresh=fresh)
     return mine_here <= codes
 
 
 def is_above_fresh(db: Session, user: User, person: User) -> bool:
     """Whether the user is above the person, on fresh reads, for checks made after the
     company's lock: an owner always; anyone else through current lines (a line ended while
-    the request waited counts). Nobody is above themselves."""
-    if user.id == person.id or user.deactivated_at is not None:
-        return False
-    return is_owner(db, user) or is_above_in_chain_fresh(db, user.id, person.id)
+    the request waited counts). Nobody is above themselves.
+
+    The user's own row and owner role are read fresh too (check.is_above with fresh=True):
+    an owner removed, or a user deactivated, while the request waited is above nobody."""
+    return is_above(db, user, person, fresh=True)
 
 
 def active_owners(db: Session) -> set[uuid.UUID]:
@@ -180,7 +211,7 @@ def active_owners(db: Session) -> set[uuid.UUID]:
     )
     owners = set()
     for person_id in set(holders_now):
-        person = db.get(User, person_id)
+        person = _get(db, User, person_id, fresh=True)  # deactivated meanwhile counts
         if person is not None and person.deactivated_at is None:
             owners.add(person_id)
     return owners
