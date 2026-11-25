@@ -52,9 +52,7 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 | `audit.verify` | company | run verification of the company's audit chain |
 | `security.view` | company | see the company's security events on the security page (built, DT5: [detection](../features/detection.md#backend)) |
 | `announcement.create` | record | post, edit, and archive announcements for an audience in scope; see who has read them ([announcements](../features/announcements.md)) |
-| `coverage.request_self` | self | ask coworkers to cover or swap one of your own shifts; cancel your request ([coverage](../features/coverage.md)) |
-| `coverage.respond_self` | self | answer a coverage request you were asked about: accept, swap, or decline |
-| `coverage.review` | person | approve or deny the coverage requests of people you are above; approving also needs `schedule.edit` on every shift that changes ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)) |
+| `coverage.respond_self` | self | on a coworker's time-off request asked with offers, offer to cover or swap one of their shifts, or decline ([coverage](../features/coverage.md)); asking is part of time off (`time_off.request_self`) and choosing offers part of reviewing it (`time_off.review`, plus `schedule.edit` on every shift a chosen offer changes) |
 | `company.transfer_ownership` | company | propose adding or removing an owner (Owner role only; other owners must agree) |
 
 Changing your own password and signing yourself out need no permission; every signed-in user can do both.
@@ -81,8 +79,7 @@ Every new company gets four roles ([0024](https://github.com/workforce-ops-app/.
 | `audit.view`, `audit.verify` | yes | yes | | |
 | `security.view` | yes | yes | | |
 | `announcement.create` | yes | yes | yes | |
-| `coverage.request_self`, `coverage.respond_self` | yes | yes | yes | yes |
-| `coverage.review` | yes | yes | yes | |
+| `coverage.respond_self` | yes | yes | yes | yes |
 | `company.transfer_ownership` | yes | | | |
 
 - **Typical scopes:** Owner and Administrator are assigned for the whole company; a Manager for their department or team; everyone gets the Employee role scoped to their **home department**, which is what lets employees see their department's schedule. An administrator can remove `schedule.view` from the Employee role to turn that off.
