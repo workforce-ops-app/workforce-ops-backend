@@ -5,7 +5,7 @@ Access is handed down from the owner one layer at a time. These functions answer
 questions the role and role-assignment services ask before they change anything:
 
 - what_role_grants():   the permission codes a role grants (the Owner: every one);
-- holders():            who holds a role right now, read fresh;
+- holders():            who holds a role right now (fresh=True: read fresh);
 - above_every_holder(): may this user change the role? Only if every holder is below them
                         (rule AZ13), or they are an owner (any role but Owner);
 - scope_of():           the place an assignment applies to, as a Scope that authorize()'s
@@ -25,7 +25,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.authz.chain import is_above_in_chain_fresh
+from app.authz.chain import is_above_in_chain, is_above_in_chain_fresh
 from app.authz.check import effective_permissions, grants, is_above, is_owner
 from app.authz.models import Role, RoleAssignment, RolePermission
 from app.authz.registry import all_permissions
@@ -50,33 +50,33 @@ def what_role_grants(db: Session, role: Role, *, fresh: bool = False) -> set[str
     return set(db.scalars(query))
 
 
-def holders(db: Session, role_id: uuid.UUID) -> set[uuid.UUID]:
+def holders(db: Session, role_id: uuid.UUID, *, fresh: bool) -> set[uuid.UUID]:
     """Everyone with an assignment of the role, deactivated people included (they would get
-    it back if reactivated), read fresh (FOR SHARE)."""
-    return set(
-        db.scalars(
-            select(RoleAssignment.user_id)
-            .where(RoleAssignment.role_id == role_id)
-            .with_for_update(read=True)
-        )
-    )
+    it back if reactivated). fresh=True reads them with locking reads (FOR SHARE), for
+    checks after the company's lock; fresh=False is an ordinary read, for answers."""
+    query = select(RoleAssignment.user_id).where(RoleAssignment.role_id == role_id)
+    return set(db.scalars(query.with_for_update(read=True) if fresh else query))
 
 
-def above_every_holder(db: Session, user: User, role: Role) -> bool:
+def above_every_holder(db: Session, user: User, role: Role, *, fresh: bool) -> bool:
     """Whether the user may change, rename, or archive the role (AZ13).
 
     An owner may change any role except Owner (the caller refuses Owner first). Anyone
     else must be above every current holder in the reporting chain, so nobody reshapes a
     role held by a peer, a superior, or themselves. A role nobody holds can be changed by
     anyone with role.manage: it reaches nobody yet.
+
+    fresh=True after the company's lock, before a change: the owner check, the holders,
+    and the chain are read with locking reads, so an owner removed or a holder added
+    while the request waited counts. fresh=False for answers such as `you_may_change` on
+    a role list (review of #171): ordinary reads, so a page view never takes row locks.
     """
-    # Fresh, like the holders below: an owner removed while this request waited is no
-    # longer an owner.
-    if is_owner(db, user, fresh=True):
+    if is_owner(db, user, fresh=fresh):
         return True
+    above = is_above_in_chain_fresh if fresh else is_above_in_chain
     return all(
-        holder != user.id and is_above_in_chain_fresh(db, user.id, holder)
-        for holder in holders(db, role.id)
+        holder != user.id and above(db, user.id, holder)
+        for holder in holders(db, role.id, fresh=fresh)
     )
 
 
