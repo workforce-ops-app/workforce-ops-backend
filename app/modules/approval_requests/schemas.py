@@ -5,9 +5,10 @@ from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.approvals.models import ApprovalRequest
+from app.approvals.models import ApprovalDecision, ApprovalRequest
 from app.approvals.service import handler_for
 from app.authz.models import Role
 from app.modules.org.models import User
@@ -34,9 +35,10 @@ class ApprovalRequestOut(BaseModel):
     not_reviewed: bool  # denied because nobody decided by review_by
     created_at: datetime
     decided_at: datetime | None
-    # Who may decide it now (empty once it is decided), worked out fresh as for a
-    # decision; the interface shows "Sent for approval to ...". Only people above
-    # the requester, so it shows them nobody they could not find out anyway.
+    # Who may decide it now (empty once it is decided; never someone who already has),
+    # worked out as for a decision; the interface shows "Sent for approval to ...".
+    # Only people above the requester, so it shows them nobody they could not find out
+    # anyway.
     reviewers: list[Reviewer]
     # Who asked, who it is about, and the role (role requests only), so the screens
     # say what is being decided without lookups the viewer may not be allowed to
@@ -90,8 +92,16 @@ def _role_name(db: Session, item: ApprovalRequest) -> str | None:
 def _reviewers(db: Session, item: ApprovalRequest) -> list[Reviewer]:
     if item.status != "pending":
         return []
-    # The same rule as a decision: never the requester or the person it is about.
+    # The same rules as a decision: never the requester or the person it is about, and
+    # never someone who already decided it (a request needing several approvals stays
+    # pending after the first; decide() refuses a second decision by the same person).
+    decided = set(
+        db.scalars(
+            select(ApprovalDecision.approver_id).where(ApprovalDecision.request_id == item.id)
+        )
+    )
     ids = handler_for(item).reviewers(db, item) - {item.requested_by, item.subject_user_id}
+    ids -= decided
     found = [person for person_id in ids if (person := db.get(User, person_id))]
     return [
         Reviewer(id=person.id, display_name=person.display_name)
