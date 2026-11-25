@@ -1,7 +1,7 @@
 """Add asking coworkers for cover or a swap on a time-off request.
 
-Revision: 0015
-Revises: 0014
+Revision: 0016
+Revises: 0015
 
 As in docs/features/coverage.md and app/modules/time_off/models.py:
 
@@ -25,8 +25,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import mysql
 
-revision: str = "0015"
-down_revision: str | None = "0014"
+revision: str = "0016"
+down_revision: str | None = "0015"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

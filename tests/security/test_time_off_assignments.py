@@ -183,3 +183,35 @@ def test_the_days_around_time_off_and_coworkers_stay_free(people: ShiftSetup) ->
     # A coworker can still be given that day.
     cara = body | {"employee_id": str(people.ids["cara"])}
     assert chef(people).post("/api/shifts", json=cara | times(at(3, 9), 6)).status_code == 201
+
+
+# --- Out of scope: the same refusal, whatever the person's time off (review of #183) ----
+
+
+def test_a_manager_who_may_not_schedule_her_learns_nothing_of_her_time_off(
+    people: ShiftSetup,
+) -> None:
+    # lead manages the Weekend Crew, so lead may change ben's shifts, but not give one to
+    # ana, who is not on the crew. Three of ben's shifts in Kitchen: on ana's approved
+    # day off, at a time she already works, and on a day she is free. Moving any of them
+    # to ana must be the same 403: a 409 for the first two would tell lead about her time
+    # off and her shifts.
+    on_day_off = people.new_shift(employee_id=people.ids["ben"], **times(at(3, 9), 6))["id"]
+    while_working = people.new_shift(employee_id=people.ids["ben"], **times(at(5, 9), 6))["id"]
+    people.new_shift(employee_id=people.ids["ana"], **times(at(5, 10), 4))
+    free_day = people.new_shift(employee_id=people.ids["ben"], **times(at(6, 9), 6))["id"]
+    approved_days_off(people, 3, 3)
+    to_ana = {"employee_id": str(people.ids["ana"])}
+    answers = [
+        people.browser("lead").post(f"/api/shifts/{shift_id}/assign", json=to_ana)
+        for shift_id in (on_day_off, while_working, free_day)
+    ]
+    assert [answer.status_code for answer in answers] == [403, 403, 403], [
+        answer.text for answer in answers
+    ]
+    assert len({answer.text for answer in answers}) == 1  # word for word the same
+    # And nothing changed: each shift is still ben's.
+    with people.db() as db:
+        for shift_id in (on_day_off, while_working, free_day):
+            found = db.get(Shift, uuid.UUID(shift_id))
+            assert found is not None and found.employee_id == people.ids["ben"]
