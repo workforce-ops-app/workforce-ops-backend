@@ -21,6 +21,26 @@ from tests.session_data import SignInSetup, email, signin
 
 __all__ = ["signin"]  # the fixture, imported so pytest finds it here
 
+
+@pytest.fixture(autouse=True)
+def one_window(signin: SignInSetup) -> None:
+    """Every request in a test falls in the same window of every rate limit (#207).
+
+    The limits count in fixed windows on the clock: a minute for sign-in attempts, an hour
+    for sign-ups. Real sign-ins take about half a second each (Argon2id), so a test with
+    many of them could cross into the next window, where every count starts again, and
+    see 401 where it expects 429. Half a minute into some minute, and so also partway
+    into some hour, leaves Retry-After above zero for both.
+    """
+    limits = signin.client.app.state.limits  # type: ignore[attr-defined]
+    for limit in (
+        limits.sign_in_per_address,
+        limits.sign_up_per_address,
+        limits.requests_per_session,
+    ):
+        limit.clock = lambda: 6_000_030.0
+
+
 URL = "/api/sign-up"
 STRONG = "lanterns drift over quiet waters"
 
