@@ -39,6 +39,11 @@ review.py.
 Every change is audited (time_off.requested, time_off.sent_up, time_off.cancelled,
 time_off.approved,
 time_off.denied, time_off.escalated, shift.opened) and commits once.
+
+Locks, always in this order (review of #167): the company's lock, the employee, the
+time-off request, its approval record, then the employee's shifts. Asking, cancelling,
+deciding, and a lapse (app/approvals/service.py, lapse) all follow it, so none of them can
+hold one lock while waiting for another that the other holds.
 """
 
 import uuid
@@ -361,7 +366,11 @@ def ask(db: Session, user: User, body: TimeOffCreate) -> TimeOffRequest:
         raise Invalid("The first day must be tomorrow or later.")
 
     # Take turns with the person's other requests (their row), then check overlaps on
-    # fresh reads, after declining any that have run out of time.
+    # fresh reads, after declining any that have run out of time. The company's lock
+    # first: the order every time-off change takes (the top of review.py), since a lapse
+    # below may take it, and taking it after the person's row could deadlock with a
+    # decision, which takes the company's lock and then the person.
+    lock_reporting_lines(db)
     me = repository.person(db, user.id, lock=True)
     if me is None or me.deactivated_at is not None:
         raise Forbidden()
@@ -374,7 +383,9 @@ def ask(db: Session, user: User, body: TimeOffCreate) -> TimeOffRequest:
                 TimeOffRequest.first_day <= body.last_day,
                 TimeOffRequest.last_day >= body.first_day,
             )
-            .with_for_update(read=True)
+            # FOR UPDATE, not FOR SHARE: a lapse below writes the row (lock order: the
+            # time-off row, then its approval record; app/modules/time_off/approval.py).
+            .with_for_update()
         )
     )
     for row in holding:
@@ -466,7 +477,9 @@ def cancel(db: Session, user: User, request_id: uuid.UUID) -> TimeOffRequest:
     found = db.get(TimeOffRequest, request_id)
     if found is None or found.employee_id != user.id:
         raise NotFound()  # someone else's request is not yours to know about here
-    # Same order as asking: the person, then the request (fresh and locked).
+    # Same order as asking and deciding: the company's lock, the person, then the request
+    # (fresh and locked), then its approval record (review of #167).
+    lock_reporting_lines(db)
     repository.person(db, user.id, lock=True)
     request = db.get(TimeOffRequest, request_id, populate_existing=True, with_for_update=True)
     if request is None:
@@ -565,7 +578,10 @@ def decide_request(
         raise Forbidden()  # still with the coworkers: it has no reviewers yet
     if request.status not in ("pending", "escalated"):
         raise Conflict("This request is no longer waiting for a decision.")
-    if not may_decide(db, user, approval):
+    # Fresh: the reviewer's grants, their place, the chain, the owners, and the employee
+    # as committed now, so a reviewer who lost time_off.review while this request waited
+    # for the locks cannot decide (review of #167).
+    if not may_decide(db, user, approval, fresh=True):
         raise Forbidden()  # their own, or not (or no longer) one of its reviewers
     if choices and decision == "approve":
         # Checked and locked before anything is written (offers.py, choose); kept with
