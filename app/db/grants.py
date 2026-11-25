@@ -78,6 +78,9 @@ APP_RIGHTS: dict[str, frozenset[str]] = {
     "approval_requests": frozenset({"SELECT", "INSERT", "UPDATE"}),
     # One person's decision: added once and never changed or removed.
     "approval_decisions": frozenset({"SELECT", "INSERT"}),
+    # Time-off requests (app/modules/time_off/): added when asked, then changed in place as
+    # they are decided, cancelled, or lapse (UPDATE). Never removed: they are history.
+    "time_off_requests": frozenset({"SELECT", "INSERT", "UPDATE"}),
 }
 
 # Alembic's own bookkeeping: only the migrations user needs it.

@@ -20,6 +20,7 @@ from fastapi import APIRouter, Query
 # Registers what each kind of request does on approval, before any request is decided.
 import app.modules.owners.approval  # noqa: F401
 import app.modules.roles.approval  # noqa: F401
+import app.modules.time_off.approval  # noqa: F401
 from app.auth.dependencies import Database, SignedInPerson
 from app.modules.approval_requests import service
 from app.modules.approval_requests.schemas import ApprovalRequestList, ApprovalRequestOut, shown

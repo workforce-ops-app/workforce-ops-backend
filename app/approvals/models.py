@@ -33,7 +33,7 @@ from app.db.types import UUIDBinary
 from app.tenancy.filter import CompanyOwned
 
 # The kinds of request. Features add theirs here when they are built (time off, coverage).
-KINDS = ("role_assignment", "owner_add", "owner_remove", "account_change")
+KINDS = ("role_assignment", "owner_add", "owner_remove", "account_change", "time_off")
 
 # Where a request is in its life: pending until approved, denied, or cancelled.
 STATUSES = ("pending", "approved", "denied", "cancelled")

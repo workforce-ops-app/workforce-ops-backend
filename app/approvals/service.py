@@ -11,7 +11,8 @@ change. The request grants nothing while it is pending. Then:
               log says so (decision 0032). This happens the next time anyone reads or
               acts on the request, so no background job is needed: nothing can approve a
               lapsed request, because every decision lapses it first. Its decided_at is
-              the deadline itself; the audit entry is written when it is noticed.
+              the deadline itself; the audit entry is written when it is noticed. Two
+              requests noticing it at once lapse it only once.
 
 What a kind of request does, and who may review it, is up to the feature that owns the
 kind: it registers a Handler (register_handler), as roles do for "role_assignment"
@@ -32,7 +33,7 @@ far with locking reads too, so one committed meanwhile by another reviewer is co
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Protocol
 
 from sqlalchemy import select, update
@@ -75,6 +76,8 @@ class Handler:
         it can no longer be made (say, the role was archived meanwhile). Runs after the
         company's lock, so it reads fresh.
     describe(db, request): what the audit entries show about it (no personal data).
+    lapsed(db, request): called when the request is declined as not reviewed, so the
+        feature can update its own record too (time off marks its request denied).
     ready(db, request, approvers): whether the approvals so far are enough. Without it,
         `required_approvals` approvals are enough; owner changes instead need every
         current reviewer, worked out again now, so an owner added meanwhile must agree too.
@@ -84,6 +87,7 @@ class Handler:
     sensitive: Callable[[Session, ApprovalRequest], bool]
     apply: Callable[[Session, ApprovalRequest, User], None]
     describe: Callable[[Session, ApprovalRequest], dict[str, Any]]
+    lapsed: Callable[[Session, ApprovalRequest], None] | None = None
     ready: Callable[[Session, ApprovalRequest, set[uuid.UUID]], bool] | None = None
 
 
@@ -134,11 +138,13 @@ def open_request(
     payload: dict[str, Any],
     details: dict[str, Any],
     required_approvals: int = 1,
+    review_by: datetime | None = None,
 ) -> ApprovalRequest:
     """Record a request waiting for approval, with its audit entry; the caller commits.
 
     `payload` is what happens on approval (kept with the request); `details` is what the
-    audit entry shows about it (for a role: its name and scope).
+    audit entry shows about it (for a role: its name and scope). `review_by` is the
+    deadline, 7 days from now unless the kind sets its own (time off: its first day).
     """
     if kind not in KINDS:
         raise ValueError(f"unknown kind of approval request {kind!r}")
@@ -149,7 +155,7 @@ def open_request(
         payload=payload,
         status="pending",
         required_approvals=required_approvals,
-        review_by=utcnow() + REVIEW_WITHIN,
+        review_by=review_by if review_by is not None else utcnow() + REVIEW_WITHIN,
         not_reviewed=False,
     )
     db.add(request)
@@ -178,12 +184,13 @@ def lapse(db: Session, request: ApprovalRequest) -> bool:
 
     Safe when two requests notice the same overdue request at the same moment (two
     people opening their lists, say): only one of them lapses it, so there is one audit
-    entry. The caller's copy may be old (read without a lock), so the change is made by
-    one UPDATE that only matches while the request is still pending and overdue. The
-    database runs that against the newest committed row and makes a second UPDATE wait
-    for the first to finish; the second then matches nothing and answers "not now".
-    Either way the copy is then read again with a locking read, so it shows what was
-    committed, not this transaction's old snapshot (reviews of #163 and #166).
+    entry and the hook runs once. The caller's copy may be old (read without a lock), so
+    the change is made by one UPDATE that only matches while the request is still
+    pending and overdue. The database runs that against the newest committed row and
+    makes a second UPDATE wait for the first to finish; the second then matches nothing
+    and answers "not now". Either way the copy is then read again with a locking read,
+    so it shows what was committed, not this transaction's old snapshot (reviews of
+    #163 and #166).
     """
     # 1. The quick answer from the copy we have: not overdue means nothing to do.
     if not _overdue(request):
@@ -200,13 +207,15 @@ def lapse(db: Session, request: ApprovalRequest) -> bool:
         .values(status="denied", not_reviewed=True, decided_at=ApprovalRequest.review_by)
         .execution_options(synchronize_session=False)
     )
-    # 3. Read the copy again with a locking read (FOR SHARE), so it shows the database's
-    #    state either way: an ordinary read would answer from this transaction's old
-    #    snapshot, and the request that lost the race would still see "pending".
+    # 3. The copy is read again, so it shows the database's state either way. A locking
+    #    read (FOR SHARE): under MySQL's REPEATABLE READ an ordinary read answers from this
+    #    transaction's old snapshot, so the request that lost the race would still see
+    #    "pending" after the winner committed the denial. A locking read sees the newest
+    #    committed row (review of #166).
     db.refresh(request, with_for_update={"read": True})
     if claimed.rowcount != 1:  # type: ignore[attr-defined]
         return False  # someone else lapsed or decided it first: nothing more to do
-    # 4. Only the request that claimed it writes the audit entry.
+    # 4. Only the request that claimed it writes the audit entry and runs the hook.
     record(
         db,
         actor=Actor.system(),
@@ -215,6 +224,9 @@ def lapse(db: Session, request: ApprovalRequest) -> bool:
         target_id=request.id,
         details={"kind": request.kind, **handler_for(request).describe(db, request)},
     )
+    hook = handler_for(request).lapsed
+    if hook is not None:
+        hook(db, request)
     return True
 
 
