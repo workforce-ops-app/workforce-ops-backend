@@ -199,19 +199,21 @@ def is_above_fresh(db: Session, user: User, person: User) -> bool:
     return is_above(db, user, person, fresh=True)
 
 
-def active_owners(db: Session) -> set[uuid.UUID]:
-    """The company's owners right now: people with the Owner role for the whole company
-    who are not deactivated, read fresh (FOR SHARE), for checks after the company's lock
-    (the last owner, who must agree to an owner change)."""
-    holders_now = db.scalars(
+def active_owners(db: Session, *, fresh: bool) -> set[uuid.UUID]:
+    """The company's owners: people with the Owner role for the whole company who are not
+    deactivated. fresh=True reads them with locking reads (FOR SHARE), for checks after
+    the company's lock (the last owner, who must agree to an owner change); fresh=False
+    is an ordinary read, for listing and for checks before the lock, which must not hold
+    or wait for row locks (the top of this file; review of #163)."""
+    query = (
         select(RoleAssignment.user_id, Role.id)
         .join(Role, Role.id == RoleAssignment.role_id)
         .where(Role.built_in == "owner", RoleAssignment.scope_type == "company")
-        .with_for_update(read=True)
     )
+    holders = db.scalars(query.with_for_update(read=True) if fresh else query)
     owners = set()
-    for person_id in set(holders_now):
-        person = _get(db, User, person_id, fresh=True)  # deactivated meanwhile counts
+    for person_id in set(holders):
+        person = _get(db, User, person_id, fresh)  # deactivated meanwhile counts
         if person is not None and person.deactivated_at is None:
             owners.add(person_id)
     return owners
