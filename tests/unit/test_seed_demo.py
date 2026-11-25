@@ -27,7 +27,7 @@ from app.db.base import Base
 from app.detection.patterns import KINDS
 from app.modules.announcements import repository as announcement_repository
 from app.modules.announcements.models import Announcement, AnnouncementRead
-from app.modules.org.models import Company, Department, Team, TeamMember, User
+from app.modules.org.models import Company, CompanyLock, Department, Team, TeamMember, User
 from app.modules.schedules import service as shift_service
 from app.modules.schedules.models import Shift
 from app.modules.security.models import PlatformSecurityEvent, SecurityEvent
@@ -44,6 +44,7 @@ ORG_TABLES = [
     model.__table__
     for model in (
         Company,
+        CompanyLock,  # every new company gets its lock row in the same save (#198)
         Department,
         Team,
         User,
