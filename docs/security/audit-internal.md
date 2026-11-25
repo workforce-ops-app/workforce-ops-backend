@@ -38,6 +38,8 @@ The demo data gives each profile a real person in Northwind Cafe (`@example.com`
 6. For every row, write the result and where the evidence is (a Burp note, a run folder, a screenshot, an audit entry's ID).
 7. Each finding gets an issue from the security-finding template (a private advisory first if it reaches another company's data or acts without permission), a row in the Findings table below, and, once fixed, a row in the [findings log](findings-log.md) with its tool, fix, regression test, threat ID, and attacker profile.
 
+**403 or 404:** inside the account's own company, a record it may not see or act on answers **403**; an unknown ID and every record of another company answer **404**, with the same body ([authorization](../architecture/authorization.md), [tenancy](../architecture/tenancy.md)). So a 403 for a coworker's record is the documented answer, not a leak, and is recorded as Expected. A few endpoints answer 404 inside the company on purpose, and say so in their rows: an announcement outside your audiences, and the offer endpoints of a time-off request you could not work a shift of. A Finding is a 403 for another company's record, or an answer that differs between another company's real ID and a made-up one.
+
 **Results:** **Pass** (the protection held, and the evidence shows it); **Finding** (it did not: file it); **Expected** (an odd answer that is the documented behavior; say which document); **False alarm** (a tool alert that is wrong; say why).
 
 ## P2: the malicious employee
@@ -54,21 +56,26 @@ One row for each threat the [threat model](threat-model.md) lists for P2. "What 
 | T3 Other companies' records by ID | Every Summit ID collected in step 2 in every route Ben can call: 404, never 403 (which would confirm it exists) | Burp | | |
 | T5 Stored XSS | `audit/xss-inputs.txt` in every text Ben can write that others read: his time-off reason (seen by Ana and Felix), offer notes, his own display name if he can change it; then open those screens as Ana | Burp, browser | | |
 | T6 Numbers past their limits | Very large and negative numbers, `1e309`, and 2^53 + 1 in every numeric field and query parameter Ben can send (`limit`, days, counts): 422, never 500 | Burp | | |
+| T8 Offering a shift you could not take, or one that is not yours | On a coworker's collecting time-off request, Ben offers to cover a shift that would double-book him, to swap with a shift that is Cara's or already past, on his own request, and after the request went up: refused (409 or 422), nothing on the schedule changes; then change one of his shifts so an offer no longer fits and have Ana approve with it: 409 at approval | Burp | | |
 | T7 Stored XSS through the security page | Ben sends XSS inputs that detection records; then Marcus opens the security page: the excerpt is shown as text | Burp, browser | | |
 | R1 Denying an action | Ben asks for time off, cancels it, answers an offer; each appears in the audit log with Ben as the actor (read it as Marcus) | browser, audit page or API | | |
 | R3 Forged log lines | Line breaks (`%0d%0a`, `\n`) and JSON fragments in Ben's text fields; every log entry stays one JSON line | Burp, `docker compose logs api` | | |
 | R4 Evading detection | The same injection in several forms (double encoding, mixed case, comments inside keywords); note which reach the security page. Measures detection only | Burp, security page | | |
 | I1 Another company's data | As Ben, every list endpoint: nothing from Summit, even with filters or cursors made from Summit IDs | Burp | | |
 | I2 Own company, outside scope | Ben lists people (`/api/users`: 403, he lacks `user.view`; by ID he sees only himself), Front of House shifts and time off, Cara's time-off request by ID, approval requests for others; the schedule shows the Kitchen only, with role names but no permissions | Burp, browser | | |
-| I3 Finding out what exists | Compare answers for a real and a made-up ID of a coworker's request, shift, and person: the same status and body shape | Burp Comparer | | |
+| I3 Finding out what exists | Compare a Summit ID with a made-up ID for a request, a shift, and a person: both 404 with the same body. A Northwind coworker's record Ben may not see answers 403 and a made-up ID 404, as documented (see "403 or 404" above): Expected | Burp Comparer | | |
 | I6 Data left in the browser cache | Sign out, press Back, look in the cache and storage: nothing personal remains | browser developer tools | | |
 | I7 Format strings | `{0.__class__}`, `%s%s%s%n`, `${7*7}` in Ben's text fields; shown and logged as plain text | Burp | | |
+| I10 Other people's offers | As a coworker asked, Ben reads the request (`GET /api/time-off-requests/{id}`, `.../offerable`): only his own answers, never the others', never the reason, the reviewers, or their decisions. A coworker who could not work any of its shifts gets 404 on the offer endpoints and 403 on `GET /{id}`; Summit gets 404 | Burp | | |
+| I11 Coworkers' roles on the schedule | Ben opens the Kitchen schedule: each shift shows the names of its person's roles in that department and nothing more (no role IDs, permissions, or scopes); never a Summit role. Accepted on purpose ([0038](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0038-final-demo-scope.md)): Expected when it shows only that | Burp, browser | | |
 | I9 Announcements meant for others | Ben opens an announcement for Front of House or for a team he is not in, by ID (404), and its read list (404); his list holds only his company, department, and teams | Burp | | |
 | D2 Expensive requests | Huge bodies, very long strings, `limit=100000`, deep JSON in Ben's requests: refused quickly, the API stays responsive | Burp | | |
+| D7 Flooding coworkers | Ben asks for many time-off requests with offers (`offer_coverage: true`), cancels them, and asks again. The threat model's D7 limits (10 open, 20 a day) were written for the first coverage design; the built design ([coverage](../features/coverage.md)) names none beyond the time-off rules (overlapping days, at most 30 days). Record what is refused and how many requests reach Ana's and his coworkers' screens: unbounded is a Finding against D7 | Burp Intruder | | |
 | D5 Flooding security events | Many attack-looking requests from Ben's session in a minute: at most 20 events, then one summary row | Burp Intruder, security page | | |
 | E1 Giving yourself more access | Ben posts a role assignment for himself (`/api/role-assignments`), a reporting line with himself as manager, an owner request for himself: all refused | Burp | | |
 | E5 Approving your own request | Ben approves or denies his own time-off request, through `/time-off-requests/{id}/approve` and through `/approval-requests/{id}/approve`; also when someone added a role that would let him review: refused. Ella (nobody above her) asks for time off: it goes to the owners, and she cannot name or become her own reviewer | Burp | | |
 | E8 Hidden buttons | Every write Marcus's screens send (step 2), replayed as Ben: refused unless the permission table allows it | Burp (Autorize or Repeater) | | |
+| E12 Moving shifts without approval | Ben's offers, and the offers on his own request, change nothing on the schedule until a reviewer approves; Ben sends `choices` with an approval of his own request, on either endpoint: refused (E5) | Burp, schedule screen | | |
 
 ## P3: the compromised manager or administrator
 
@@ -83,7 +90,8 @@ One row for each threat the [threat model](threat-model.md) lists for P3.
 | R2 Covering tracks | Marcus deactivates a person, archives a role, ends a line: nothing removes or edits the earlier audit entries; the chain still verifies | audit API | | |
 | I1 Another company's data | As Marcus and Ana, every list with filters, cursors, and IDs from Summit: nothing from Summit | Burp | | |
 | I2 Own company, outside scope | Felix lists shifts and time off outside the Weekend Crew; Ana reads Front of House shifts, people, and time-off reasons; Priya reads Kitchen requests; a manager reads the security page or the audit log (refused without `security.view`, `audit.view`) | Burp | | |
-| I3 Finding out what exists | As Ana, a real and a made-up ID of a Front of House person or request: the same answer; a taken email when Marcus creates a person, in any letter case | Burp Comparer | | |
+| I3 Finding out what exists | As Ana, a Summit ID and a made-up ID of a person or request: both 404 with the same body; a Front of House person or request answers 403, as documented (Expected). A taken email when Marcus creates a person, in any letter case | Burp Comparer | | |
+| I10 Other people's offers | Priya reads a Kitchen request's offers and reason (outside her `time_off.view`): 403; Felix sees the reason and every offer only for people his `time_off.view` covers | Burp | | |
 | I9 Announcements | Felix reads the read list of an announcement for the whole Kitchen; Ana reads one for Front of House: 404 | Burp | | |
 | D3 Destroying data from inside | As Marcus, look for any delete of people, shifts, requests, or audit entries (records are deactivated or archived only); archive a department with active teams (refused) | Burp | | |
 | E1 Giving yourself more access | Ana gives herself the Administrator role or a wider scope, adds a line with herself above Priya, edits her own role's permissions: refused | Burp | | |
@@ -94,6 +102,7 @@ One row for each threat the [threat model](threat-model.md) lists for P3.
 | E6 Taking over a company | As Marcus: add himself or Sofia as an owner, remove Olivia. As Olivia, with a second owner added: removing the other owner follows 0032 (either may remove the other, password re-entered); the last owner can never be removed | Burp | | |
 | E7 Weakening security settings | Marcus sets the password minimum, lockout, or session limits below the platform's limits, or a department minimum below the company's: 422 | Burp | | |
 | E9 Changing a role held by peers or superiors | Sofia edits or archives the Administrator role (Marcus holds it); Marcus edits the Owner role; Ana edits the Manager role (Priya holds it): refused | Burp | | |
+| E12 Approving an outcome that benefits yourself | Felix approves Ben's request choosing a swap whose offered shift is outside his `schedule.edit` (a Front of House shift): 403, nothing changes. A reviewer who offered on the request chooses their own offer: refused. Choices sent with an approval that does not settle the request (two reviewers): not applied | Burp | | |
 | E11 Announcements outside your scope | Felix posts to the whole Kitchen or the company; Ana posts to Front of House; check `/api/announcements/audiences` offers only what each may post to | Burp | | |
 | Concurrency | Two of Marcus's sessions send the same approval, role change, or owner change at the same moment (Burp's "send group in parallel"); one wins, nothing is applied twice, no 500 | Burp Repeater groups | | |
 
@@ -111,10 +120,15 @@ For every operation, the expected answer for each weaker account, from the [auth
 | `GET /api/departments/{id}/settings`, `PUT /api/departments/{id}/settings/{key}` | refused | refused | own department only, confirmed by all its managers | allowed within the company's limits | |
 | `GET /api/roles`, `GET /api/roles/{id}`, `GET /api/permissions` | refused | refused | refused | allowed | |
 | `POST /api/roles`, `PATCH /api/roles/{id}`, `.../archive` | refused | refused | refused | only roles she is above every holder of; never Owner | |
-| `GET`/`POST /api/role-assignments`, `DELETE /api/role-assignments/{id}` | refused | refused | refused | people below her; same level waits for approval | |
-| `GET`/`POST /api/reporting-lines`, `.../end` | refused | refused | refused | above both people, password re-entered | |
-| `GET`/`POST /api/owners`, `.../remove` | refused | refused | refused | refused (owners only) | |
-| `GET /api/approval-requests`, `GET /api/approval-requests/{id}`, `.../approve`, `.../deny`, `.../cancel` | only requests he made or that are about him; never approve own | as reviewer of what waits for him | as reviewer | as reviewer; never own | |
+| `GET /api/role-assignments` (a person's roles) | own only | own, and people in his `user.view` scope | own, and people in her `user.view` scope | company | |
+| `POST /api/role-assignments`, `DELETE /api/role-assignments/{id}` | refused | refused | refused | people below her; same level waits for approval | |
+| `GET /api/reporting-lines` (a person's lines) | own only | own, and people in his `user.view` scope | own, and people in her `user.view` scope | company | |
+| `POST /api/reporting-lines`, `.../end` | refused | refused | refused | above both people, password re-entered | |
+| `GET /api/owners` | refused (needs `role.view`) | refused | refused | allowed (`role.view`) | |
+| `POST /api/owners`, `.../remove` | refused | refused | refused | refused (owners only; password re-entered) | |
+| `GET /api/approval-requests`, `GET /api/approval-requests/{id}` | requests he made or that are about him | those, and what waits for him as a reviewer | those, and what waits for her | those, and what waits for her | |
+| `.../approve`, `.../deny` | refused (he reviews nothing; never his own or one about him) | only as a reviewer of what waits for him; never his own | only as a reviewer; never her own | only as a reviewer; never her own | |
+| `.../cancel` | only requests he made, while still waiting | only requests he made | only requests she made | only requests she made; a reviewer never cancels someone else's (403) | |
 | `GET /api/shifts`, `GET /api/shifts/{id}` | own department (and own shifts) | scope | scope | company | |
 | `POST /api/shifts`, `.../batch`, `PATCH /api/shifts/{id}`, `.../assign`, `.../cancel` | refused | team only | department only; never onto someone's approved time off | company | |
 | `GET`/`POST /api/time-off-requests`, `GET .../{id}`, `.../cancel` | own; coworkers' requests show no reason | own, and scope to review | own, and scope to review | own, and company | |
