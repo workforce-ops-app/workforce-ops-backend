@@ -32,6 +32,9 @@ STUBS = {
     "mysql": """#!/bin/bash
 case "$*" in
   *"SELECT @@server_uuid"*) echo "$STUB_SERVER" ;;
+  *"FLUSH BINARY LOGS"*) ;;
+  # The server's binary log files, oldest first; the last is the one it is writing.
+  *"SHOW BINARY LOGS"*) ls -1 "$STUB_SOURCE" | sort | sed 's/$/	400	No/' ;;
   *) echo "loaded: $(cat | wc -l) line(s)" >> "$STUB_LOG" ;;
 esac
 """,
@@ -46,9 +49,22 @@ fi
 echo "-- Dump completed on 2026-11-25 10:00:00"
 """,
     # Reading binary log files: their contents as they are (the tests write them in
-    # mysqlbinlog's own text form). Options are skipped.
+    # mysqlbinlog's own text form). Downloading one from the server (--result-file)
+    # copies it from "$STUB_SOURCE" and writes down its name. Other options are skipped.
     "mysqlbinlog": """#!/bin/bash
-for argument in "$@"; do [[ "$argument" == -* ]] || cat "$argument"; done
+result=""
+for argument in "$@"; do
+  case "$argument" in
+    --result-file=*) result="${argument#--result-file=}" ;;
+    -*) ;;
+    *) if [[ -n "$result" ]]; then
+         cp "$STUB_SOURCE/$argument" "$result$argument"
+         echo "downloaded: $argument" >> "$STUB_LOG"
+       else
+         cat "$argument"
+       fi ;;
+  esac
+done
 """,
     "zstd": """#!/bin/bash
 cat
@@ -76,6 +92,9 @@ def backups(tmp_path: Path) -> dict[str, object]:
         stub = bin_dir / name
         stub.write_text(body, newline="\n")
         stub.chmod(0o755)
+    # The server's own binary log files, for shipping (the stand-in mysqlbinlog reads them).
+    source = tmp_path / "server-binlogs"
+    source.mkdir()
     keys = tmp_path / "keys"
     keys.mkdir()
     (keys / "cert.pem").write_text("not a real certificate")
@@ -92,12 +111,14 @@ def backups(tmp_path: Path) -> dict[str, object]:
         "STUB_SERVER": SERVER,
         "STUB_LOG": str(tmp_path / "stub.log"),
         "STUB_DUMP": "ok",
+        "STUB_SOURCE": str(source),
         "TZ": "UTC",
     }
     return {
         "env": environment,
         "server": tmp_path / "backups" / "servers" / SERVER,
         "log": tmp_path / "stub.log",
+        "source": source,
     }
 
 
@@ -113,11 +134,41 @@ def run(backups: dict[str, object], *arguments: str, **env: str) -> subprocess.C
     )
 
 
-def loaded(backups: dict[str, object]) -> list[str]:
-    """What reached the new server, one line per load."""
+def stub_log(backups: dict[str, object]) -> list[str]:
+    """What the stand-ins were asked to do, one line each."""
     log = backups["log"]
     assert isinstance(log, Path)
     return log.read_text().splitlines() if log.exists() else []
+
+
+def loaded(backups: dict[str, object]) -> list[str]:
+    """What reached the new server, one line per load."""
+    return [line for line in stub_log(backups) if line.startswith("loaded:")]
+
+
+def downloaded(backups: dict[str, object]) -> list[str]:
+    """The binary log files shipping downloaded from the server, by name."""
+    return [line.split(": ", 1)[1] for line in stub_log(backups) if line.startswith("downloaded:")]
+
+
+def on_the_server(backups: dict[str, object], *names: str) -> None:
+    """Binary log files the server still has; the last is the one it is writing."""
+    source = backups["source"]
+    assert isinstance(source, Path)
+    for name in names:
+        (source / name).write_text(binlog("10:30:00"), newline="\n")
+
+
+def checksum_matches(folder: Path, name: str) -> bool:
+    assert BASH is not None
+    return (
+        subprocess.run(  # noqa: S603 (coreutils, a test file)
+            [BASH, "-c", f"cd '{folder.as_posix()}' && sha256sum --quiet -c '{name}.sha256'"],
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 0
+    )
 
 
 def put(folder: Path, name: str, content: str) -> None:
@@ -184,6 +235,67 @@ def test_a_whole_full_backup_is_published_with_its_checksum(backups: dict[str, o
     assert names[0].endswith(".sql.zst.cms")
     assert names[1] == f"{names[0]}.sha256"
     assert (server / "last-full-day").exists()  # freshness, in this server's own folder
+
+
+# Shipping the binary log (second review of #205): a file is skipped only if it was
+# shipped whole, with a checksum that matches it. A run stopped while publishing leaves
+# a part, or a file without its checksum; the next run ships that file again.
+
+
+def test_shipping_publishes_each_closed_file_with_its_checksum(
+    backups: dict[str, object],
+) -> None:
+    on_the_server(backups, "binlog.000003", "binlog.000004")  # 000004 is being written
+    done = run(backups, "binlogs")
+    assert done.returncode == 0, done.stderr
+    assert downloaded(backups) == ["binlog.000003"]
+    server = backups["server"]
+    assert isinstance(server, Path)
+    assert sorted(path.name for path in (server / "binlog").iterdir()) == [
+        "binlog.000003.cms",
+        "binlog.000003.cms.sha256",
+    ]
+    assert checksum_matches(server / "binlog", "binlog.000003.cms")
+
+
+def test_a_file_shipped_whole_is_not_shipped_again(backups: dict[str, object]) -> None:
+    on_the_server(backups, "binlog.000003", "binlog.000004")
+    server = backups["server"]
+    assert isinstance(server, Path)
+    put(server / "binlog", "binlog.000003.cms", binlog("10:30:00"))
+    done = run(backups, "binlogs")
+    assert done.returncode == 0, done.stderr
+    assert downloaded(backups) == []
+
+
+@pytest.mark.parametrize(
+    "left_behind",
+    [
+        "the file without its checksum",
+        "the checksum and the part, stopped before the rename",
+        "a checksum that does not match",
+    ],
+)
+def test_a_file_whose_shipping_was_interrupted_is_shipped_again(
+    backups: dict[str, object], left_behind: str
+) -> None:
+    on_the_server(backups, "binlog.000003", "binlog.000004")
+    server = backups["server"]
+    assert isinstance(server, Path)
+    folder = server / "binlog"
+    put(folder, "binlog.000003.cms", "half of it\n")
+    if left_behind == "the file without its checksum":
+        (folder / "binlog.000003.cms.sha256").unlink()
+    elif left_behind == "the checksum and the part, stopped before the rename":
+        (folder / "binlog.000003.cms").rename(folder / "binlog.000003.cms.part")
+    else:
+        (folder / "binlog.000003.cms").write_text("changed since\n", newline="\n")
+    done = run(backups, "binlogs")
+    assert done.returncode == 0, done.stderr
+    assert downloaded(backups) == ["binlog.000003"]
+    assert (folder / "binlog.000003.cms").read_text() == binlog("10:30:00")
+    assert checksum_matches(folder, "binlog.000003.cms")
+    assert not list(folder.glob("*.part"))
 
 
 # --- Restoring -------------------------------------------------------------------------

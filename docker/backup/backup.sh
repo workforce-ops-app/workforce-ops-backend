@@ -115,10 +115,23 @@ seal() {  # seal <file>
     | openssl cms -encrypt -binary -aes-256-gcm -recip "$BACKUP_CERT" -outform DER -out "$1.part"
 }
 
-# Make a sealed <file>.part a finished backup: renamed in one step, then its checksum.
+# Make a sealed <file>.part a finished backup. The checksum is written first (as
+# <file>.sha256, under the finished file's name) and the file is renamed last, in one
+# step: the rename is the moment the backup exists, so a stop anywhere before it leaves
+# no <file> at all, and the next run makes it again (second review of #205).
 publish() {  # publish <file>
+  local name digest
+  name="$(basename "$1")"
+  digest="$(sha256sum < "$1.part" | cut -d' ' -f1)"
+  printf '%s  %s\n' "$digest" "$name" > "$1.sha256.part"
+  mv "$1.sha256.part" "$1.sha256"
   mv "$1.part" "$1"
-  (cd "$(dirname "$1")" && sha256sum "$(basename "$1")" > "$(basename "$1").sha256")
+}
+
+# Whether <file> is a finished backup: the file, its checksum, and the two agree.
+published() {  # published <file>
+  [[ -f "$1" && -f "$1.sha256" ]] \
+    && (cd "$(dirname "$1")" && sha256sum --quiet -c "$(basename "$1").sha256" >/dev/null 2>&1)
 }
 
 # Check a backup file's checksum, then decrypt and decompress it to standard output.
@@ -189,8 +202,12 @@ ship_binlogs() {
   local current="${names[-1]}"
   for name in "${names[@]}"; do
     [[ "$name" == "$current" ]] && continue
-    [[ -f "$binlog_dir/$name.cms" ]] && continue
     [[ "$name" =~ ^[A-Za-z0-9_.-]+$ ]] || { log "odd binary log name: $name"; exit 1; }
+    # Skipped only if shipped whole: the file and a checksum that matches it (second
+    # review of #205). Anything less (a run stopped while publishing, or a damaged
+    # copy) is shipped again while the server still has the file.
+    published "$binlog_dir/$name.cms" && continue
+    rm -f "$binlog_dir/$name.cms" "$binlog_dir/$name.cms.sha256" "$binlog_dir/$name.cms.sha256.part"
     # --raw writes the file exactly as the server has it.
     mysqlbinlog --defaults-extra-file="$(source_client)" \
       --read-from-remote-server --raw --result-file="$WORK_DIR/" "$name"

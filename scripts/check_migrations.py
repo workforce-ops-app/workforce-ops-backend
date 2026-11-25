@@ -2940,7 +2940,27 @@ def _people_race_problems(engine: Engine) -> list[str]:
 _NO_RIGHT = {1044, 1142, 1143, 1227}
 
 
-def _backup_user_problems(backup_url: str) -> list[str]:
+# Definitions the backup leaves out (docker/backup/backup.sh, full_backup): it takes tables
+# and views only, which is all the database defines.
+_LEFT_OUT_OF_BACKUPS = (
+    (
+        "trigger",
+        "SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()",
+    ),
+    ("event", "SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA = DATABASE()"),
+    (
+        "routine",
+        "SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE()",
+    ),
+)
+
+
+def _left_out_of_backups(connection: Connection) -> list[str]:
+    """The kinds of definition the database has that the backups leave out."""
+    return [kind for kind, sql in _LEFT_OUT_OF_BACKUPS if connection.execute(text(sql)).scalar()]
+
+
+def _backup_user_problems(backup_url: str, admin_url: str) -> list[str]:
     """What the backup user can do that it must not, or cannot that it must (#117).
 
     It reads the database and the binary log (docs/operations/backup-and-restore.md) and
@@ -2948,34 +2968,37 @@ def _backup_user_problems(backup_url: str) -> list[str]:
     which the backups hold anyway, but cannot change or destroy it.
     """
     problems = []
+    # A trigger, event, or routine added later would be left out of every backup without
+    # a word, so it stops the check here. Counted as the migration user (admin_url), not
+    # the backup user: MySQL shows a user only the definitions it has a right to, and the
+    # backup user has no right to these, so it would always count none (second review of
+    # #205). A probe trigger, made and dropped as the migration user, shows the count can
+    # see one.
+    admin = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as connection:
+            problems += [
+                f"the database has a {kind}, which the backups leave out: dump it too"
+                " (backup.sh) and give the backup user the right to read it"
+                for kind in _left_out_of_backups(connection)
+            ]
+            connection.execute(
+                text(
+                    "CREATE TRIGGER backup_inventory_probe BEFORE INSERT ON sessions"
+                    " FOR EACH ROW SET @backup_inventory_probe = 1"
+                )
+            )
+            try:
+                if "trigger" not in _left_out_of_backups(connection):
+                    problems.append(
+                        "the count of definitions the backups leave out missed a trigger"
+                    )
+            finally:
+                connection.execute(text("DROP TRIGGER backup_inventory_probe"))
+    finally:
+        admin.dispose()
     engine = create_engine(backup_url, isolation_level="AUTOCOMMIT")
     try:
-        # The backup takes tables and views only (docker/backup/backup.sh, full_backup),
-        # which is all the database defines; a trigger, event, or routine added later
-        # would be left out of every backup without a word, so it stops the check here.
-        with engine.connect() as connection:
-            for kind, sql in (
-                (
-                    "trigger",
-                    "SELECT COUNT(*) FROM information_schema.TRIGGERS"
-                    " WHERE TRIGGER_SCHEMA = DATABASE()",
-                ),
-                (
-                    "event",
-                    "SELECT COUNT(*) FROM information_schema.EVENTS"
-                    " WHERE EVENT_SCHEMA = DATABASE()",
-                ),
-                (
-                    "routine",
-                    "SELECT COUNT(*) FROM information_schema.ROUTINES"
-                    " WHERE ROUTINE_SCHEMA = DATABASE()",
-                ),
-            ):
-                if connection.execute(text(sql)).scalar():
-                    problems.append(
-                        f"the database has a {kind}, which the backups leave out: dump it"
-                        " too (backup.sh) and give the backup user the right to read it"
-                    )
         # What it must be able to do: read every table, see the binary log, close it.
         with engine.connect() as connection:
             for sql in (
@@ -3220,7 +3243,7 @@ def main() -> int:
         if app_url != url:
             rule_problems += _grant_problems(app_url)
         if backup_url:
-            rule_problems += _backup_user_problems(backup_url)
+            rule_problems += _backup_user_problems(backup_url, url)
         else:
             print("one database user given: the application user's rights are not checked")
     finally:

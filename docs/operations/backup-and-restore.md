@@ -46,7 +46,8 @@ Freshness is kept per server: a server that a backup was restored into has no fu
 
 **What fails safely** (review of #205):
 
-- A full backup is published (renamed from `.part`, then given its checksum) only after `mysqldump` and the encryption have both finished without an error. A dump that stopped halfway leaves nothing behind, and the server is not marked as backed up today.
+- A full backup is published (its checksum written, then the file renamed from `.part`, so the rename is the moment the backup exists) only after `mysqldump` and the encryption have both finished without an error. A dump that stopped halfway leaves nothing behind, and the server is not marked as backed up today.
+- A binary log file counts as shipped only if the file and its checksum are both there and agree (second review of #205). A run stopped while publishing one, or a damaged copy, leaves something less, so the next run ships that file again while the server still has it.
 - A restore checks everything before it writes to the new server, and refuses with `restore refused, nothing was written` if: the full backup's dump did not finish (no `-- Dump completed` at its end); the binary log file the snapshot starts in was never shipped; a binary log file is missing between the first and the last (a gap); or the last file does not reach the `--until` moment (each shipped file ends with the rotation that closed it, so its last event says how far it reaches).
 - If the snapshot's own binary log file never left the server (the server was lost between a full backup and the next shipment), `restore --snapshot-only` restores the full backup alone, to the moment it was taken. It is never chosen without being asked for.
 
@@ -89,7 +90,7 @@ A database restored onto a new server is a new server with a new `server_uuid`: 
    GRANT RELOAD, REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'workforce_backup'@'%';
    ```
 
-   It reads every table and the binary log; `RELOAD` lets it close the binary log and take the brief lock `mysqldump` needs for a consistent snapshot. It can change nothing, definitions included: no `TRIGGER` or `EVENT` right, since both would let it create or drop triggers and events (review of #205). The database defines only tables, so the backup takes tables only, and `scripts/check_migrations.py` fails if a trigger, event, or routine ever appears, which the backups would otherwise leave out. That check also tries what the backup user must and must not be able to do, creating and dropping triggers, events, and procedures included.
+   It reads every table and the binary log; `RELOAD` lets it close the binary log and take the brief lock `mysqldump` needs for a consistent snapshot. It can change nothing, definitions included: no `TRIGGER` or `EVENT` right, since both would let it create or drop triggers and events (review of #205). The database defines only tables, so the backup takes tables only, and `scripts/check_migrations.py` fails if a trigger, event, or routine ever appears, which the backups would otherwise leave out. It looks for them as the migration user, since MySQL hides definitions from a user without rights to them, so the backup user would never see one (second review of #205); a probe trigger shows the check can see one. That check also tries what the backup user must and must not be able to do, creating and dropping triggers, events, and procedures included.
 
    A server set up with the earlier rights takes them away with:
 
