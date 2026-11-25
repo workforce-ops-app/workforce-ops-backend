@@ -1,6 +1,6 @@
 # Announcements
 
-- **Status:** posting, editing, archiving, and the managed list are built (AN1, #154: `app/modules/announcements/`, migration `0014`, the `team` column of `ScopeColumns` in `app/authz/scope.py`); reading, read marks, and the read list follow with AN2 (final demo, [0038](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0038-final-demo-scope.md))
+- **Status:** posting, editing, archiving, and the managed list are built (AN1, #154: `app/modules/announcements/`, migration `0014`, the `team` column of `ScopeColumns` in `app/authz/scope.py`); reading, one announcement, read marks, and the read list are built (AN2, #155, no migration); the demo data follows with AN3 (final demo, [0038](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0038-final-demo-scope.md))
 - **Related:** design workforce-ops-app/workforce-ops-backend#110; backend workforce-ops-app/workforce-ops-backend#120; screens workforce-ops-app/workforce-ops-frontend#65; tracker workforce-ops-app/.github#84; design: [authorization](../architecture/authorization.md), [organization](organization.md)
 
 ## In short
@@ -70,8 +70,9 @@ stateDiagram-v2
 - Archived announcements cannot be edited (409) and are not shown to readers. They are never deleted ([0020](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0020-status-over-deletion.md)).
 
 **Read marks**
-- `POST /announcements/{id}/read` records that the signed-in person has read it. Doing it again changes nothing (still 204). Only people in the audience can mark it (otherwise 404, as if it did not exist for them).
-- The read list (`GET /announcements/{id}/reads`) shows the people in the audience now, each with when they read it, or not yet. Only people whose `announcement.create` covers the audience may see it.
+- `POST /announcements/{id}/read` records that the signed-in person has read it. Doing it again changes nothing (still 204), and the first read time stays. Two marks sent at the same moment are one mark: the database refuses the second, and the request answers 204 once it has seen the first one's mark. If the database refuses the save for any other reason, so the mark is not there, the answer is 500, never a 204 claiming it was saved (review of #158). Only people in the audience of an active announcement can mark it (otherwise 404, as if it did not exist for them), so a manager who covers an audience they are not in cannot mark it read. Two marks sent at the same moment both answer 204 and one mark is kept: the primary key refuses the second, and that refusal is not an error for the person (`scripts/check_migrations.py` tries this race on MySQL).
+- The read list (`GET /announcements/{id}/reads`) shows the people in the audience now, each with when they read it, or not yet. Only people whose `announcement.create` covers the audience may see it. Someone who can read the announcement but does not manage it (an employee) gets 403; for anyone who cannot even read it, it does not exist (404).
+- The read counts, the read list, and the check on one person use one definition of the audience (`_with_audience()` in `repository.py`), so `read_count` and `audience_count` always match the read list. The reader's own list asks the same question from the other end (from one person to their announcements), and a test compares the two for every person and audience.
 - The read list is paged like every other list ([0026](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0026-api-conventions.md)): `?cursor=&limit=`, `limit` 1 to 200 (default 50), in name order (display name, then ID), so a company-wide announcement never answers with everyone at once. The cursor is the last person's ID; if that person is no longer in the audience, the cursor is refused (422), so a cursor cannot be used to learn where someone outside the audience sorts. The totals come from `read_count` and `audience_count` on the announcement, not from counting pages.
 - Reads are not audited: they are a record of the feature, not a security action, and every page view would otherwise grow the audit chain.
 
@@ -90,7 +91,7 @@ stateDiagram-v2
 | `POST /announcements/{id}/read` | in the audience | mark read (204) |
 | `GET /announcements/{id}/reads?cursor=&limit=` | `announcement.create` covering the audience | page through the people in the audience by name, each with when they read it, or not yet |
 
-An announcement in an answer: `id`, `audience` (`{type, department_id, department_name, team_id, team_name}`), `title`, `body`, `author` (`{id, display_name}`), `posted_at`, `edited_at`, `archived`, and for readers `read`, for managers `read_count` and `audience_count`. `audience_count` is the people in the audience now (an archived team's audience is empty); `read_count` is how many of them have read it, so it matches the read list. The managed list's answer to someone whose only `announcement.create` assignment is for an archived department or team is 403, as for any list without a permission.
+An announcement in an answer: `id`, `audience` (`{type, department_id, department_name, team_id, team_name}`; `department_id` is null for a team audience), `title`, `body`, `author` (`{id, display_name}`), `posted_at`, `edited_at`, `archived`, and for readers `read`, for managers `read_count` and `audience_count`. The reader's list answers `{items, next_cursor}` with `read` and no counts. `GET /announcements/{id}` answers `read` for everyone (whether the signed-in person has read it) and `read_count` and `audience_count` when their `announcement.create` covers the audience, null otherwise, so a reader never learns how many others have read it; the people who manage it also see it once archived. The read list answers `{items, next_cursor}`, each item `{id, display_name, read_at}` (`read_at` null: not read yet). `audience_count` is the people in the audience now (an archived team's audience is empty); `read_count` is how many of them have read it, so it matches the read list. The managed list's answer to someone whose only `announcement.create` assignment is for an archived department or team is 403, as for any list without a permission.
 
 **Table: `announcements`** (feature table)
 
@@ -136,7 +137,9 @@ A `CHECK` keeps the audience columns consistent: exactly the ID its type needs, 
 
 Scope tests for the filter, added with AN1: for every pair of an assignment (company, each department, each team) and an announcement (company, department, team, team of another department), the managed list contains the announcement exactly when `authorize()` allows it; a department assignment lists its teams' announcements; a team assignment lists neither its department's announcements nor another team's; a team audience whose team or department is archived is listed for nobody below company scope ([organization](organization.md#states-and-rules)).
 
-**Audience filter:** the reader's list is limited in the database to the company, the reader's home department, and the teams they are on, with the same tenancy filter as every other query ([tenancy](../architecture/tenancy.md)); announcements for other audiences are never loaded.
+**Audience filter:** the reader's list is limited in the database to the company, the reader's home department, and the teams they are on, with the same tenancy filter as every other query ([tenancy](../architecture/tenancy.md)); announcements for other audiences are never loaded. The reader's active teams (and whether their home department is active) are looked up first, because the company filter refuses subqueries; the list then asks for `team_id IN (those teams)`, as the scope filter does. One query joins each announcement to its author, its department and team names, and the reader's own read mark (`list_for_reader()` in `repository.py`, explained there for the presentation). A test counts the rows the query returns for one reader in a company with many audiences.
+
+The audience is worked out the same way everywhere: deactivated people are in no audience, an archived team reaches nobody, and so does an archived department. The organization rules already keep an archived department empty, so the last is a second guard; the read counts check it too.
 
 ### Demo data
 
@@ -162,6 +165,8 @@ The seed script adds, in each demo company, through the same service the applica
 - An archived department's announcements reach nobody.
 - The managed list agrees with `authorize()` for every assignment and audience pair (the scope tests under Managed list filter).
 - The read list answers at most 200 people per page, refuses a larger `limit` (422), and refuses a cursor naming someone outside the audience (422).
+- A deactivated person, someone taken off a team, and everyone in an archived department or team are in no audience; archived announcements disappear for readers; read marks cannot point across companies.
+- The reader's list query returns only the reader's announcements, in a company with many audiences.
 
 ### Slices
 
