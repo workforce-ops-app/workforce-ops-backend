@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 
 import app.modules.roles.approval  # noqa: F401  (registers what role requests do on approval)
 from app.auth.dependencies import Database, SignedInPerson
+from app.authz.check import Forbidden, authorize
 from app.authz.delegation import above_every_holder
 from app.authz.models import Role, RoleAssignment
 from app.modules.approval_requests.schemas import ApprovalRequestOut, shown
@@ -46,11 +47,30 @@ roles = APIRouter(prefix="/api/roles", tags=["roles"])
 role_assignments = APIRouter(prefix="/api/role-assignments", tags=["roles"])
 
 
-def _role(db: Database, viewer: User, role: Role, codes: list[str]) -> RoleOut:
-    """A role in the answer shape, with whether the viewer may change it (the same rule as
-    service._changeable_role, minus the permission, which the screen checks itself)."""
+def _may_manage(db: Database, viewer: User) -> bool:
+    """Whether the viewer holds role.manage (ordinary reads; worked out once per answer)."""
+    try:
+        authorize(db, viewer, "role.manage")
+    except Forbidden:
+        return False
+    return True
+
+
+def _role(
+    db: Database, viewer: User, role: Role, codes: list[str], *, may_manage: bool | None = None
+) -> RoleOut:
+    """A role in the answer shape, with whether the viewer may change it: the same rule as
+    service._changeable_role (role.manage, not Owner, not archived, above every holder;
+    review of #171), on ordinary reads, since an answer takes no row locks."""
     archived = role.archived_at is not None
-    changeable = role.built_in != "owner" and not archived and above_every_holder(db, viewer, role)
+    if may_manage is None:
+        may_manage = _may_manage(db, viewer)
+    changeable = (
+        may_manage
+        and role.built_in != "owner"
+        and not archived
+        and above_every_holder(db, viewer, role, fresh=False)
+    )
     return RoleOut(
         id=role.id,
         name=role.name,
@@ -73,11 +93,10 @@ def list_permissions(current: SignedInPerson, db: Database) -> PermissionList:
 
 @roles.get("")
 def list_roles(current: SignedInPerson, db: Database) -> RoleList:
+    found = service.list_roles(db, current.user)
+    may_manage = _may_manage(db, current.user)
     return RoleList(
-        items=[
-            _role(db, current.user, role, codes)
-            for role, codes in service.list_roles(db, current.user)
-        ]
+        items=[_role(db, current.user, role, codes, may_manage=may_manage) for role, codes in found]
     )
 
 

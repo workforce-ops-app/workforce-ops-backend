@@ -20,8 +20,9 @@ from sqlalchemy import select
 from app.audit import Actor
 from app.authz import registry
 from app.authz.chain import add_reporting_line
-from app.authz.models import Role
+from app.authz.models import Role, RolePermission
 from app.authz.registry import Kind, PermissionDef
+from app.authz.roles import assign_role
 from tests.people_data import actions, people
 from tests.shift_data import PASSWORD, ShiftSetup, iso, shifts, soon
 
@@ -196,6 +197,35 @@ def test_each_role_says_whether_you_may_change_it(people: ShiftSetup) -> None:
     # An owner may change every role but Owner.
     may = {k: r["you_may_change"] for k, r in roles_by_kind(people.browser("owner")).items()}
     assert may == {"owner": False, "administrator": True, "manager": True, "employee": True}
+
+
+def test_without_role_manage_no_role_says_you_may_change_it(people: ShiftSetup) -> None:
+    # Review of #171: role.view alone shows roles but changes none, so the answer must
+    # not offer changes, even for a role held only below the viewer.
+    with people.db() as db:
+        viewer = Role(name="Role viewer")
+        db.add(viewer)
+        db.flush()
+        db.add(RolePermission(role_id=viewer.id, permission_code="role.view"))
+        assign_role(
+            db, Actor.system(), user_id=people.ids["chef"], role=viewer, scope_type="company"
+        )
+        # A role held only by ana, who is below chef.
+        below = Role(name="Below chef")
+        db.add(below)
+        db.flush()
+        db.add(RolePermission(role_id=below.id, permission_code="schedule.view_self"))
+        assign_role(db, Actor.system(), user_id=people.ids["ana"], role=below, scope_type="company")
+        db.commit()
+    chef = people.browser("chef")
+    listed = roles_by_kind(chef)
+    assert listed["Below chef"]["you_may_change"] is False
+    assert not any(role["you_may_change"] for role in listed.values())
+    one = chef.get(f"/api/roles/{listed['Below chef']['id']}")
+    assert one.status_code == 200 and one.json()["you_may_change"] is False
+    # And the change itself is refused, as the field says.
+    renamed = chef.patch(f"/api/roles/{listed['Below chef']['id']}", json={"name": "Renamed"})
+    assert renamed.status_code == 403
 
 
 def test_a_rename_alone_needs_no_reentry(people: ShiftSetup) -> None:
