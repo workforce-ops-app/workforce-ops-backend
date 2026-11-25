@@ -41,6 +41,7 @@ from sqlalchemy.orm import Session
 
 from app.approvals.models import KINDS, ApprovalDecision, ApprovalRequest
 from app.audit import Actor, record
+from app.authz.chain import lock_reporting_lines
 from app.db.base import utcnow
 from app.modules.org.models import User
 
@@ -82,6 +83,11 @@ class Handler:
         enough approvals approve": called after each decision is recorded, it answers
         "approved", "denied", or None (still waiting). Time off uses it to send a
         disagreement up the chain instead of deciding it.
+    lock(db, request): take the feature's own row locks for this request, called by
+        lapse() before it changes the approval record. Time off locks its request row,
+        so every path takes the time-off row first and the approval record after it, as
+        deciding does (review of #167); otherwise a lapse and a decision could each hold
+        one and wait for the other.
     ready(db, request, approvers): whether the approvals so far are enough. Without it,
         `required_approvals` approvals are enough; owner changes instead need every
         current reviewer, worked out again now, so an owner added meanwhile must agree too.
@@ -94,6 +100,7 @@ class Handler:
     lapsed: Callable[[Session, ApprovalRequest], None] | None = None
     outcome: Callable[[Session, ApprovalRequest], str | None] | None = None
     ready: Callable[[Session, ApprovalRequest, set[uuid.UUID]], bool] | None = None
+    lock: Callable[[Session, ApprovalRequest], None] | None = None
 
 
 _handlers: dict[str, Handler] = {}
@@ -200,7 +207,18 @@ def lapse(db: Session, request: ApprovalRequest) -> bool:
     # 1. The quick answer from the copy we have: not overdue means nothing to do.
     if not _overdue(request):
         return False
-    # 2. Claim it: one conditional UPDATE. Declined at the deadline, not at the moment
+    # 2. The locks, in the order a decision takes them (review of #167): the company's
+    #    lock first, then the feature's own rows (Handler.lock), then the approval record
+    #    (the UPDATE below). The company's lock must come first because every audit entry
+    #    refers to the company's row (a foreign key): writing one takes a shared lock on
+    #    that row, so it waits while a decision holds the company's lock. A lapse holding
+    #    the request's rows while it waited would leave the decision waiting on them in
+    #    turn: a deadlock. Only an overdue request gets here, so lists rarely lock.
+    lock_reporting_lines(db)
+    locker = handler_for(request).lock
+    if locker is not None:
+        locker(db, request)
+    # 3. Claim it: one conditional UPDATE. Declined at the deadline, not at the moment
     #    someone happened to look, so the history shows exactly when it ran out of time.
     claimed = db.execute(
         update(ApprovalRequest)
@@ -212,7 +230,7 @@ def lapse(db: Session, request: ApprovalRequest) -> bool:
         .values(status="denied", not_reviewed=True, decided_at=ApprovalRequest.review_by)
         .execution_options(synchronize_session=False)
     )
-    # 3. The copy is read again, so it shows the database's state either way. A locking
+    # 4. The copy is read again, so it shows the database's state either way. A locking
     #    read (FOR SHARE): under MySQL's REPEATABLE READ an ordinary read answers from this
     #    transaction's old snapshot, so the request that lost the race would still see
     #    "pending" after the winner committed the denial. A locking read sees the newest
@@ -220,7 +238,7 @@ def lapse(db: Session, request: ApprovalRequest) -> bool:
     db.refresh(request, with_for_update={"read": True})
     if claimed.rowcount != 1:  # type: ignore[attr-defined]
         return False  # someone else lapsed or decided it first: nothing more to do
-    # 4. Only the request that claimed it writes the audit entry and runs the hook.
+    # 5. Only the request that claimed it writes the audit entry and runs the hook.
     record(
         db,
         actor=Actor.system(),
@@ -306,7 +324,17 @@ def decide(db: Session, user: User, request: ApprovalRequest, decision: str) -> 
         db.flush()  # the kind's rule reads this decision with the others
         result = rule(db, request)
         if result is None:
-            return  # still waiting (or sent up the chain)
+            # Still waiting (or sent up the chain): this decision is audited on its own,
+            # like a first approval of a request needing several (AZ12; review of #167).
+            record(
+                db,
+                actor=Actor.user(user.id),
+                action="approval.denied" if decision == "deny" else "approval.approved",
+                target_type="approval_request",
+                target_id=request.id,
+                details={**details, "final": False},
+            )
+            return
         decision = "deny" if result == "denied" else "approve"
     if decision == "deny":
         request.status, request.decided_at = "denied", now
