@@ -2,21 +2,28 @@
 # Backups and restores of the database (#117, decision 0028,
 # docs/operations/backup-and-restore.md). Runs in the backup image (docker/backup).
 #
-#   backup.sh run       the service: ship the binary log every 5 minutes, a full backup
-#                       every night (and at once if there is none yet), then prune
+#   backup.sh run       the service: ship the binary log every 5 minutes, and on its own
+#                       schedule a full backup every night (and at once if the server has
+#                       none yet), then prune
 #   backup.sh full      one full backup now
+#   backup.sh nightly   a full backup and a prune if the server is due one
 #   backup.sh binlogs   ship the binary log now
 #   backup.sh prune     remove backups past the retention rules
 #   backup.sh list      what there is to restore from
 #   backup.sh restore [--until "YYYY-MM-DD HH:MM:SS"]
 #                       restore into the server at RESTORE_HOST, to the given UTC moment
-#                       (the latest backed-up moment without --until)
+#                       (the latest backed-up moment without --until). Refused, before
+#                       anything is written, if the backups cannot reach that moment
+#   backup.sh restore --snapshot-only
+#                       only the newest full backup, to the moment it was taken: for when
+#                       its binary log never reached the backups
 #
 # What a backup is, in a folder per database server (servers/<server_uuid>/):
 #   full/<time>.sql.zst.cms   mysqldump of the database: one consistent snapshot (a single
 #                             transaction), with the binary log position it was taken at
 #   binlog/<name>.cms         one closed binary log file: every change after a snapshot
 #   *.sha256                  each file's checksum, to notice damage before a restore
+#   last-full-day, last-binlog-ship   when this server last had each (freshness)
 # A folder per server because a server that a backup was restored into is a new server:
 # it numbers its binary log from binlog.000001 again, and those files must not be taken
 # for the old server's files of the same name.
@@ -98,12 +105,18 @@ server_dir() {
 
 # --- Encrypting ------------------------------------------------------------------------
 
-# Compress and encrypt standard input into <file>, written under a temporary name first
-# so a half-written backup never looks finished; then its checksum next to it.
+# Compress and encrypt standard input into <file>.part. Nothing is published here: in
+# "producer | seal", seal cannot know whether the producer finished or failed halfway (a
+# pipeline's status is known only once every part has ended), so the caller publishes
+# the file only after the whole pipeline succeeded (review of #205).
 seal() {  # seal <file>
   [[ -r "$BACKUP_CERT" ]] || { log "no certificate at $BACKUP_CERT"; exit 1; }
   zstd -q -T0 \
     | openssl cms -encrypt -binary -aes-256-gcm -recip "$BACKUP_CERT" -outform DER -out "$1.part"
+}
+
+# Make a sealed <file>.part a finished backup: renamed in one step, then its checksum.
+publish() {  # publish <file>
   mv "$1.part" "$1"
   (cd "$(dirname "$1")" && sha256sum "$(basename "$1")" > "$(basename "$1").sha256")
 }
@@ -119,25 +132,48 @@ unseal() {  # unseal <file>
 # --- Backing up ------------------------------------------------------------------------
 
 full_backup() {
-  local name full_dir
-  full_dir="$(server_dir)/full"
+  local name dir
+  dir="$(server_dir)"
   name="$(date -u +%Y%m%dT%H%M%SZ).sql.zst.cms"
   log "full backup: $name"
   # --single-transaction: one consistent snapshot, without locking the tables while it
   #   reads (all tables are InnoDB).
   # --source-data=2: the binary log position of that snapshot, as a comment at the top;
   #   a restore replays the binary log from exactly there.
-  # --routines --triggers --events: everything else defined in the database.
+  # --skip-triggers, and no --routines or --events: the database defines tables only
+  #   (scripts/check_migrations.py fails if a trigger, event, or routine appears), so the
+  #   backup user needs no TRIGGER or EVENT right, which could change definitions.
   # --hex-blob: binary columns (the UUIDs) as hex, so nothing is changed in transit.
   # --no-tablespaces: tablespaces are server-wide, and the backup user may not read them.
   # --set-gtid-purged=OFF: the server does not use GTIDs, and a restore starts fresh.
-  mysqldump --defaults-extra-file="$(source_client)" \
-    --single-transaction --source-data=2 --routines --triggers --events \
+  # Published only if mysqldump and the sealing all succeeded (pipefail): a dump that
+  # stopped halfway leaves no backup behind, only its .part, which is removed.
+  if ! mysqldump --defaults-extra-file="$(source_client)" \
+    --single-transaction --source-data=2 --skip-triggers \
     --hex-blob --no-tablespaces --set-gtid-purged=OFF \
     --databases "$MYSQL_DATABASE" \
-    | seal "$full_dir/$name"
-  date -u +%Y-%m-%d > "$STATE_DIR/last-full-day"
-  log "full backup done: $name ($(stat -c %s "$full_dir/$name") bytes)"
+    | seal "$dir/full/$name"; then
+    rm -f "$dir/full/$name.part"
+    log "full backup failed: $name not kept"
+    exit 1
+  fi
+  publish "$dir/full/$name"
+  date -u +%Y-%m-%d > "$dir/last-full-day"
+  log "full backup done: $name ($(stat -c %s "$dir/full/$name") bytes)"
+}
+
+# The nightly full backup and prune, if this server is due one: none yet (a server a
+# backup was restored into starts with none, so it gets one at once), or none today and
+# it is past FULL_AT_HOUR. Freshness is per server, in its own folder.
+nightly() {
+  local dir today
+  dir="$(server_dir)"
+  today="$(date -u +%Y-%m-%d)"
+  if [[ ! -s "$dir/last-full-day" ]] \
+    || { [[ "$(cat "$dir/last-full-day")" != "$today" ]] && (( $(date -u +%-H) >= FULL_AT_HOUR )); }; then
+    "$0" full
+    "$0" prune
+  fi
 }
 
 ship_binlogs() {
@@ -145,8 +181,9 @@ ship_binlogs() {
   # closed file; then download each closed file not shipped yet. The file the server
   # opens next is shipped next time, so at most BINLOG_EVERY seconds of changes are only
   # on the server (the 5 minutes of decision 0028).
-  local binlog_dir names shipped=0
-  binlog_dir="$(server_dir)/binlog"
+  local dir binlog_dir names shipped=0
+  dir="$(server_dir)"
+  binlog_dir="$dir/binlog"
   source_sql "FLUSH BINARY LOGS"
   mapfile -t names < <(source_sql "SHOW BINARY LOGS" | cut -f1)
   local current="${names[-1]}"
@@ -158,10 +195,13 @@ ship_binlogs() {
     mysqlbinlog --defaults-extra-file="$(source_client)" \
       --read-from-remote-server --raw --result-file="$WORK_DIR/" "$name"
     seal "$binlog_dir/$name.cms" < "$WORK_DIR/$name"
+    publish "$binlog_dir/$name.cms"
     rm -f "$WORK_DIR/$name"
     shipped=$((shipped + 1))
   done
-  touch "$STATE_DIR/last-binlog-ship"
+  # Freshness, per server; the health check reads the server being backed up now.
+  touch "$dir/last-binlog-ship"
+  basename "$dir" > "$STATE_DIR/current-server"
   log "binary log shipped: $shipped file(s)"
 }
 
@@ -184,22 +224,31 @@ prune() {
     | sed 's/^/prune: /' >&2
 }
 
+# Shipping the binary log, every BINLOG_EVERY seconds, in a process of its own.
+ship_loop() {
+  while true; do
+    "$0" binlogs || log "ERROR: shipping the binary log failed"
+    sleep "$BINLOG_EVERY"
+  done
+}
+
 run_service() {
   log "started: binary log every ${BINLOG_EVERY}s, full backup daily after ${FULL_AT_HOUR}:00 UTC"
+  # Two schedules, so a long full backup never holds up the binary log, which must leave
+  # the server every 5 minutes (decision 0028; review of #205): shipping runs in its own
+  # process, and this one checks once a minute whether a full backup is due.
+  # Each step runs as its own process ("$0" ...): inside "step || log", bash would stop
+  # treating a failed command as fatal, and a half-done step could look finished. A
+  # failure is logged and tried again next round; the health check turns red if the
+  # binary log has not been shipped for 11 minutes.
+  ship_loop &
+  local shipper=$!
+  trap 'kill "$shipper" 2>/dev/null; rm -rf "$WORK_DIR"' EXIT
   while true; do
-    # Each step runs as its own process: inside "step || log", bash would stop treating
-    # a failed command as fatal, and a half-done step could look finished. A failure is
-    # logged and tried again next round; the health check turns red if the binary log
-    # has not been shipped for 11 minutes.
-    "$0" binlogs || log "ERROR: shipping the binary log failed"
-    local today hour
-    today="$(date -u +%Y-%m-%d)"
-    hour="$(date -u +%-H)"
-    if [[ ! -s "$STATE_DIR/last-full-day" ]] \
-      || { [[ "$(cat "$STATE_DIR/last-full-day")" != "$today" ]] && (( hour >= FULL_AT_HOUR )); }; then
-      { "$0" full && "$0" prune; } || log "ERROR: the full backup failed"
-    fi
-    sleep "$BINLOG_EVERY"
+    # If shipping ever stopped, stop the service too, so the container restarts it.
+    kill -0 "$shipper" 2>/dev/null || { log "ERROR: the binary log shipping stopped"; exit 1; }
+    "$0" nightly || log "ERROR: the full backup failed"
+    sleep 60
   done
 }
 
@@ -217,12 +266,28 @@ list_backups() {
 
 # --- Restoring -------------------------------------------------------------------------
 
+# The time of the last event in a binary log file, as "YYYY-MM-DD HH:MM:SS" (UTC: the
+# image runs in UTC). A shipped file was closed by FLUSH BINARY LOGS, and its last event
+# is that closing, so this is how far the file reaches. mysqlbinlog prints each event's
+# time as "#YYMMDD HH:MM:SS server id ...", the hour padded with a space.
+log_reaches() {  # log_reaches <plain binary log file>
+  mysqlbinlog "$1" \
+    | sed -n 's/^#\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\) *\([0-9]\{1,2\}\):\([0-9]\{2\}\):\([0-9]\{2\}\) server id.*/20\1-\2-\3 \4:\5:\6/p' \
+    | tail -n 1 \
+    | awk '{ split($2, t, ":"); printf "%s %02d:%s:%s\n", $1, t[1], t[2], t[3] }'
+}
+
+# Refuse a restore: nothing has been written to the new server yet.
+refuse() { log "restore refused, nothing was written: $*"; exit 1; }
+
 restore() {
-  local until=""
+  local until="" snapshot_only=0
   if [[ "${1:-}" == "--until" ]]; then
     until="${2:?--until needs a UTC time, YYYY-MM-DD HH:MM:SS}"
     [[ "$until" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\ [0-9]{2}:[0-9]{2}:[0-9]{2}$ ]] \
       || { log "--until must look like 2026-11-25 14:30:00 (UTC)"; exit 1; }
+  elif [[ "${1:-}" == "--snapshot-only" ]]; then
+    snapshot_only=1
   fi
   : "${RESTORE_HOST:?set RESTORE_HOST: the new, empty server to restore into}"
   : "${RESTORE_PASSWORD:?set RESTORE_PASSWORD}"
@@ -244,31 +309,62 @@ restore() {
   [[ -n "$full" ]] || { log "no full backup before ${until:-now}"; exit 1; }
   log "restore: from $(basename "$full")${until:+, until $until UTC}"
 
-  # 2. Load it. The binary log position it was taken at is in its first lines.
-  local started
-  started="$(date +%s)"
+  # 2. Read it, and check it is whole: mysqldump ends a dump it finished with "-- Dump
+  #    completed". The binary log position it was taken at is in its first lines.
   unseal "$full" > "$WORK_DIR/full.sql"
+  tail -n 1 "$WORK_DIR/full.sql" | grep -q '^-- Dump completed' \
+    || refuse "$(basename "$full") is not a whole dump"
   local position file_name position_number
-  position="$(head -c 65536 "$WORK_DIR/full.sql" | grep -m1 -o "SOURCE_LOG_FILE='[^']*', SOURCE_LOG_POS=[0-9]*")"
-  [[ -n "$position" ]] || { log "no binary log position in $(basename "$full")"; exit 1; }
+  position="$(head -c 65536 "$WORK_DIR/full.sql" | grep -m1 -o "SOURCE_LOG_FILE='[^']*', SOURCE_LOG_POS=[0-9]*")" \
+    || refuse "no binary log position in $(basename "$full")"
   file_name="$(printf '%s' "$position" | sed "s/SOURCE_LOG_FILE='\([^']*\)'.*/\1/")"
   position_number="${position##*=}"
+
+  # 3. The binary log from the snapshot on, checked whole before anything is written
+  #    (review of #205): the snapshot's own file must be there, every file after it with
+  #    no number missing, and the last one must reach the moment asked for. Otherwise
+  #    the restore would end earlier than asked and look as if it had worked.
+  local logs=() reached="" name number expected=""
+  if (( ! snapshot_only )); then
+    for file in "$(dirname "$(dirname "$full")")"/binlog/*.cms; do
+      [[ -e "$file" ]] || continue
+      name="$(basename "$file" .cms)"
+      [[ "$name" < "$file_name" ]] && continue
+      number=$((10#${name##*.}))
+      if [[ -z "$expected" ]]; then
+        [[ "$name" == "$file_name" ]] \
+          || refuse "$file_name, where the snapshot starts, was never shipped (the first file there is $name); use --snapshot-only to restore the full backup alone"
+      elif (( number != expected )); then
+        refuse "the binary log has a gap: $(printf '%s.%06d' "${name%.*}" "$expected") is missing before $name"
+      fi
+      expected=$((number + 1))
+      unseal "$file" > "$WORK_DIR/$name"
+      logs+=("$WORK_DIR/$name")
+    done
+    (( ${#logs[@]} )) \
+      || refuse "$file_name, where the snapshot starts, was never shipped; use --snapshot-only to restore the full backup alone"
+    reached="$(log_reaches "${logs[-1]}")"
+    [[ -n "$reached" ]] || refuse "cannot read how far $(basename "${logs[-1]}") reaches"
+    if [[ -n "$until" && "$until" > "$reached" ]]; then
+      refuse "the backed-up binary log reaches only $reached UTC, before $until; choose an earlier --until, or wait for the next shipment"
+    fi
+  fi
+
+  # 4. Load the full backup.
+  local started
+  started="$(date +%s)"
   mysql --defaults-extra-file="$target" < "$WORK_DIR/full.sql"
   rm -f "$WORK_DIR/full.sql"
   log "restore: full backup loaded in $(( $(date +%s) - started ))s (log position $file_name:$position_number)"
+  if (( snapshot_only )); then
+    log "restore: done, to the moment of $(basename "$full") only (--snapshot-only); next, run the migrate tool, then verify (the runbook's steps 5 and 6)"
+    return
+  fi
 
-  # 3. Replay the binary log from that position to the moment. Only this database's
+  # 5. Replay the binary log from that position to the moment. Only this database's
   #    changes are replayed (--database): the new server has its own users, and the
   #    migrate tool sets the application user's rights afterwards.
   started="$(date +%s)"
-  local logs=()
-  for file in "$(dirname "$(dirname "$full")")"/binlog/*.cms; do
-    [[ -e "$file" ]] || continue
-    name="$(basename "$file" .cms)"
-    [[ "$name" < "$file_name" ]] && continue
-    unseal "$file" > "$WORK_DIR/$name"
-    logs+=("$WORK_DIR/$name")
-  done
   if (( ${#logs[@]} )); then
     # --start-position applies to the first file only, which is the snapshot's file.
     mysqlbinlog --database="$MYSQL_DATABASE" --start-position="$position_number" \
@@ -277,7 +373,7 @@ restore() {
   fi
   rm -f "${logs[@]}"
   log "restore: ${#logs[@]} binary log file(s) replayed in $(( $(date +%s) - started ))s"
-  log "restore: done; next, run the migrate tool, then verify (the runbook's steps 5 and 6)"
+  log "restore: done, to ${until:-$reached} UTC; next, run the migrate tool, then verify (the runbook's steps 5 and 6)"
 }
 
 # --- Command -----------------------------------------------------------------------------
@@ -285,9 +381,10 @@ restore() {
 case "${1:-run}" in
   run) run_service ;;
   full) full_backup ;;
+  nightly) nightly ;;
   binlogs) ship_binlogs ;;
   prune) prune ;;
   list) list_backups ;;
   restore) shift; restore "$@" ;;
-  *) echo "usage: backup.sh run | full | binlogs | prune | list | restore [--until TIME]" >&2; exit 2 ;;
+  *) echo "usage: backup.sh run | full | nightly | binlogs | prune | list | restore [--until TIME | --snapshot-only]" >&2; exit 2 ;;
 esac

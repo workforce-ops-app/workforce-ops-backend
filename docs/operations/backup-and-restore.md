@@ -36,8 +36,21 @@ After a restore, the database is exactly as it was at the chosen moment: every a
 servers/<server_uuid>/full/20261125T020000Z.sql.zst.cms     a full backup (UTC time)
 servers/<server_uuid>/full/20261125T020000Z.sql.zst.cms.sha256
 servers/<server_uuid>/binlog/binlog.000042.cms             one binary log file
-state/last-binlog-ship, state/last-full-day                 for the health check
+servers/<server_uuid>/last-full-day, last-binlog-ship       this server's freshness
+state/current-server                                        the server backed up now (health check)
 ```
+
+Freshness is kept per server: a server that a backup was restored into has no full backup of its own yet, so the service takes one at once, instead of waiting for the night because the old server had one today.
+
+**How the service runs:** two schedules. Shipping the binary log runs in a process of its own, every `BINLOG_EVERY` seconds, so a long full backup never holds it up past the 5 minutes; the other process checks once a minute whether a full backup is due (`backup.sh nightly`), then prunes. If shipping ever stops, the service stops, and Docker restarts it.
+
+**What fails safely** (review of #205):
+
+- A full backup is published (renamed from `.part`, then given its checksum) only after `mysqldump` and the encryption have both finished without an error. A dump that stopped halfway leaves nothing behind, and the server is not marked as backed up today.
+- A restore checks everything before it writes to the new server, and refuses with `restore refused, nothing was written` if: the full backup's dump did not finish (no `-- Dump completed` at its end); the binary log file the snapshot starts in was never shipped; a binary log file is missing between the first and the last (a gap); or the last file does not reach the `--until` moment (each shipped file ends with the rotation that closed it, so its last event says how far it reaches).
+- If the snapshot's own binary log file never left the server (the server was lost between a full backup and the next shipment), `restore --snapshot-only` restores the full backup alone, to the moment it was taken. It is never chosen without being asked for.
+
+`tests/unit/test_backup_script.py` tries each of these with stand-ins for the database tools; the restore drills below try the real ones.
 
 A database restored onto a new server is a new server with a new `server_uuid`: it numbers its binary log from 1 again, so its backups go to a folder of their own and never mix with the old server's files.
 
@@ -72,11 +85,17 @@ A database restored onto a new server is a new server with a new `server_uuid`: 
    ```
    ```sql
    CREATE USER 'workforce_backup'@'%' IDENTIFIED BY '<the same password>';
-   GRANT SELECT, SHOW VIEW, TRIGGER, EVENT ON `workforce_ops`.* TO 'workforce_backup'@'%';
+   GRANT SELECT, SHOW VIEW ON `workforce_ops`.* TO 'workforce_backup'@'%';
    GRANT RELOAD, REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'workforce_backup'@'%';
    ```
 
-   It reads every table and the binary log; `RELOAD` lets it close the binary log and take the brief lock `mysqldump` needs for a consistent snapshot. It can change nothing (`scripts/check_migrations.py` checks that it can and cannot do these things).
+   It reads every table and the binary log; `RELOAD` lets it close the binary log and take the brief lock `mysqldump` needs for a consistent snapshot. It can change nothing, definitions included: no `TRIGGER` or `EVENT` right, since both would let it create or drop triggers and events (review of #205). The database defines only tables, so the backup takes tables only, and `scripts/check_migrations.py` fails if a trigger, event, or routine ever appears, which the backups would otherwise leave out. That check also tries what the backup user must and must not be able to do, creating and dropping triggers, events, and procedures included.
+
+   A server set up with the earlier rights takes them away with:
+
+   ```sql
+   REVOKE TRIGGER, EVENT ON `workforce_ops`.* FROM 'workforce_backup'@'%';
+   ```
 
 4. **Start the service:**
 
@@ -127,7 +146,7 @@ Restoring is the same whether the database was destroyed, damaged by an attacker
      backup restore --until "2026-11-25 14:30:00"
    ```
 
-   Without `--until`, it restores everything backed up. It checks each file's checksum, decrypts it, loads the newest full backup before the moment, then replays the binary log from that backup's position up to the moment. Only this database's changes are replayed: the new server keeps its own users.
+   Without `--until`, it restores everything backed up, and says how far that reaches. It checks each file's checksum, decrypts it, and checks that the backups reach the moment (see "What fails safely" above) before writing anything; then it loads the newest full backup before the moment and replays the binary log from that backup's position up to the moment. Only this database's changes are replayed: the new server keeps its own users. If it refuses because the snapshot's binary log file never left the server, `backup restore --snapshot-only` restores the full backup alone.
 
 5. **Set the application user's rights** (they belong to the server, not the database, so they are not in the backup):
 
@@ -187,6 +206,8 @@ Each drill restored the demo data plus 10,000 signed audit entries (`--bulk 1000
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | 2026-11-25 | 10,373 | 416 KiB | 15.8 s | 25.5 s (2 s / 22 s) | 3.2 s | 5.8 s | **50.3 s** | the database at T: every table's count matches, A there and B not, 3 audit chains verified, the new server's backups kept apart |
 | 2 | 2026-11-25 | 10,373 | 417 KiB | 36.7 s | 26.5 s (2 s / 23 s) | 3.3 s | 6.1 s | **72.6 s** | the same |
+
+After the review changes (#205: publishing only finished backups, the checks of the binary log chain before a restore, the two schedules, and the narrower rights), a third drill ran with the real tools and a smaller load (`--bulk 2000`, 2,388 rows at T): the restore passed its new checks (the snapshot's binary log file there, no gap, the log reaching T) and gave back the database at T, 3 audit chains verified, in 34.9 s in all.
 
 Against decision 0028's targets: the machine part of a restore took **under 75 seconds**, far inside the 4-hour RTO, and nothing before the chosen second was lost. Most of the time goes to starting the new server (which varies with the laptop's load) and to replaying the binary log, which re-applies every change one by one: 5,000 changes took about 22 seconds, so a day with far more changes would make the replay the step to watch. A drill with more data before the full backup and fewer after it restores faster, since loading a full backup is the quick part (2 seconds here). The next drill is due 2026-12-25.
 

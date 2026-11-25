@@ -12,8 +12,10 @@
 #     migrations can grant the application user its rights. Used by Alembic only.
 #   backup user (MYSQL_BACKUP_USER, default workforce_backup), only when
 #     MYSQL_BACKUP_PASSWORD is set (#117, docs/operations/backup-and-restore.md): reads this
-#     database and the binary log, and can change nothing. SELECT, SHOW VIEW, TRIGGER, and
-#     EVENT let mysqldump read every table and definition; RELOAD lets it close the binary
+#     database and the binary log, and can change nothing. SELECT and SHOW VIEW let
+#     mysqldump read every table and view (the database has no triggers, events, or
+#     routines, which check_migrations.py makes sure of, so no TRIGGER or EVENT right: both
+#     would let it change definitions; review of #205); RELOAD lets it close the binary
 #     log and take the brief read lock for a consistent snapshot; REPLICATION CLIENT and
 #     REPLICATION SLAVE let it list and download the binary log files.
 #
@@ -61,7 +63,7 @@ SQL
 if [[ -n "${MYSQL_BACKUP_PASSWORD:-}" ]]; then
   docker_process_sql <<SQL
 CREATE USER '${backup_user}'@'%' IDENTIFIED BY $(sql_string "$MYSQL_BACKUP_PASSWORD");
-GRANT SELECT, SHOW VIEW, TRIGGER, EVENT ON \`${MYSQL_DATABASE}\`.* TO '${backup_user}'@'%';
+GRANT SELECT, SHOW VIEW ON \`${MYSQL_DATABASE}\`.* TO '${backup_user}'@'%';
 GRANT RELOAD, REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO '${backup_user}'@'%';
 SQL
 fi

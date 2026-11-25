@@ -2950,6 +2950,32 @@ def _backup_user_problems(backup_url: str) -> list[str]:
     problems = []
     engine = create_engine(backup_url, isolation_level="AUTOCOMMIT")
     try:
+        # The backup takes tables and views only (docker/backup/backup.sh, full_backup),
+        # which is all the database defines; a trigger, event, or routine added later
+        # would be left out of every backup without a word, so it stops the check here.
+        with engine.connect() as connection:
+            for kind, sql in (
+                (
+                    "trigger",
+                    "SELECT COUNT(*) FROM information_schema.TRIGGERS"
+                    " WHERE TRIGGER_SCHEMA = DATABASE()",
+                ),
+                (
+                    "event",
+                    "SELECT COUNT(*) FROM information_schema.EVENTS"
+                    " WHERE EVENT_SCHEMA = DATABASE()",
+                ),
+                (
+                    "routine",
+                    "SELECT COUNT(*) FROM information_schema.ROUTINES"
+                    " WHERE ROUTINE_SCHEMA = DATABASE()",
+                ),
+            ):
+                if connection.execute(text(sql)).scalar():
+                    problems.append(
+                        f"the database has a {kind}, which the backups leave out: dump it"
+                        " too (backup.sh) and give the backup user the right to read it"
+                    )
         # What it must be able to do: read every table, see the binary log, close it.
         with engine.connect() as connection:
             for sql in (
@@ -2973,6 +2999,12 @@ def _backup_user_problems(backup_url: str) -> list[str]:
             "TRUNCATE TABLE sessions",
             "SELECT authentication_string FROM mysql.user",
             "CREATE USER backup_probe IDENTIFIED BY 'x'",
+            # Definitions (review of #205): no TRIGGER, EVENT, or routine rights. The same
+            # right covers dropping, which cannot be tried without one to drop: "DROP ...
+            # IF EXISTS" of a missing one only gives a note, whatever the rights.
+            "CREATE TRIGGER backup_probe BEFORE INSERT ON sessions FOR EACH ROW SET @x = 1",
+            "CREATE EVENT backup_probe ON SCHEDULE EVERY 1 DAY DO SELECT 1",
+            "CREATE PROCEDURE backup_probe() SELECT 1",
         ):
             with engine.connect() as connection:
                 try:

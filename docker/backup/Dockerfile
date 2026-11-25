@@ -40,7 +40,7 @@ WORKDIR /backups
 
 # Healthy while the binary log has been shipped in the last 11 minutes.
 HEALTHCHECK --interval=60s --timeout=5s --start-period=60s \
-    CMD ["sh", "-c", "find /backups/state/last-binlog-ship -mmin -11 | grep -q ."]
+    CMD ["sh", "-c", "find \"/backups/servers/$(cat /backups/state/current-server)/last-binlog-ship\" -mmin -11 | grep -q ."]
 
 ENTRYPOINT ["/usr/local/bin/backup.sh"]
 CMD ["run"]
