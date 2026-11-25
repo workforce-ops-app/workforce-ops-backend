@@ -209,7 +209,7 @@ Built in `app/modules/roles/` (rules in `service.py`, the delegation checks in `
 | Endpoint | Needs | What it does |
 |---|---|---|
 | `GET /api/permissions` | `role.view` | every permission a role can grant, with its kind and description |
-| `GET /api/roles`, `GET /api/roles/{id}` | `role.view` | the company's roles, archived ones included, with what each grants and `you_may_change` (false for Owner and archived roles, otherwise AZ13 for the viewer; the screen offers changes only where it is true, #170) |
+| `GET /api/roles`, `GET /api/roles/{id}` | `role.view` | the company's roles, archived ones included, with what each grants and `you_may_change` (false without `role.manage`, and for Owner and archived roles, otherwise AZ13 for the viewer, on ordinary reads; the screen offers changes only where it is true, #170) |
 | `POST /api/roles` `{name, permissions}` | `role.manage`; only permissions you hold (AZ3) | create a role; nobody holds it yet |
 | `PATCH /api/roles/{id}` `{name?, permissions?}` | `role.manage`; above every holder (AZ13); added permissions you hold (AZ3); password re-entry when what it grants changes | rename, or replace what it grants |
 | `POST /api/roles/{id}/archive` | as for a change, with password re-entry | the role grants nothing from now on, and cannot be changed again |
