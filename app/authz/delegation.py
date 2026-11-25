@@ -26,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.authz.chain import is_above_in_chain_fresh
-from app.authz.check import effective_permissions, grants, is_owner
+from app.authz.check import effective_permissions, grants, is_above, is_owner
 from app.authz.models import Role, RoleAssignment, RolePermission
 from app.authz.registry import all_permissions
 from app.authz.scope import Scope, covers, person_scope
@@ -187,3 +187,13 @@ def is_same_level(
     mine = set(effective_permissions(db, user, fresh=fresh))
     mine_here = held_for(db, user, mine, scope, fresh=fresh)
     return mine_here <= codes
+
+
+def is_above_fresh(db: Session, user: User, person: User) -> bool:
+    """Whether the user is above the person, on fresh reads, for checks made after the
+    company's lock: an owner always; anyone else through current lines (a line ended while
+    the request waited counts). Nobody is above themselves.
+
+    The user's own row and owner role are read fresh too (check.is_above with fresh=True):
+    an owner removed, or a user deactivated, while the request waited is above nobody."""
+    return is_above(db, user, person, fresh=True)

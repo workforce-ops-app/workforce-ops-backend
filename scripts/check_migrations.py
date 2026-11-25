@@ -22,10 +22,12 @@
    they waited (grants, the actor's own access, the role limit), and so do giving and
    removing roles (the giver's access, the role's grants and state, the person's place,
    the same-level rule), and so do approval decisions (the reviewer's access, the
-   requested role's grants and state), and an overdue request noticed by two requests
-   lapses once, with both seeing it declined. SQLite has no row locks, so this too can
-   only be tried on MySQL. They run as the application user, so they also show its
-   rights are enough for the app's own writes and locking reads.
+   requested role's grants and state), and so do reporting line changes (the actor's
+   reporting_line.manage, each person's place and active status), and an overdue
+   request noticed by two requests lapses once, with both seeing it declined. SQLite
+   has no row locks, so this too can only be tried on MySQL. They run as the
+   application user, so they also show its rights are enough for the app's own writes
+   and locking reads.
 6. The application user's rights (_grant_problems, #43): created by the same first-start
    script Docker Compose uses (docker/mysql/init/01-users.sh) and granted by the
    migrations (app/db/grants.py), it cannot change the structure, cannot change or
@@ -305,6 +307,7 @@ def _race_problems(url: str) -> list[str]:
     try:
         return (
             _reporting_line_race_problems(engine)
+            + _line_authz_race_problems(engine)
             + _shift_race_problems(engine)
             + _org_race_problems(engine)
             + _people_race_problems(engine)
@@ -321,8 +324,8 @@ def _race_problems(url: str) -> list[str]:
 def _reporting_line_race_problems(engine: Engine) -> list[str]:
     """Two requests changing reporting lines at the same moment; return what failed.
 
-    add_reporting_line() locks the company first and then checks with fresh, locking
-    reads (app/authz/chain.py).
+    add_reporting_line() and end_reporting_line() lock the company first and then check
+    with fresh, locking reads (app/authz/chain.py).
     """
     import threading
 
@@ -330,7 +333,12 @@ def _reporting_line_race_problems(engine: Engine) -> list[str]:
     from sqlalchemy.orm import Session
 
     from app.audit import Actor
-    from app.authz.chain import ReportingLineError, add_reporting_line, lock_reporting_lines
+    from app.authz.chain import (
+        ReportingLineError,
+        add_reporting_line,
+        end_reporting_line,
+        lock_reporting_lines,
+    )
     from app.authz.models import ReportingLine
     from app.modules.org.models import Company, Department, User
     from app.tenancy.context import set_company
@@ -395,7 +403,28 @@ def _reporting_line_race_problems(engine: Engine) -> list[str]:
     if not refused_after_late_commit(("b", "c"), ("c", "b")):
         problems.append("a reporting line loop committed meanwhile was not seen")
 
-    # 3. Two changes in one company take turns: while request 1 holds the company lock,
+    # 3. One line ended by two requests (#56): the second must see that it has ended,
+    # not end it twice. Line a -> b was added in race 1.
+    with session() as db:
+        line_ab = db.scalars(
+            select(ReportingLine.id).where(
+                ReportingLine.manager_id == ids["a"],
+                ReportingLine.employee_id == ids["b"],
+                ReportingLine.ended_at.is_(None),
+            )
+        ).one()
+    with session() as request_2:
+        request_2.scalars(select(ReportingLine)).all()  # its view is now fixed
+        with session() as request_1:
+            end_reporting_line(request_1, Actor.system(), line_ab)
+            request_1.commit()
+        try:
+            end_reporting_line(request_2, Actor.system(), line_ab)
+            problems.append("a reporting line ended meanwhile was ended a second time")
+        except ReportingLineError:
+            pass
+
+    # 4. Two changes in one company take turns: while request 1 holds the company lock,
     # request 2 (in another thread) must wait, and go ahead once request 1 commits.
     # Request 1 only takes the lock and writes nothing: adding a line also locks the
     # audit log's chain head, which would make request 2 wait even without the
@@ -421,6 +450,216 @@ def _reporting_line_race_problems(engine: Engine) -> list[str]:
     waiting.join(timeout=30)
     if waiting.is_alive() or errors:
         problems.append(f"the waiting reporting line change did not finish: {errors}")
+    return problems
+
+
+def _line_authz_race_problems(engine: Engine) -> list[str]:
+    """Adding and ending reporting lines while another request changed who may do it;
+    return what failed (review of #164).
+
+    add_line() and end_line() take the company's lock, then check everything again on
+    fresh reads: the actor's reporting_line.manage over both people, each person's place
+    in its scope, the place above each, and for a new line that both are still active
+    (app/modules/reporting_lines/service.py, top of the file). Each check below fixes
+    request 2's view first (ordinary reads, as its session and permission checks make),
+    lets request 1 commit a change, and then runs request 2's change through the service.
+    Request 2's checks before the lock still see the old view, so only the ones after the
+    lock can catch the change:
+
+    1. A person deactivated meanwhile: no new line for them (409).
+    2. A person moved meanwhile to a department outside the actor's grant: refused (403).
+    3. The actor's reporting_line.manage taken away meanwhile: adding is refused (403).
+    4. The same, for ending a line: refused (403).
+
+    The service commits when it goes ahead, so a check that wrongly passes leaves its
+    line behind: each check uses its own employee, so it cannot change the next one.
+    """
+    from sqlalchemy import delete, select, update
+    from sqlalchemy.orm import Session
+
+    from app.audit import Actor
+    from app.auth.models import UserSession
+    from app.authz.chain import add_reporting_line
+    from app.authz.check import Forbidden
+    from app.authz.models import ReportingLine, Role, RoleAssignment
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.db.base import utcnow
+    from app.modules.org.models import Company, Department, User
+    from app.modules.org.service import Conflict
+    from app.modules.reporting_lines import service as lines
+    from app.modules.reporting_lines.schemas import LineCreate
+    from app.modules.roles import service as role_service
+    from app.modules.roles.schemas import RoleCreate
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    # A company of its own, made by platform code (a session with no company).
+    with Session(engine) as platform:
+        company = Company(name="line authorization race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # A sign-in session whose password was just entered again (changing lines needs
+    # it). It is never saved: require_reauth() only looks at its reauth_at.
+    reauthed = UserSession(reauth_at=utcnow())
+
+    # The owner, and a boss above a and the employees b, d, e (one per check) and c, all
+    # in Office; Floor is elsewhere. The line a -> c is there to be ended (check 4).
+    with session() as db:
+        office, floor = Department(name="Office"), Department(name="Floor")
+        db.add_all([office, floor])
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        people = {
+            name: User(
+                email=f"{name}@line-race.example.com",
+                display_name=name,
+                department_id=office.id,
+            )
+            for name in ("owner", "boss", "a", "b", "c", "d", "e")
+        }
+        db.add_all(people.values())
+        db.flush()
+        assign_role(
+            db,
+            Actor.system(),
+            user_id=people["owner"].id,
+            role=roles["owner"],
+            scope_type="company",
+        )
+        for manager, employee in (
+            ("boss", "a"),
+            ("boss", "b"),
+            ("boss", "c"),
+            ("boss", "d"),
+            ("boss", "e"),
+            ("a", "c"),
+        ):
+            add_reporting_line(
+                db, Actor.system(), manager_id=people[manager].id, employee_id=people[employee].id
+            )
+        db.commit()
+        ids = {name: person.id for name, person in people.items()}
+        office_id, floor_id = office.id, floor.id
+
+    def person(db: Session, name: str) -> User:
+        found = db.get(User, ids[name])
+        if found is None:  # made above, in this company
+            raise RuntimeError("a line race probe person is missing")
+        return found
+
+    # The boss's role: reporting_line.manage for Office, made by the owner.
+    with session() as db:
+        manages = role_service.create_role(
+            db,
+            person(db, "owner"),
+            RoleCreate(name="Line keeper", permissions=["reporting_line.manage"]),
+        ).id
+        db.commit()
+
+    def give_boss_the_role() -> None:
+        with session() as db:
+            found = db.get(Role, manages)
+            if found is None:  # made above
+                raise RuntimeError("the line race probe role is missing")
+            assign_role(
+                db,
+                Actor.system(),
+                user_id=ids["boss"],
+                role=found,
+                scope_type="department",
+                scope_id=office_id,
+            )
+            db.commit()
+
+    give_boss_the_role()
+    with session() as db:
+        line_ac = db.scalars(
+            select(ReportingLine.id).where(
+                ReportingLine.manager_id == ids["a"],
+                ReportingLine.employee_id == ids["c"],
+            )
+        ).one()
+
+    def meanwhile(change: object) -> None:
+        """Request 1: one change, committed."""
+        with session() as request_1:
+            request_1.execute(change)  # type: ignore[call-overload]
+            request_1.commit()
+
+    def fixed_view(db: Session) -> User:
+        """Request 2 reads what its permission checks would, so its view is now fixed."""
+        db.scalars(select(RoleAssignment)).all()
+        for name in ("a", "b", "c", "d", "e"):
+            person(db, name)
+        return person(db, "boss")
+
+    def add_a_over(db: Session, boss: User, employee: str) -> None:
+        lines.add_line(
+            db, boss, LineCreate(manager_id=ids["a"], employee_id=ids[employee]), session=reauthed
+        )
+
+    # 1. b deactivated meanwhile.
+    with session() as request_2:
+        boss = fixed_view(request_2)
+        meanwhile(update(User).where(User.id == ids["b"]).values(deactivated_at=utcnow()))
+        try:
+            add_a_over(request_2, boss, "b")
+        except Conflict:
+            pass  # refused: the deactivation was seen
+        else:
+            problems.append("a reporting line was added for a person deactivated meanwhile")
+        request_2.rollback()
+    meanwhile(update(User).where(User.id == ids["b"]).values(deactivated_at=None))
+
+    # 2. d moved meanwhile to Floor, outside the boss's Office grant.
+    with session() as request_2:
+        boss = fixed_view(request_2)
+        meanwhile(update(User).where(User.id == ids["d"]).values(department_id=floor_id))
+        try:
+            add_a_over(request_2, boss, "d")
+        except Forbidden:
+            pass  # refused: the move was seen
+        else:
+            problems.append("a reporting line was added for a person moved out of scope meanwhile")
+        request_2.rollback()
+    meanwhile(update(User).where(User.id == ids["d"]).values(department_id=office_id))
+
+    take_away = delete(RoleAssignment).where(
+        RoleAssignment.user_id == ids["boss"], RoleAssignment.role_id == manages
+    )
+    # 3. The boss's reporting_line.manage taken away, then adding.
+    with session() as request_2:
+        boss = fixed_view(request_2)
+        meanwhile(take_away)
+        try:
+            add_a_over(request_2, boss, "e")
+        except Forbidden:
+            pass  # refused: the boss's current grants were seen
+        else:
+            problems.append("a reporting line was added after reporting_line.manage was taken away")
+        request_2.rollback()
+    give_boss_the_role()
+
+    # 4. The same, then ending a line.
+    with session() as request_2:
+        boss = fixed_view(request_2)
+        request_2.get(ReportingLine, line_ac)
+        meanwhile(take_away)
+        try:
+            lines.end_line(request_2, boss, line_ac, session=reauthed)
+        except Forbidden:
+            pass  # refused: the boss's current grants were seen
+        else:
+            problems.append("a reporting line was ended after reporting_line.manage was taken away")
+        request_2.rollback()
     return problems
 
 
