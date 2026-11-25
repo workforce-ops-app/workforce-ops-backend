@@ -43,9 +43,9 @@ class RoleOut(BaseModel):
     built_in: str | None  # owner, administrator, manager, employee; null for the company's own
     archived: bool
     permissions: list[str]  # sorted codes
-    # Whether the signed-in person may rename, change, or archive it now: never the
-    # Owner role or an archived one, otherwise only when they are above every holder
-    # (AZ13; an owner may change any other role). Worked out by the API, so the
+    # Whether the signed-in person may rename, change, or archive it now: only with
+    # role.manage, never the Owner role or an archived one, and only when they are above
+    # every holder (AZ13; an owner may change any other role). Worked out by the API, so the
     # interface offers changes only where they can work; every change is still checked.
     you_may_change: bool
 
