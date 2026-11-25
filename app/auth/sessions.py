@@ -282,6 +282,18 @@ def load_session(db: Session, cookie: str | None) -> Current | None:
     return Current(user=user, session=session)
 
 
+def has_working_session(db: Session, cookie: str | None) -> bool:
+    """Whether a request's cookie belongs to a session that still works.
+
+    Looked up in a database session of its own, like end_previous_session: load_session
+    binds the session it is given to the cookie's company, even when it then finds the
+    session ended, and a request that goes on to work for another company (company
+    sign-up) must not carry that binding along.
+    """
+    with Session(db.get_bind()) as other:
+        return load_session(other, cookie) is not None
+
+
 def end_previous_session(db: Session, cookie: str | None) -> None:
     """End the session a browser carried before signing in again, if it still works.
 
