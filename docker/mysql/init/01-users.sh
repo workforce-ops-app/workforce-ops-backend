@@ -10,17 +10,25 @@
 #   migrations user (MYSQL_MIGRATIONS_USER, default workforce_migrations): everything on
 #     this one database, including handing out rights there (WITH GRANT OPTION), so the
 #     migrations can grant the application user its rights. Used by Alembic only.
+#   backup user (MYSQL_BACKUP_USER, default workforce_backup), only when
+#     MYSQL_BACKUP_PASSWORD is set (#117, docs/operations/backup-and-restore.md): reads this
+#     database and the binary log, and can change nothing. SELECT, SHOW VIEW, TRIGGER, and
+#     EVENT let mysqldump read every table and definition; RELOAD lets it close the binary
+#     log and take the brief read lock for a consistent snapshot; REPLICATION CLIENT and
+#     REPLICATION SLAVE let it list and download the binary log files.
 #
-# Both passwords come from the environment and are required; nothing is stored here.
+# The passwords come from the environment (the first two are required); nothing is
+# stored here.
 
 : "${MYSQL_DATABASE:?MYSQL_DATABASE must be set}"
 : "${MYSQL_APP_PASSWORD:?MYSQL_APP_PASSWORD must be set}"
 : "${MYSQL_MIGRATIONS_PASSWORD:?MYSQL_MIGRATIONS_PASSWORD must be set}"
 app_user="${MYSQL_APP_USER:-workforce_app}"
 migrations_user="${MYSQL_MIGRATIONS_USER:-workforce_migrations}"
+backup_user="${MYSQL_BACKUP_USER:-workforce_backup}"
 
 # Names go into the SQL text as they are, so only plain names are accepted.
-for name in "$MYSQL_DATABASE" "$app_user" "$migrations_user"; do
+for name in "$MYSQL_DATABASE" "$app_user" "$migrations_user" "$backup_user"; do
   if [[ ! "$name" =~ ^[A-Za-z0-9_]{1,32}$ ]]; then
     echo "not a plain name: $name" >&2
     exit 1
@@ -48,3 +56,12 @@ CREATE USER '${app_user}'@'%' IDENTIFIED BY $(sql_string "$MYSQL_APP_PASSWORD");
 CREATE USER '${migrations_user}'@'%' IDENTIFIED BY $(sql_string "$MYSQL_MIGRATIONS_PASSWORD");
 GRANT ALL PRIVILEGES ON \`${MYSQL_DATABASE}\`.* TO '${migrations_user}'@'%' WITH GRANT OPTION;
 SQL
+
+# The backup user, if a password for it is given.
+if [[ -n "${MYSQL_BACKUP_PASSWORD:-}" ]]; then
+  docker_process_sql <<SQL
+CREATE USER '${backup_user}'@'%' IDENTIFIED BY $(sql_string "$MYSQL_BACKUP_PASSWORD");
+GRANT SELECT, SHOW VIEW, TRIGGER, EVENT ON \`${MYSQL_DATABASE}\`.* TO '${backup_user}'@'%';
+GRANT RELOAD, REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO '${backup_user}'@'%';
+SQL
+fi

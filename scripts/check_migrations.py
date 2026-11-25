@@ -33,6 +33,9 @@
    migrations (app/db/grants.py), it cannot change the structure, cannot change or
    remove audit entries, and can read every table the app uses.
 
+7. The backup user's rights (_backup_user_problems, #117): created by the same script,
+   it can read every table and the binary log, and can change nothing.
+
 The database is a throwaway Docker container (removed afterwards), unless
 MIGRATION_CHECK_DATABASE_URL points at an empty database to use instead. That one URL
 is then used for everything, and step 6 is skipped: it needs the two users.
@@ -102,14 +105,15 @@ def _docker() -> str:
     return path
 
 
-def _start_mysql() -> tuple[str, str, str]:
-    """Start an empty MySQL container with the two users, as Docker Compose creates them.
+def _start_mysql() -> tuple[str, str, str, str]:
+    """Start an empty MySQL container with the three users, as Docker Compose creates them.
 
-    Returns the container's name, the migrations user's URL, and the application user's.
+    Returns the container's name and the URLs of the migrations, application, and backup
+    users.
     """
     name = f"workforce-ops-migration-check-{secrets.token_hex(4)}"
     # Throwaway passwords, never stored. Hex only, so they fit in a URL as they are.
-    root, app, migrations = (secrets.token_hex(16) for _ in range(3))
+    root, app, migrations, backup = (secrets.token_hex(16) for _ in range(4))
     port = _free_port()
     # Every argument is fixed or generated here; nothing comes from user input.
     subprocess.run(  # noqa: S603
@@ -121,6 +125,7 @@ def _start_mysql() -> tuple[str, str, str]:
             "--env", "MYSQL_DATABASE=migration_check",
             "--env", f"MYSQL_APP_PASSWORD={app}",
             "--env", f"MYSQL_MIGRATIONS_PASSWORD={migrations}",
+            "--env", f"MYSQL_BACKUP_PASSWORD={backup}",
             MYSQL_IMAGE,
         ],
         check=True,
@@ -131,6 +136,7 @@ def _start_mysql() -> tuple[str, str, str]:
         name,
         f"mysql+pymysql://workforce_migrations:{migrations}@{address}",
         f"mysql+pymysql://workforce_app:{app}@{address}",
+        f"mysql+pymysql://workforce_backup:{backup}@{address}",
     )
 
 
@@ -2827,6 +2833,51 @@ def _people_race_problems(engine: Engine) -> list[str]:
 _NO_RIGHT = {1044, 1142, 1143, 1227}
 
 
+def _backup_user_problems(backup_url: str) -> list[str]:
+    """What the backup user can do that it must not, or cannot that it must (#117).
+
+    It reads the database and the binary log (docs/operations/backup-and-restore.md) and
+    changes nothing: a break-in that takes the backup tool's password can copy the data,
+    which the backups hold anyway, but cannot change or destroy it.
+    """
+    problems = []
+    engine = create_engine(backup_url, isolation_level="AUTOCOMMIT")
+    try:
+        # What it must be able to do: read every table, see the binary log, close it.
+        with engine.connect() as connection:
+            for sql in (
+                "SELECT COUNT(*) FROM audit_events",
+                "SELECT COUNT(*) FROM users",
+                "SHOW BINARY LOGS",
+                "SHOW BINARY LOG STATUS",
+                "FLUSH BINARY LOGS",
+            ):
+                try:
+                    connection.execute(text(sql))
+                except DBAPIError as error:
+                    problems.append(f"the backup user cannot run {sql}: {error.orig}")
+        # What it must not: change data or structure, read other users' passwords.
+        for sql in (
+            "INSERT INTO audit_chain_heads (chain_id, last_seq) VALUES (0x00, 0)",
+            "UPDATE users SET display_name = display_name",
+            "DELETE FROM sessions",
+            "CREATE TABLE backup_probe (id INT)",
+            "DROP TABLE shifts",
+            "TRUNCATE TABLE sessions",
+            "SELECT authentication_string FROM mysql.user",
+            "CREATE USER backup_probe IDENTIFIED BY 'x'",
+        ):
+            with engine.connect() as connection:
+                try:
+                    connection.execute(text(sql))
+                except DBAPIError:
+                    continue
+                problems.append(f"the backup user may run {sql}")
+    finally:
+        engine.dispose()
+    return problems
+
+
 def _grant_problems(app_url: str) -> list[str]:
     """What the application user can do that it must not, or cannot that it must.
 
@@ -2891,9 +2942,9 @@ def main() -> int:
     container = None
     url = os.environ.get("MIGRATION_CHECK_DATABASE_URL", "")
     # With MIGRATION_CHECK_DATABASE_URL, one user does both jobs.
-    app_url = url
+    app_url, backup_url = url, ""
     if not url:
-        container, url, app_url = _start_mysql()
+        container, url, app_url, backup_url = _start_mysql()
     try:
         _wait_until_ready(url)
         # migrations/env.py reads the URLs from the app settings: each address goes in its
@@ -2917,6 +2968,8 @@ def main() -> int:
         # Last, as a refused change that got through could leave the database broken.
         if app_url != url:
             rule_problems += _grant_problems(app_url)
+        if backup_url:
+            rule_problems += _backup_user_problems(backup_url)
         else:
             print("one database user given: the application user's rights are not checked")
     finally:
@@ -2938,7 +2991,7 @@ def main() -> int:
     where = "a fresh MySQL 8.4" if container else "MIGRATION_CHECK_DATABASE_URL"
     print(
         f"one head ({heads[0]}); upgrade, downgrade, upgrade passed on {where}; "
-        "models match; database rules and the application user's rights hold"
+        "models match; database rules and the application and backup users' rights hold"
     )
     return 0
 
