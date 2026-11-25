@@ -16,8 +16,12 @@ on, so changing them is as strict as changing roles:
 - Both need the password entered again (decision 0025), and both are audited (AZ12).
 
 Changes take turns through the company's lock (chain.lock_reporting_lines), always taken
-before any audit entry; after it, "above both" is checked again on fresh reads, so a line
-ended or a role taken away while this request waited counts.
+before any audit entry. After it, everything is checked again on fresh reads (locking reads;
+under MySQL's REPEATABLE READ an ordinary read would answer from before the wait): the
+actor still holds reporting_line.manage over both people, both are still in its scope, the
+actor is still above both, and for a new line both people are still active. So a line
+ended, a role taken away, a person moved, or a person deactivated while this request waited
+all count (review of #164).
 """
 
 import uuid
@@ -34,8 +38,7 @@ from app.authz.chain import (
     end_reporting_line,
     lock_reporting_lines,
 )
-from app.authz.check import Forbidden, authorize
-from app.authz.delegation import is_above_fresh
+from app.authz.check import authorize
 from app.authz.models import ReportingLine
 from app.modules.org import repository
 from app.modules.org.models import User
@@ -74,21 +77,30 @@ def _both(
     return manager, employee
 
 
-def _still_above_both(db: Session, user: User, manager: User, employee: User) -> None:
-    """After the company's lock, on fresh reads (the top of this file)."""
-    if not (is_above_fresh(db, user, manager) and is_above_fresh(db, user, employee)):
-        raise Forbidden()
+def _still_allowed(db: Session, user: User, manager: User, employee: User) -> None:
+    """After the company's lock, the whole check again on fresh reads (the top of this
+    file): the permission, each person's scope, and the place above each. authorize()
+    with fresh=True also refreshes the two User copies, so their status is current after
+    this."""
+    authorize(db, user, PERMISSION, manager, fresh=True)
+    authorize(db, user, PERMISSION, employee, fresh=True)
+
+
+def _check_active(manager: User, employee: User) -> None:
+    """Deactivated people get no new lines (the top of this file)."""
+    if manager.deactivated_at is not None or employee.deactivated_at is not None:
+        raise Conflict("This person is deactivated.")
 
 
 def add_line(db: Session, user: User, body: LineCreate, *, session: UserSession) -> ReportingLine:
     """The employee now reports to the manager."""
     authorize(db, user, PERMISSION)  # anywhere at all, before looking anyone up
     manager, employee = _both(db, user, body.manager_id, body.employee_id)
-    if manager.deactivated_at is not None or employee.deactivated_at is not None:
-        raise Conflict("This person is deactivated.")
+    _check_active(manager, employee)  # early, so the answer comes before the password
     require_reauth(session)
     lock_reporting_lines(db)
-    _still_above_both(db, user, manager, employee)
+    _still_allowed(db, user, manager, employee)
+    _check_active(manager, employee)  # again: either may have been deactivated meanwhile
     try:
         line = add_reporting_line(
             db, Actor.user(user.id), manager_id=manager.id, employee_id=employee.id
@@ -108,7 +120,7 @@ def end_line(db: Session, user: User, line_id: uuid.UUID, *, session: UserSessio
     manager, employee = _both(db, user, found.manager_id, found.employee_id)
     require_reauth(session)
     lock_reporting_lines(db)
-    _still_above_both(db, user, manager, employee)
+    _still_allowed(db, user, manager, employee)
     try:
         line = end_reporting_line(db, Actor.user(user.id), line_id)
     except ReportingLineError as error:

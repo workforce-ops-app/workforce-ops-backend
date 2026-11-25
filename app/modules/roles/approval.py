@@ -120,7 +120,7 @@ def reviewers(db: Session, request: ApprovalRequest, *, fresh: bool = False) -> 
             return able
         seen |= level
         level = direct_managers_fresh(db, level) - seen
-    return active_owners(db) - {request.requested_by, request.subject_user_id}
+    return active_owners(db, fresh=fresh) - {request.requested_by, request.subject_user_id}
 
 
 def sensitive(db: Session, request: ApprovalRequest) -> bool:
