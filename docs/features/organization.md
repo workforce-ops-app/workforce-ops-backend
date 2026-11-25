@@ -195,7 +195,7 @@ Lock order: the platform chain's head first, then the new company's rows (which 
 | `GET /approval-requests` | signed in | requests you made and requests waiting for you |
 | `POST /approval-requests/{id}/approve`, `.../deny`, `.../cancel` | the eligible approver, or the requester for cancel | decide or withdraw |
 
-A person in an answer: `id`, `display_name`, `email`, `department_id`, `team_ids` (archived teams included), `status` (`invited`, `active`, or `deactivated`), and `locked`. Never the password hash or the count of wrong passwords.
+A person in an answer: `id`, `display_name`, `email`, `department_id`, `team_ids` (archived teams included), `status` (`invited`, `active`, or `deactivated`), `locked`, and `you_are_above`: whether the signed-in person is above them (the Owner is above everyone but themselves; anyone else above the people below them through reporting lines; worked out once per page of people). `you_are_above` is a hint for the interface, which shows action buttons only for people the user is above (#168); every action is still checked by the API. Never the password hash or the count of wrong passwords.
 
 Setup and reset links are on the [authentication](../architecture/authentication.md#endpoints) page.
 

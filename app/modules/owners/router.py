@@ -44,7 +44,7 @@ def _owners(db: Database, user: User) -> OwnerList:
 def _answer(db: Database, user: User, proposed: service.Proposed) -> OwnerList | JSONResponse:
     if proposed.request is not None:
         return JSONResponse(
-            status_code=202, content=shown(proposed.request).model_dump(mode="json")
+            status_code=202, content=shown(db, proposed.request).model_dump(mode="json")
         )
     return _owners(db, user)
 

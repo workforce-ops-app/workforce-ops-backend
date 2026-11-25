@@ -45,6 +45,7 @@ every other permission check.
 """
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
@@ -52,7 +53,7 @@ from sqlalchemy.orm import Session
 from app.audit import Actor, record
 from app.auth.models import UserSession
 from app.auth.reauth import require_reauth
-from app.authz.chain import add_reporting_line, lock_reporting_lines
+from app.authz.chain import add_reporting_line, lock_reporting_lines, people_below
 from app.authz.check import (
     Forbidden,
     authorize,
@@ -134,6 +135,23 @@ def view_person(db: Session, user: User, person_id: uuid.UUID) -> User:
     if person.id != user.id:
         authorize(db, user, "user.view", person)
     return person
+
+
+# Whether the viewer is above a person, by the person's ID (a display hint: see above_test).
+Above = Callable[[uuid.UUID], bool]
+
+
+def above_test(db: Session, viewer: User) -> Above:
+    """Answers "is the viewer above this person?" for any number of people, from one
+    question to the database: the Owner is above everyone but themselves, anyone else above
+    the people below them through reporting lines (check.is_above, asked once for a whole
+    page). Only a hint for the interface: every action checks again on its own."""
+    if viewer.deactivated_at is not None:
+        return lambda person_id: False
+    if is_owner(db, viewer):
+        return lambda person_id: person_id != viewer.id
+    below = people_below(db, viewer.id)
+    return lambda person_id: person_id in below
 
 
 def teams_of(db: Session, people: list[User]) -> dict[uuid.UUID, list[uuid.UUID]]:

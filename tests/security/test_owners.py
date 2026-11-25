@@ -191,3 +191,21 @@ def test_an_owner_removed_while_a_request_waits_is_no_longer_needed(people: Shif
     # not reviewed; the proposer can send it again. It never makes ana an owner unasked.
     assert owner.get(request).json()["status"] == "pending"
     assert owners(people) == ids(people, "owner", "admin")
+
+
+def test_reviewers_leave_out_owners_who_already_approved(people: ShiftSetup) -> None:
+    # Review of #169: "reviewers" is who may decide the request now, so an owner who
+    # approved a request still waiting for others is no longer listed.
+    three_owners(people)  # owner, admin, chef
+    owner = reenter(people.browser("owner"))
+    asked = owner.post(URL, json={"user_id": str(people.ids["ana"])})
+    assert asked.status_code == 202
+    listed = {uuid.UUID(r["id"]) for r in asked.json()["reviewers"]}
+    assert listed == ids(people, "admin", "chef")
+    request = f"/api/approval-requests/{asked.json()['id']}"
+    partly = reenter(people.browser("admin")).post(f"{request}/approve")
+    assert partly.status_code == 200 and partly.json()["status"] == "pending"
+    assert {uuid.UUID(r["id"]) for r in partly.json()["reviewers"]} == ids(people, "chef")
+    # The requester sees the same.
+    seen = owner.get(request).json()["reviewers"]
+    assert {uuid.UUID(r["id"]) for r in seen} == ids(people, "chef")

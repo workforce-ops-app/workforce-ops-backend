@@ -213,6 +213,8 @@ def test_a_role_at_your_own_level_only_opens_a_request(people: ShiftSetup) -> No
     asked = admin.post(URL, json=body)
     assert asked.status_code == 202, asked.text
     assert asked.json()["status"] == "pending" and asked.json()["kind"] == "role_assignment"
+    # Who it went to, for "Sent for approval to ...": admin's manager, the owner.
+    assert [r["id"] for r in asked.json()["reviewers"]] == [str(people.ids["owner"])]
     # Nothing is granted while it waits.
     assert ("administrator", "company", None) not in held(people, "chef")
     [request] = pending(people)

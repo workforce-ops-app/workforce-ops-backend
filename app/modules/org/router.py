@@ -174,7 +174,7 @@ def remove_member(
 # --- People ----------------------------------------------------------------------------
 
 
-def _person(item: User, team_ids: list[uuid.UUID]) -> UserOut:
+def _person(item: User, team_ids: list[uuid.UUID], above: people.Above) -> UserOut:
     """A person in the agreed answer shape (never the password hash or lockout counter)."""
     return UserOut(
         id=item.id,
@@ -184,12 +184,13 @@ def _person(item: User, team_ids: list[uuid.UUID]) -> UserOut:
         team_ids=team_ids,
         status=people.status(item),
         locked=people.is_locked(item),
+        you_are_above=above(item.id),
     )
 
 
-def _one_person(db: Database, item: User) -> UserOut:
+def _one_person(db: Database, viewer: User, item: User) -> UserOut:
     """A single person in the answer shape, with their teams."""
-    return _person(item, people.teams_of(db, [item])[item.id])
+    return _person(item, people.teams_of(db, [item])[item.id], people.above_test(db, viewer))
 
 
 @users.get("")
@@ -202,43 +203,46 @@ def list_people(
     """The people the signed-in person may see (user.view, limited to its scope)."""
     rows, next_cursor = people.list_people(db, current.user, cursor=cursor, limit=limit)
     teams_by_person = people.teams_of(db, rows)
+    # Worked out once for the whole page, not once per person.
+    above = people.above_test(db, current.user)
     return UserPage(
-        items=[_person(row, teams_by_person[row.id]) for row in rows], next_cursor=next_cursor
+        items=[_person(row, teams_by_person[row.id], above) for row in rows],
+        next_cursor=next_cursor,
     )
 
 
 @users.get("/{user_id}")
 def view_person(user_id: uuid.UUID, current: SignedInPerson, db: Database) -> UserOut:
-    return _one_person(db, people.view_person(db, current.user, user_id))
+    return _one_person(db, current.user, people.view_person(db, current.user, user_id))
 
 
 @users.post("", status_code=201)
 def create_person(body: UserCreate, current: SignedInPerson, db: Database) -> UserOut:
-    return _one_person(db, people.create_person(db, current.user, body))
+    return _one_person(db, current.user, people.create_person(db, current.user, body))
 
 
 @users.patch("/{user_id}")
 def change_person(
     user_id: uuid.UUID, body: UserUpdate, current: SignedInPerson, db: Database
 ) -> UserOut:
-    return _one_person(db, people.change_person(db, current.user, user_id, body))
+    return _one_person(db, current.user, people.change_person(db, current.user, user_id, body))
 
 
 @users.post("/{user_id}/deactivate")
 def deactivate(user_id: uuid.UUID, current: SignedInPerson, db: Database) -> DeactivatedOut:
     done = people.deactivate(db, current.user, user_id, session=current.session)
-    shown = _one_person(db, done.person)
+    shown = _one_person(db, current.user, done.person)
     return DeactivatedOut(**shown.model_dump(), upcoming_shift_ids=done.upcoming_shift_ids)
 
 
 @users.post("/{user_id}/reactivate")
 def reactivate(user_id: uuid.UUID, current: SignedInPerson, db: Database) -> UserOut:
-    return _one_person(db, people.reactivate(db, current.user, user_id))
+    return _one_person(db, current.user, people.reactivate(db, current.user, user_id))
 
 
 @users.post("/{user_id}/unlock")
 def unlock(user_id: uuid.UUID, current: SignedInPerson, db: Database) -> UserOut:
-    return _one_person(db, people.unlock(db, current.user, user_id))
+    return _one_person(db, current.user, people.unlock(db, current.user, user_id))
 
 
 @users.delete("/{user_id}/sessions", status_code=204)
