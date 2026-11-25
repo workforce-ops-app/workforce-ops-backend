@@ -187,6 +187,8 @@ In the code (`app/authz/chain.py`) the last line reads the `reporting_lines` mod
 
 Both take the company's lock before anything else (and before the audit entry), then run the whole check again on fresh reads (`authorize(..., fresh=True)` for each person: `reporting_line.manage` still held, the person still in its scope, the actor still above them), and adding checks again that neither person was deactivated meanwhile, because under MySQL's REPEATABLE READ an ordinary read after the wait would still answer from before it (review of #164); ending reads the line itself fresh and locked, so two requests never end it twice (a race in `scripts/check_migrations.py`).
 
+**The company's lock** is `lock_reporting_lines()` in `app/authz/chain.py`: a `SELECT ... FOR UPDATE` on the company's row in `company_locks` ([data model](data-model.md#company_locks)), held until the request commits. Reporting-line, role, owner, approval-request, and time-off changes take it before anything else, so one company's changes to who is above whom, and the decisions that depend on it, take turns; other companies never wait. It is a row of its own, not the company's row in `companies`, because every audit entry refers to that row by a foreign key and MySQL takes a shared lock on it for each such insert: with the lock there, a request holding a person's row and writing its audit entry and a request holding the company's lock and waiting for that person deadlocked (#198).
+
 **People with no line above them** can be managed only by the Owner. Their requests go straight to the Owner ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)).
 
 ## Delegation limits

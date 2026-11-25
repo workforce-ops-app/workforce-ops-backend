@@ -17,14 +17,15 @@ from sqlalchemy.orm import Session
 from app.audit.models import AuditChainHead, AuditEvent
 from app.core.config import get_settings
 from app.db.base import Base
-from app.modules.org.models import Company
+from app.modules.org.models import Company, CompanyLock
 from app.tenancy.context import set_company
 
 # A test key: long enough for the settings (32 characters or more), and obviously fake.
 TEST_KEY = "test-audit-key-not-for-real-use-0123456789"
 TEST_KEY_ID = "test-1"
 
-TABLES = [Company.__table__, AuditChainHead.__table__, AuditEvent.__table__]
+# CompanyLock: every new company gets its lock row in the same save (#198).
+TABLES = [Company.__table__, CompanyLock.__table__, AuditChainHead.__table__, AuditEvent.__table__]
 
 
 @dataclass
