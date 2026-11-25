@@ -5,6 +5,7 @@ Course topic: REST. Each URL names a thing (a collection, or one item in it), th
 method says what to do with it, and the status code says how it went:
 
     GET    /api/departments[?cursor=]                         200  list (paged)
+    GET    /api/departments/mine                              200  yours, with your permissions
     POST   /api/departments  {name, timezone?}                201  create
     PATCH  /api/departments/{id}  {name?, timezone?}          200  rename, change zone
     POST   /api/departments/{id}/archive                      200  archive
@@ -37,8 +38,10 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Query, Response
+from sqlalchemy import select
 
 from app.auth.dependencies import Database, SignedInPerson
+from app.authz.check import department_permissions
 from app.modules.org import people, service
 from app.modules.org.models import Department, Team, User
 from app.modules.org.schemas import (
@@ -50,6 +53,8 @@ from app.modules.org.schemas import (
     DepartmentUpdate,
     MemberAdd,
     MemberOut,
+    MyDepartment,
+    MyDepartments,
     TeamCreate,
     TeamOut,
     TeamPage,
@@ -100,6 +105,37 @@ def list_departments(
         for department in rows
     ]
     return DepartmentPage(items=items, next_cursor=next_cursor)
+
+
+@departments.get("/mine")
+def my_departments(current: SignedInPerson, db: Database) -> MyDepartments:
+    """The departments where the signed-in person holds a role, each with the permissions
+    they hold there (department_permissions in app/authz/check.py), in name order.
+
+    For the department picker and its screens (found in review): a person sees only the
+    departments they are part of, and the tools follow their roles in each one. This only
+    shapes the screens; every request is still checked by authorize().
+    """
+    # Step 1: where the person's roles apply, and what they grant there.
+    held = department_permissions(db, current.user)
+    if not held:
+        return MyDepartments(items=[])
+    # Step 2: those departments, in name order (the company filter keeps them to this
+    # company; department_permissions already left out archived ones).
+    rows = db.scalars(
+        select(Department).where(Department.id.in_(held)).order_by(Department.name, Department.id)
+    )
+    return MyDepartments(
+        items=[
+            MyDepartment(
+                id=department.id,
+                name=department.name,
+                timezone=department.timezone,
+                permissions=sorted(held[department.id]),
+            )
+            for department in rows
+        ]
+    )
 
 
 @departments.post("", status_code=201)
