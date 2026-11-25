@@ -35,7 +35,7 @@ from sqlalchemy.orm import Session
 from app.approvals.models import ApprovalRequest
 from app.approvals.service import DecisionError, Handler, register_handler
 from app.audit import Actor
-from app.authz.chain import direct_managers_fresh, is_above_in_chain_fresh
+from app.authz.chain import direct_managers, is_above_in_chain_fresh
 from app.authz.check import ADMIN_LEVEL, Forbidden, NotFound, authorize, is_owner
 from app.authz.delegation import (
     active_owners,
@@ -108,7 +108,7 @@ def reviewers(db: Session, request: ApprovalRequest, *, fresh: bool = False) -> 
     could give the role themselves, or else the owners. fresh=True after the company's
     lock (the top of this file)."""
     seen: set[uuid.UUID] = {request.requested_by}
-    level = direct_managers_fresh(db, {request.requested_by})
+    level = direct_managers(db, {request.requested_by}, fresh=fresh)
     while level:
         able = {
             person_id
@@ -119,7 +119,7 @@ def reviewers(db: Session, request: ApprovalRequest, *, fresh: bool = False) -> 
         if able:
             return able
         seen |= level
-        level = direct_managers_fresh(db, level) - seen
+        level = direct_managers(db, level, fresh=fresh) - seen
     return active_owners(db, fresh=fresh) - {request.requested_by, request.subject_user_id}
 
 
