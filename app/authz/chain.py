@@ -174,19 +174,26 @@ def _current_line_exists(db: Session, manager_id: uuid.UUID, employee_id: uuid.U
     return found is not None
 
 
-def direct_managers_fresh(db: Session, person_ids: set[uuid.UUID]) -> set[uuid.UUID]:
-    """The people these people report to directly, through current lines, read fresh
-    (FOR SHARE: see is_above_in_chain_fresh). One step of a walk up the chain, for finding
-    who reviews a request one level at a time (app/modules/roles/approval.py)."""
+def direct_managers(db: Session, person_ids: set[uuid.UUID], *, fresh: bool) -> set[uuid.UUID]:
+    """The people these people report to directly, through current lines. One step of a
+    walk up the chain, for finding who reviews a request one level at a time
+    (app/modules/roles/approval.py, app/modules/time_off/review.py).
+
+    fresh=True after the company's lock, before a decision: a locking read (FOR SHARE: see
+    is_above_in_chain_fresh). fresh=False for answers (who reviews a request, shown on a
+    page): an ordinary read, so a page view never takes or waits for row locks (reviews
+    of #171 and #167)."""
     if not person_ids:
         return set()
-    return set(
-        db.scalars(
-            select(ReportingLine.manager_id)
-            .where(ReportingLine.employee_id.in_(person_ids), _current())
-            .with_for_update(read=True)
-        )
+    query = select(ReportingLine.manager_id).where(
+        ReportingLine.employee_id.in_(person_ids), _current()
     )
+    return set(db.scalars(query.with_for_update(read=True) if fresh else query))
+
+
+def direct_managers_fresh(db: Session, person_ids: set[uuid.UUID]) -> set[uuid.UUID]:
+    """direct_managers() with fresh=True: for checks after the company's lock."""
+    return direct_managers(db, person_ids, fresh=True)
 
 
 def is_above_in_chain_fresh(db: Session, user_id: uuid.UUID, person_id: uuid.UUID) -> bool:
