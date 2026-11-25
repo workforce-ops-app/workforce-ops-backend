@@ -30,6 +30,9 @@ class TimeOffOut(BaseModel):
 
     id: uuid.UUID
     employee_id: uuid.UUID
+    # Who asked, so the review screen names them without a lookup the reviewer may
+    # not be allowed to make (#172). Anyone who may see the request may see this.
+    employee_name: str
     first_day: date
     last_day: date
     reason: str | None
@@ -52,6 +55,7 @@ class Decision(BaseModel):
     """One reviewer's decision so far."""
 
     approver_id: uuid.UUID
+    approver_name: str  # shown with the request only (#172)
     decision: str  # approve or deny
     decided_at: datetime
     comment: str | None  # plain text, as the reviewer wrote it
