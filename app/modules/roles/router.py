@@ -24,8 +24,11 @@ from fastapi.responses import JSONResponse
 
 import app.modules.roles.approval  # noqa: F401  (registers what role requests do on approval)
 from app.auth.dependencies import Database, SignedInPerson
+from app.authz.check import Forbidden, authorize
+from app.authz.delegation import above_every_holder
 from app.authz.models import Role, RoleAssignment
 from app.modules.approval_requests.schemas import ApprovalRequestOut, shown
+from app.modules.org.models import User
 from app.modules.roles import assignments, service
 from app.modules.roles.schemas import (
     AssignmentCreate,
@@ -44,14 +47,37 @@ roles = APIRouter(prefix="/api/roles", tags=["roles"])
 role_assignments = APIRouter(prefix="/api/role-assignments", tags=["roles"])
 
 
-def _role(role: Role, codes: list[str]) -> RoleOut:
-    """A role in the answer shape."""
+def _may_manage(db: Database, viewer: User) -> bool:
+    """Whether the viewer holds role.manage (ordinary reads; worked out once per answer)."""
+    try:
+        authorize(db, viewer, "role.manage")
+    except Forbidden:
+        return False
+    return True
+
+
+def _role(
+    db: Database, viewer: User, role: Role, codes: list[str], *, may_manage: bool | None = None
+) -> RoleOut:
+    """A role in the answer shape, with whether the viewer may change it: the same rule as
+    service._changeable_role (role.manage, not Owner, not archived, above every holder;
+    review of #171), on ordinary reads, since an answer takes no row locks."""
+    archived = role.archived_at is not None
+    if may_manage is None:
+        may_manage = _may_manage(db, viewer)
+    changeable = (
+        may_manage
+        and role.built_in != "owner"
+        and not archived
+        and above_every_holder(db, viewer, role, fresh=False)
+    )
     return RoleOut(
         id=role.id,
         name=role.name,
         built_in=role.built_in,
-        archived=role.archived_at is not None,
+        archived=archived,
         permissions=codes,
+        you_may_change=changeable,
     )
 
 
@@ -67,20 +93,22 @@ def list_permissions(current: SignedInPerson, db: Database) -> PermissionList:
 
 @roles.get("")
 def list_roles(current: SignedInPerson, db: Database) -> RoleList:
+    found = service.list_roles(db, current.user)
+    may_manage = _may_manage(db, current.user)
     return RoleList(
-        items=[_role(role, codes) for role, codes in service.list_roles(db, current.user)]
+        items=[_role(db, current.user, role, codes, may_manage=may_manage) for role, codes in found]
     )
 
 
 @roles.get("/{role_id}")
 def view_role(role_id: uuid.UUID, current: SignedInPerson, db: Database) -> RoleOut:
-    return _role(*service.view_role(db, current.user, role_id))
+    return _role(db, current.user, *service.view_role(db, current.user, role_id))
 
 
 @roles.post("", status_code=201)
 def create_role(body: RoleCreate, current: SignedInPerson, db: Database) -> RoleOut:
     role = service.create_role(db, current.user, body)
-    return _role(role, service.granted(db, role))
+    return _role(db, current.user, role, service.granted(db, role))
 
 
 @roles.patch("/{role_id}")
@@ -88,13 +116,13 @@ def update_role(
     role_id: uuid.UUID, body: RoleUpdate, current: SignedInPerson, db: Database
 ) -> RoleOut:
     role = service.update_role(db, current.user, role_id, body, session=current.session)
-    return _role(role, service.granted(db, role))
+    return _role(db, current.user, role, service.granted(db, role))
 
 
 @roles.post("/{role_id}/archive")
 def archive_role(role_id: uuid.UUID, current: SignedInPerson, db: Database) -> RoleOut:
     role = service.archive_role(db, current.user, role_id, session=current.session)
-    return _role(role, service.granted(db, role))
+    return _role(db, current.user, role, service.granted(db, role))
 
 
 def _assignment(item: RoleAssignment, role: Role) -> AssignmentOut:

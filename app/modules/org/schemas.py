@@ -40,6 +40,7 @@ class DepartmentOut(BaseModel):
 
     id: uuid.UUID
     name: str
+    timezone: str | None  # null: the company's time zone applies (#170)
 
 
 class DepartmentPage(BaseModel):

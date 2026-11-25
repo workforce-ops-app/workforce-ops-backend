@@ -95,7 +95,10 @@ def list_departments(
     """Return active departments for the signed-in person's company."""
 
     rows, next_cursor = service.list_departments(db, cursor=cursor, limit=limit)
-    items = [DepartmentOut(id=department.id, name=department.name) for department in rows]
+    items = [
+        DepartmentOut(id=department.id, name=department.name, timezone=department.timezone)
+        for department in rows
+    ]
     return DepartmentPage(items=items, next_cursor=next_cursor)
 
 
