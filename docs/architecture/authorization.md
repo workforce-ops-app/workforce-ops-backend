@@ -185,7 +185,7 @@ In the code (`app/authz/chain.py`) the last line reads the `reporting_lines` mod
 | `POST /api/reporting-lines` `{manager_id, employee_id}` | `reporting_line.manage` over both people (never yourself: AZ2), above both (AZ6), password re-entry | add a line; 409 for a loop, a duplicate, or a deactivated person |
 | `POST /api/reporting-lines/{id}/end` | as for adding | end a line; it stays as history; 409 if it has already ended |
 
-Both take the company's lock before anything else (and before the audit entry), then check "above both" again on fresh reads; ending reads the line itself fresh and locked, so two requests never end it twice (a race in `scripts/check_migrations.py`).
+Both take the company's lock before anything else (and before the audit entry), then run the whole check again on fresh reads (`authorize(..., fresh=True)` for each person: `reporting_line.manage` still held, the person still in its scope, the actor still above them), and adding checks again that neither person was deactivated meanwhile, because under MySQL's REPEATABLE READ an ordinary read after the wait would still answer from before it (review of #164); ending reads the line itself fresh and locked, so two requests never end it twice (a race in `scripts/check_migrations.py`).
 
 **People with no line above them** can be managed only by the Owner. Their requests go straight to the Owner ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)).
 
@@ -231,7 +231,9 @@ Built in `app/modules/owners/` (the owner kinds of approval request in `approval
 | `POST /api/owners` `{user_id}` | an owner (`company.transfer_ownership`), password re-entry | with one owner, adds at once (200); with several, opens an `owner_add` request (202) that every other owner must approve |
 | `POST /api/owners/{user_id}/remove` | as for adding | removes at once (200) when no other owner needs to agree, otherwise opens an `owner_remove` request (202) for every owner except the one being removed; never the last owner (409) |
 
-The owner who proposes a change counts as agreeing to it. So with two owners, either may remove the other at once: "every owner except the one being removed" is then only the proposer. For these kinds, "enough approvals" is every current reviewer, counted again at the last approval (`ready` in the kind's handler), so an owner added while a request waits must agree too. Approval re-checks that the change is still possible: never the last owner, never a deactivated person.
+The owner who proposes a change counts as agreeing to it. So with two owners, either may remove the other at once: "every owner except the one being removed" is then only the proposer. This is on purpose (agreed in the review of #165): the other choice, needing the removed owner's agreement too, would let a rogue co-owner block their own removal for good (decision 0032, alternatives). The removal is audited and needs the password re-entered. For these kinds, "enough approvals" is every current reviewer, counted again at the last approval (`ready` in the kind's handler), so an owner added while a request waits must agree too. Approval re-checks that the change is still possible: never the last owner, never a deactivated person.
+
+After the company's lock, a proposal checks the proposer's `company.transfer_ownership` again on fresh reads (an owner removed while the request waited proposes nothing), and both proposing and approving lock the person's row before checking that they are active. Deactivation locks the same row and checks for an owner on fresh reads, so the two take turns: a person is never made an owner while being deactivated (`_owner_race_problems` in `scripts/check_migrations.py`, MySQL).
 
 ### Approval request endpoints
 
@@ -275,7 +277,7 @@ Each rule becomes a security test in `tests/security/` when the code is built. T
 | AZ12 | Every role, permission, assignment, reporting line, ownership, and approval change writes an audit entry. | R1 |
 | AZ13 | A role can be changed, renamed, or archived only by someone above every current holder (or the Owner). | E9 |
 | AZ14 | A role at the granter's own level grants nothing until someone above the granter approves it; the granter and the person receiving the role cannot approve. | E2 |
-| AZ15 | Adding an owner needs every current owner; removing one needs every other owner; no owner acts alone when there are several. | E6 |
+| AZ15 | Adding an owner needs every current owner; removing one needs every owner except the one being removed, so nobody blocks their own removal. The proposer counts as agreeing, so a sole owner adds alone, and with two owners either may remove the other; with three or more, no owner acts alone. | E6 |
 
 ## Sensitive actions
 
