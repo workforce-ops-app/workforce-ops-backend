@@ -116,6 +116,7 @@ class TooManyRequests(HTTPException):
     """429 with Retry-After: the number of seconds until the limit's window ends."""
 
     def __init__(self, retry_after: int) -> None:
+        self.retry_after = retry_after  # kept, to pick the longest of several refusals
         super().__init__(
             status_code=429,
             detail="Too many requests. Wait a moment and try again.",
