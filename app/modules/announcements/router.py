@@ -7,6 +7,7 @@ with it, and the status code says how it went:
 
     GET   /api/announcements?cursor=&limit=                             200  yours (paged)
     GET   /api/announcements/managed?cursor=&limit=&include_archived=   200  managed (paged)
+    GET   /api/announcements/audiences                                  200  where you may post
     GET   /api/announcements/{id}                                       200  one
     POST  /api/announcements                                            201  post
     PATCH /api/announcements/{id}  {title?, body?}                      200  correct the text
@@ -35,6 +36,8 @@ from app.modules.announcements.schemas import (
     AnnouncementOut,
     AnnouncementPage,
     AnnouncementUpdate,
+    AudienceChoice,
+    AudienceChoiceList,
     AudienceOut,
     AuthorRef,
     ReadOut,
@@ -121,6 +124,29 @@ def list_managed(
     # names (repository.list_managed).
     items = [_out(row[0], row[2], row[3], row[4], counted.get(row[0].id, (0, 0))) for row in rows]
     return AnnouncementManagedPage(items=items, next_cursor=next_cursor)
+
+
+@router.get("/audiences")
+def list_audiences(current: SignedInPerson, db: Database) -> AudienceChoiceList:
+    """The audiences you may post to, for the posting form (declared before /{id}, so
+    "audiences" is never read as an announcement's ID)."""
+    choices = []
+    for item in service.postable_audiences(db, current.user):
+        # The names the form shows: the department's or team's, and a team's department
+        # (already loaded by the session, so these look-ups send no new queries).
+        team = repository.team(db, item.team_id) if item.team_id else None
+        department_id = team.department_id if team else item.department_id
+        department = repository.department(db, department_id) if department_id else None
+        choices.append(
+            AudienceChoice(
+                type=item.audience_type,
+                department_id=item.department_id,
+                team_id=item.team_id,
+                name=team.name if team else (department.name if department else None),
+                department_name=department.name if team and department else None,
+            )
+        )
+    return AudienceChoiceList(items=choices)
 
 
 @router.get("/{announcement_id}")

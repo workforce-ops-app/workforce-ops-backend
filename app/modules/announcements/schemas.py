@@ -56,6 +56,25 @@ class AudienceOut(BaseModel):
     team_name: str | None
 
 
+class AudienceChoice(BaseModel):
+    """An audience the signed-in person may post to (GET /api/announcements/audiences).
+
+    type, department_id, and team_id are exactly what the POST body needs for it (so for a
+    team, department_id is null). name is the department's or team's name (null for the
+    company); department_name is a team's department, for the screens only.
+    """
+
+    type: str
+    department_id: uuid.UUID | None
+    team_id: uuid.UUID | None
+    name: str | None
+    department_name: str | None
+
+
+class AudienceChoiceList(BaseModel):
+    items: list[AudienceChoice]
+
+
 class AuthorRef(BaseModel):
     id: uuid.UUID
     display_name: str

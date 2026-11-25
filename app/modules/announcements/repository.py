@@ -31,6 +31,19 @@ def team(db: Session, team_id: uuid.UUID) -> Team | None:
     return db.get(Team, team_id)
 
 
+def active_departments(db: Session) -> list[Department]:
+    """The session's company's active departments, by name."""
+    query = select(Department).where(Department.archived_at.is_(None))
+    return list(db.scalars(query.order_by(Department.name, Department.id)))
+
+
+def active_teams(db: Session) -> list[Team]:
+    """The session's company's active teams, by name. A team of an archived department is
+    archived with it (organization.md), so an active team is always in an active one."""
+    query = select(Team).where(Team.archived_at.is_(None))
+    return list(db.scalars(query.order_by(Team.name, Team.id)))
+
+
 def person(db: Session, user_id: uuid.UUID) -> User | None:
     """A person of the session's company (another company's looks like none)."""
     return db.get(User, user_id)
