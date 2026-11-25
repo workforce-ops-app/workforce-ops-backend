@@ -13,6 +13,9 @@ Owners hold everything, so owner changes are the strictest:
   may remove the other at once, and with three or more, the others must approve.
 - Never the last owner (AZ8): removing the only owner is refused (409), on fresh reads,
   both when asked and again when the last approval arrives.
+- After the company's lock everything is read again with locking reads: the proposer's
+  permission, the owners, and the person (locked, so a deactivation cannot race with
+  making them an owner).
 - The Owner role itself never changes (AZ9, app/modules/roles/service.py); it is given
   and taken only here.
 
@@ -55,7 +58,7 @@ def _owner_role(db: Session) -> Role:
 def list_owners(db: Session, user: User) -> list[User]:
     """The company's owners, by name (role.view: the people who manage roles)."""
     authorize(db, user, "role.view")
-    people = [db.get(User, person_id) for person_id in active_owners(db)]
+    people = [db.get(User, person_id) for person_id in active_owners(db, fresh=False)]
     return sorted((p for p in people if p is not None), key=lambda p: (p.display_name, p.id))
 
 
@@ -66,7 +69,7 @@ def make_owner(db: Session, actor: Actor, person: User) -> None:
     """Give the person the Owner role for the whole company; audited. Caller commits."""
     if person.deactivated_at is not None:
         raise DecisionError("This person is deactivated.")
-    if person.id in active_owners(db):
+    if person.id in active_owners(db, fresh=True):
         raise DecisionError("This person is already an owner.")
     assign_role(db, actor, user_id=person.id, role=_owner_role(db), scope_type="company")
     record(db, actor=actor, action="ownership.owner_added", target_type="user", target_id=person.id)
@@ -75,7 +78,7 @@ def make_owner(db: Session, actor: Actor, person: User) -> None:
 def unmake_owner(db: Session, actor: Actor, person: User) -> None:
     """Take the Owner role away from the person; audited. Never the last owner. Their
     other roles stay. Caller commits."""
-    owners = active_owners(db)
+    owners = active_owners(db, fresh=True)
     if person.id not in owners:
         raise DecisionError("This person is not an owner.")
     if len(owners) <= 1:
@@ -100,22 +103,37 @@ class Proposed:
     request: ApprovalRequest | None = None
 
 
+def locked_person(db: Session, person_id: uuid.UUID) -> User | None:
+    """The person's row, locked (SELECT ... FOR UPDATE) and read fresh. Deactivation locks
+    the same row (app/modules/org/people.py), so the two take turns: a deactivation
+    committed first is seen here, and one that comes later waits, then sees an owner and
+    is refused. Taken after the company's lock and before any audit entry (the lock order
+    in chain.lock_reporting_lines)."""
+    return db.get(User, person_id, with_for_update=True, populate_existing=True)
+
+
 def _proposer_and_person(
     db: Session, user: User, person_id: uuid.UUID, session: UserSession
 ) -> User:
-    authorize(db, user, PERMISSION)  # owners only
-    person = repository.person(db, person_id)
-    if person is None:
+    """Checks before the company's lock (ordinary reads), the lock, then the same checks
+    again on fresh reads: an owner removed while this request waited proposes nothing,
+    and the person is the newest committed row, locked (review of #165)."""
+    authorize(db, user, PERMISSION)  # owners only; no row lock held or waited for yet
+    if repository.person(db, person_id) is None:
         raise Invalid("Unknown person.")
     require_reauth(session)
     lock_reporting_lines(db)
+    authorize(db, user, PERMISSION, fresh=True)
+    person = locked_person(db, person_id)
+    if person is None:  # people are never deleted
+        raise Invalid("Unknown person.")
     return person
 
 
 def add_owner(db: Session, user: User, person_id: uuid.UUID, *, session: UserSession) -> Proposed:
     """Propose a new owner: at once with one owner, else every other owner must approve."""
     person = _proposer_and_person(db, user, person_id, session)
-    owners = active_owners(db)
+    owners = active_owners(db, fresh=True)
     if person.deactivated_at is not None:
         raise Conflict("This person is deactivated.")
     if person.id in owners:
@@ -145,7 +163,7 @@ def remove_owner(
 ) -> Proposed:
     """Propose removing an owner: needs every owner except the one being removed."""
     person = _proposer_and_person(db, user, person_id, session)
-    owners = active_owners(db)
+    owners = active_owners(db, fresh=True)
     if person.id not in owners:
         raise NotFound()  # not an owner: nothing to remove
     if len(owners) <= 1:
