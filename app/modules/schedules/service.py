@@ -322,16 +322,22 @@ def _assign(db: Session, user: User, shift_id: uuid.UUID, employee_id: uuid.UUID
     _check_changeable(item)
     previous = item.employee_id
 
-    # Check the new person BEFORE the shift is changed: the overlap check runs a query, and
-    # a changed shift would be written (flushed) to the database just before it.
-    if employee_id is not None:
-        _check_assignable(db, item, employee_id)
-    if employee_id is None:
-        item.employee_id, item.status = None, "open"
-    else:
-        item.employee_id, item.status = employee_id, "scheduled"
     # ...and as it will be: a manager cannot move a shift out of their own scope either.
-    authorize(db, user, "schedule.edit", item)
+    # This comes BEFORE the checks on the new person (review of #183): they say things
+    # about that person (has approved time off, already works then), which a manager who
+    # may not schedule them must not learn. So anyone out of scope gets the same 403,
+    # whatever the person's time off or shifts.
+    # no_autoflush: the change is not written to the database yet. The checks below run
+    # queries, and SQLAlchemy would otherwise flush the changed shift just before them;
+    # a refused assignment must leave nothing behind but the rollback.
+    with db.no_autoflush:
+        if employee_id is None:
+            item.employee_id, item.status = None, "open"
+        else:
+            item.employee_id, item.status = employee_id, "scheduled"
+        authorize(db, user, "schedule.edit", item)
+        if employee_id is not None:
+            _check_assignable(db, item, employee_id)
 
     record(
         db,

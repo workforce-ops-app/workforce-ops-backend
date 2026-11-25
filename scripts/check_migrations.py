@@ -376,6 +376,7 @@ def _race_problems(url: str) -> list[str]:
             + _role_race_problems(engine)
             + _lapse_race_problems(engine)
             + _time_off_review_race_problems(engine)
+            + _time_off_assign_race_problems(engine)
             + _role_view_lock_problems(engine)
             + _assignment_race_problems(engine)
             + _approval_race_problems(engine)
@@ -2537,6 +2538,203 @@ def _time_off_review_race_problems(engine: Engine) -> list[str]:
         if row is None or row.status != "denied" or entries != 1:
             status = row.status if row else None
             problems.append(f"an overdue request ended {status!r} with {entries} lapse entries")
+    return problems
+
+
+def _time_off_assign_race_problems(engine: Engine) -> list[str]:
+    """Approving someone's time off while a manager gives them a shift on that day, at the
+    same moment, in two threads; return what failed (review of #183).
+
+    Nobody is assigned during their approved time off (docs/features/schedules.md). The
+    approval takes the employee's row lock before it opens their shifts
+    (app/modules/time_off/service.py), and an assignment takes that same lock before it
+    checks for approved time off (app/modules/schedules/service.py, _check_assignable),
+    so the two take turns. Either order must end the same way: the time off approved and
+    the shift not the worker's.
+
+    - The approval first: the assignment is refused (409, approved time off).
+    - The assignment first: the approval then opens the shift again.
+
+    Several rounds, a new day each time; an error (a deadlock, say) is a failure too.
+    """
+    import threading
+    from datetime import timedelta
+
+    from fastapi import HTTPException
+    from sqlalchemy.orm import Session
+
+    import app.modules.time_off.approval  # noqa: F401  (registers the "time_off" handler)
+    import app.modules.time_off.scope  # noqa: F401  (where a time-off request belongs)
+    from app.approvals.service import open_request
+    from app.audit import Actor
+    from app.authz.chain import add_reporting_line
+    from app.authz.models import Role, RolePermission
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.db.base import utcnow
+    from app.modules.org.models import Company, Department, User
+    from app.modules.schedules import service as schedules
+    from app.modules.schedules.models import Shift
+    from app.modules.time_off import service as time_off
+    from app.modules.time_off.models import TimeOffRequest
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    with Session(engine) as platform:
+        company = Company(name="time off and assignment race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # The owner gives shifts; chef, the worker's manager, reviews time off in Office.
+    with session() as db:
+        office = Department(name="Office")
+        db.add(office)
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        people = {
+            name: User(
+                email=f"{name}@time-off-assign-race.example.com",
+                display_name=name,
+                department_id=office.id,
+                # Set up (any value: random text is never a valid Argon2id hash, so
+                # nobody can sign in as these probe people).
+                password_hash=secrets.token_hex(16),
+            )
+            for name in ("owner", "chef", "worker")
+        }
+        db.add_all(people.values())
+        db.flush()
+        assign_role(
+            db,
+            Actor.system(),
+            user_id=people["owner"].id,
+            role=roles["owner"],
+            scope_type="company",
+        )
+        reviewer = Role(name="Time off reviewer")
+        db.add(reviewer)
+        db.flush()
+        for code in ("time_off.review", "time_off.view"):
+            db.add(RolePermission(role_id=reviewer.id, permission_code=code))
+        assign_role(
+            db,
+            Actor.system(),
+            user_id=people["chef"].id,
+            role=reviewer,
+            scope_type="department",
+            scope_id=office.id,
+        )
+        add_reporting_line(
+            db, Actor.system(), manager_id=people["chef"].id, employee_id=people["worker"].id
+        )
+        db.commit()
+        ids = {name: person.id for name, person in people.items()}
+        office_id = office.id
+
+    def person(db: Session, name: str) -> User:
+        found = db.get(User, ids[name])
+        if found is None:  # made above, in this company
+            raise RuntimeError("a time off and assignment race probe person is missing")
+        return found
+
+    def a_day(number: int) -> tuple[uuid.UUID, uuid.UUID]:
+        """worker asks for day `number` off, and that day has an open 9 to 17 shift."""
+        midnight = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        start = midnight + timedelta(days=number)
+        with session() as db:
+            approval = open_request(
+                db,
+                kind="time_off",
+                requested_by=ids["worker"],
+                subject_user_id=ids["worker"],
+                payload={},
+                details={},
+                required_approvals=1,
+                review_by=start,
+            )
+            row = TimeOffRequest(
+                employee_id=ids["worker"],
+                first_day=start.date(),
+                last_day=start.date(),
+                status="pending",
+                approval_request_id=approval.id,
+            )
+            shift = Shift(
+                department_id=office_id,
+                starts_at=start + timedelta(hours=9),
+                ends_at=start + timedelta(hours=17),
+                timezone="UTC",
+                status="open",
+            )
+            db.add_all([row, shift])
+            db.flush()
+            approval.payload = {"time_off_request_id": str(row.id)}
+            db.commit()
+            return row.id, shift.id
+
+    def race_round(request_id: uuid.UUID, shift_id: uuid.UUID) -> dict[str, str]:
+        """chef approves the day off while the owner gives worker the shift."""
+        start = threading.Barrier(2)
+        outcomes = {"approve": "not run", "assign": "not run"}
+
+        def approve() -> None:
+            with session() as db:
+                chef = person(db, "chef")
+                start.wait()
+                try:
+                    time_off.decide_request(db, chef, request_id, "approve", None)
+                    outcomes["approve"] = "ok"
+                except Exception as error:  # a deadlock would show up here
+                    outcomes["approve"] = f"error: {error!r}"[:300]
+
+        def assign() -> None:
+            with session() as db:
+                owner = person(db, "owner")
+                start.wait()
+                try:
+                    schedules.assign_shift(db, owner, shift_id, ids["worker"])
+                    outcomes["assign"] = "ok"
+                except HTTPException as refused:
+                    on_time_off = (
+                        refused.status_code == 409 and refused.detail == schedules.ON_TIME_OFF
+                    )
+                    detail = f"{refused.status_code} {refused.detail}"
+                    outcomes["assign"] = "refused" if on_time_off else f"refused: {detail}"
+                except Exception as error:  # a deadlock would show up here
+                    outcomes["assign"] = f"error: {error!r}"[:300]
+
+        threads = [threading.Thread(target=approve), threading.Thread(target=assign)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        return outcomes
+
+    for number in range(2, 8):  # several rounds, a new day each time
+        request_id, shift_id = a_day(number)
+        outcomes = race_round(request_id, shift_id)
+        if outcomes["approve"] != "ok" or outcomes["assign"] not in ("ok", "refused"):
+            problems.append(
+                f"time off approved while its shift was given, round {number}: {outcomes}"
+            )
+            break
+        with session() as db:
+            row = db.get(TimeOffRequest, request_id)
+            shift = db.get(Shift, shift_id)
+            status = row.status if row else None
+            given = shift is not None and shift.employee_id == ids["worker"]
+        if status != "approved" or given:
+            problems.append(
+                f"round {number} ({outcomes}) ended with the time off {status!r}"
+                f" and the shift {'still the worker' if given else 'not the worker'}'s"
+            )
+            break
     return problems
 
 
