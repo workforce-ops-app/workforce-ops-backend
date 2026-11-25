@@ -25,7 +25,15 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.approvals.models import ApprovalDecision, ApprovalRequest
-from app.approvals.service import DecisionError, cancel, decide, handler_for, lapse, may_decide
+from app.approvals.service import (
+    DecisionError,
+    cancel,
+    decide,
+    handler_for,
+    lapse,
+    may_decide,
+    waits_for,
+)
 from app.auth.models import UserSession
 from app.auth.reauth import require_reauth
 from app.authz.chain import lock_reporting_lines
@@ -60,7 +68,7 @@ def list_requests(
     db: Session, user: User, *, view: Literal["mine", "to_review"], limit: int
 ) -> list[ApprovalRequest]:
     """The newest requests the user asked for or that are about them ("mine"), or the
-    pending ones the user may decide now ("to_review")."""
+    pending ones still waiting for the user's decision ("to_review")."""
     if view == "mine":
         rows = list(
             db.scalars(
@@ -85,7 +93,9 @@ def list_requests(
         )
     )
     _lapse_all(db, pending)
-    return [request for request in pending if may_decide(db, user, request)][:limit]
+    # Only the ones still waiting for this person: a request they already decided, still
+    # pending for the other reviewers, is not listed again.
+    return [request for request in pending if waits_for(db, user, request)][:limit]
 
 
 def view_request(db: Session, user: User, request_id: uuid.UUID) -> ApprovalRequest:

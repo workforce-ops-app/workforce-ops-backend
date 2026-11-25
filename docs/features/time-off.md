@@ -92,7 +92,7 @@ stateDiagram-v2
 |---|---|---|
 | `GET /time-off-requests?mine=true` | `time_off.request_self` | your own requests |
 | `GET /time-off-requests?status=&employee_id=&from=&to=` | `time_off.view` (scope filter) | requests of people in scope |
-| `GET /time-off-requests/waiting` | signed in | requests waiting for your review |
+| `GET /time-off-requests/waiting` | signed in | requests waiting for your review; once you approve or deny one, it leaves this list even while it still waits for other reviewers |
 | `GET /time-off-requests/{id}` | owner of the request, or `time_off.view` | one request, with its affected shifts and decisions so far |
 | `POST /time-off-requests` `{first_day, last_day, reason}` | `time_off.request_self` | ask for time off |
 | `POST /time-off-requests/{id}/cancel` | `time_off.cancel_self` | cancel your own request |
@@ -125,6 +125,21 @@ Every answer names the employee (`employee_name`), and each decision its reviewe
 **Not reviewed in time, without a background job** (agreed 2026-11-19 for the final; see [authorization](../architecture/authorization.md#approval-request-endpoints)): the approval record's deadline (`review_by`) is the start of the first day in the employee's workplace zone. The first read or action on a request after that moment declines it as not reviewed (actor `system`, `decided_at` = the deadline itself), through the shared approval layer and the time-off handler's `lapsed` hook (`app/modules/time_off/approval.py`). Every list and view does this first, so the answer never shows a stale status, and no decision can arrive late. A list lapses every overdue request it matches before it filters by status and applies its limit (both in the database), so asking for one status always finds the newest requests with it, even when newer requests have other statuses. Two lists read at the same moment lapse a request only once (one audit entry), and the one that lost still answers with it declined: `refresh()` ends its transaction when another request lapsed a row first, so the status filter and the not-reviewed flags that follow read a new MySQL snapshot that includes that lapse, not the one from before it. A scheduled job can replace it later without changing any endpoint.
 
 **In the code:** rules for asking, cancelling, and deciding in `app/modules/time_off/service.py`; who reviews and what the decisions add up to in `review.py` (the shared layer calls it through the handler's `outcome` hook, instead of its own "one denial denies"); the approval record's hooks in `approval.py`; days and time zones in `days.py`; where a request belongs (its employee) in `scope.py`. A decision locks, in order, the company's reporting lines, the employee, the request, its approval record, and the shifts it opens, and only then writes audit entries: the same order as every schedule change, so the two never wait on each other. Asking, cancelling, and a lapse (declined as not reviewed) take the same order, starting with the company's lock: every audit entry refers to the company's row, so a request holding other locks while it waits to write one could otherwise deadlock with a decision (review of #167). For that reason time-off requests are decided and cancelled only on their own endpoints; `/api/approval-requests/{id}/approve`, `.../deny`, and `.../cancel` answer 409 for them, before taking any lock. Who reviews a request is worked out on locking reads only inside a decision; pages that show it (the waiting list, a request, the approval record's `reviewers`) use ordinary reads. Every decision has its own audit entry, also one that leaves the request waiting or sends it up the chain (`final: false`). Reviewers' comments are kept with the approval record (plain text, at most 500 characters) and never in the audit log. Each person's requests take turns through a lock on their user row, so two requests sent at once cannot both pass the overlap check. The reason never goes into the audit log, which is kept for good.
+
+### Demo data
+
+Built in SD2 as `DEMO_TIME_OFF` in `scripts/seed_demo.py` (workforce-ops-app/workforce-ops-backend#68), the same in both companies (in Northwind Cafe; days counted from the day the script runs):
+
+| Who asks | Days | Reason | Afterwards | State |
+|---|---|---|---|---|
+| Ella Novak | day 1 | Doctor's appointment | nobody reviews it (only the owner could: she has no manager) | waiting; declined as not reviewed from day 1 on |
+| Diego Ruiz | day 4 | Concert | declined by Priya Shah, with a comment | declined |
+| Ella Novak | day 5 | | cancelled by Ella | cancelled |
+| Ben Okafor | days 6 and 7 | Moving house | denied by Felix Grant, approved by Ana Diaz (his two managers) | moved up to Marcus Lee, the nearest manager above both |
+| Cara Lund | days 8 to 10 | Wedding | approved by Felix Grant, with a comment | approved; her shift on those days is open |
+| Diego Ruiz | days 10 and 11 | Family visit | | waiting for Priya Shah |
+
+Each step (asking, each decision, cancelling) goes through this module's service as the person who takes it, exactly as on the website, so the same rules apply: only a current reviewer decides (worked out from the [reporting lines](organization.md#demo-data)), approving opens the shifts on those days with their `shift.opened` entries, and everything is audited under that person's name. The days count from the real today, since the application refuses days that have started, and the requests come right after the shifts (which they wait for). Added once per company; a step the application refuses stops the script and keeps none of that company's requests (`tests/unit/test_seed_demo.py`, checked also against MySQL).
 
 ### Audit and security
 

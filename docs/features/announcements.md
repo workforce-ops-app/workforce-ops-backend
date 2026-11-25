@@ -1,6 +1,6 @@
 # Announcements
 
-- **Status:** posting, editing, archiving, and the managed list are built (AN1, #154: `app/modules/announcements/`, migration `0014`, the `team` column of `ScopeColumns` in `app/authz/scope.py`); reading, one announcement, read marks, and the read list are built (AN2, #155, no migration); the demo data is built (AN3, #156: `seed_announcements()` in `scripts/seed_demo.py`) (final demo, [0038](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0038-final-demo-scope.md))
+- **Status:** posting, editing, archiving, and the managed list are built (AN1, #154: `app/modules/announcements/`, migration `0014`, the `team` column of `ScopeColumns` in `app/authz/scope.py`); reading, one announcement, read marks, and the read list are built (AN2, #155, no migration); the audiences you may post to are built (#177, for the posting form); the demo data is built (AN3, #156: `seed_announcements()` in `scripts/seed_demo.py`) (final demo, [0038](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0038-final-demo-scope.md))
 - **Related:** design workforce-ops-app/workforce-ops-backend#110; backend workforce-ops-app/workforce-ops-backend#120; screens workforce-ops-app/workforce-ops-frontend#65; tracker workforce-ops-app/.github#84; design: [authorization](../architecture/authorization.md), [organization](organization.md)
 
 ## In short
@@ -84,6 +84,7 @@ stateDiagram-v2
 |---|---|---|
 | `GET /announcements?cursor=&limit=` | signed in | page through the active announcements whose audience includes you, newest first, each with `read` (true or false) |
 | `GET /announcements/managed?cursor=&limit=&include_archived=` | `announcement.create` (scope filter) | page through the announcements whose audience your assignments cover, with read counts |
+| `GET /announcements/audiences` | `announcement.create` (anywhere) | the audiences you may post to, for the posting form (#177) |
 | `GET /announcements/{id}` | in the audience, or `announcement.create` covering it | one announcement |
 | `POST /announcements` `{audience_type, department_id?, team_id?, title, body}` | `announcement.create` covering the audience | post (201) |
 | `PATCH /announcements/{id}` `{title?, body?}` | `announcement.create` covering the audience | correct the text |
@@ -92,6 +93,8 @@ stateDiagram-v2
 | `GET /announcements/{id}/reads?cursor=&limit=` | `announcement.create` covering the audience | page through the people in the audience by name, each with when they read it, or not yet |
 
 An announcement in an answer: `id`, `audience` (`{type, department_id, department_name, team_id, team_name}`; `department_id` is null for a team audience), `title`, `body`, `author` (`{id, display_name}`), `posted_at`, `edited_at`, `archived`, and for readers `read`, for managers `read_count` and `audience_count`. The reader's list answers `{items, next_cursor}` with `read` and no counts. `GET /announcements/{id}` answers `read` for everyone (whether the signed-in person has read it) and `read_count` and `audience_count` when their `announcement.create` covers the audience, null otherwise, so a reader never learns how many others have read it; the people who manage it also see it once archived. The read list answers `{items, next_cursor}`, each item `{id, display_name, read_at}` (`read_at` null: not read yet). `audience_count` is the people in the audience now (an archived team's audience is empty); `read_count` is how many of them have read it, so it matches the read list. The managed list's answer to someone whose only `announcement.create` assignment is for an archived department or team is 403, as for any list without a permission.
+
+**Where you may post** (`GET /announcements/audiences`, #177): the session lists permission names only, not their scopes, and managers cannot read what roles grant, so the posting form asks the API which audiences to offer. The answer is `{items}`: the company first (if allowed), then each active department, then each active team, by name. Each item is `{type, department_id, team_id, name, department_name}`: `type` and the two IDs are exactly what the `POST` body needs (for a team, `department_id` is null), `name` is the department's or team's (null for the company), and `department_name` is a team's department, for the screens only. Each candidate is checked with `authorize()` on an unsaved announcement for that audience, the same check posting makes (`postable_audiences()` in `service.py`), so the form offers exactly what posting allows and the scope rules stay in one place. Archived departments and teams are left out, as posting to them is refused (409). Without `announcement.create` anywhere it answers 403. It is a convenience: posting still checks everything (E11).
 
 **Table: `announcements`** (feature table)
 
@@ -175,6 +178,7 @@ They are posted in that order, so the last is the newest, and read before any is
 - The author, audience, and dates cannot be set or changed through the request body (422).
 - An archived department's announcements reach nobody.
 - The managed list agrees with `authorize()` for every assignment and audience pair (the scope tests under Managed list filter).
+- The audiences offered for posting agree with posting itself for every manager and audience; employees get 403; another company's departments and teams, and archived ones, are never offered (#177).
 - The read list answers at most 200 people per page, refuses a larger `limit` (422), and refuses a cursor naming someone outside the audience (422).
 - A deactivated person, someone taken off a team, and everyone in an archived department or team are in no audience; archived announcements disappear for readers; read marks cannot point across companies.
 - The reader's list query returns only the reader's announcements, in a company with many audiences.

@@ -132,6 +132,42 @@ def post_announcement(db: Session, user: User, body: AnnouncementCreate) -> Anno
     return item
 
 
+def postable_audiences(db: Session, user: User) -> list[Announcement]:
+    """The audiences the user may post to now, as unsaved announcements naming each one:
+    the company, then each active department, then each active team, each by name.
+
+    Each is checked with authorize() on an announcement for that audience, exactly the
+    check post_announcement makes, so the posting form offers only what posting allows and
+    the scope rules live in one place (E11). Archived departments and teams are left out,
+    as posting to them is refused (409). Someone without announcement.create anywhere gets
+    403, as for the managed list. Nothing is saved: the announcements are never added to
+    the session.
+    """
+    # 1. No announcement.create anywhere: 403, as for every list without its permission.
+    authorize(db, user, PERMISSION)
+
+    # 2. Every audience there is: the company, each active department, each active team.
+    candidates = [Announcement(company_id=user.company_id, audience_type="company")]
+    candidates += [
+        Announcement(company_id=user.company_id, audience_type="department", department_id=d.id)
+        for d in repository.active_departments(db)
+    ]
+    candidates += [
+        Announcement(company_id=user.company_id, audience_type="team", team_id=t.id)
+        for t in repository.active_teams(db)
+    ]
+
+    # 3. Keep the ones posting would allow.
+    allowed = []
+    for candidate in candidates:
+        try:
+            authorize(db, user, PERMISSION, candidate)
+        except Forbidden:
+            continue
+        allowed.append(candidate)
+    return allowed
+
+
 def _changeable(db: Session, user: User, announcement_id: uuid.UUID) -> Announcement:
     """The announcement, checked and locked for a change by this user.
 

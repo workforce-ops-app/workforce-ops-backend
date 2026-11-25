@@ -271,6 +271,28 @@ def may_decide(db: Session, user: User, request: ApprovalRequest, *, fresh: bool
     return user.id in handler_for(request).reviewers(db, request, fresh=fresh)
 
 
+def has_decided(db: Session, user: User, request: ApprovalRequest) -> bool:
+    """Whether the user has already approved or denied this request."""
+    # The decisions table is keyed by (request, person), so this is one primary-key read.
+    return db.get(ApprovalDecision, (request.id, user.id)) is not None
+
+
+def waits_for(db: Session, user: User, request: ApprovalRequest) -> bool:
+    """Whether the request still needs the user's decision: what the "waiting for you"
+    lists and counts show.
+
+    A request that needs several reviewers stays pending after one of them decides, while
+    it waits for the others. That reviewer is still one of its reviewers (may_decide), but
+    a second decision would be refused (decide(): "You have already decided this
+    request."), so it must not be listed as waiting for them. may_decide() itself stays as
+    it is: the decision endpoints use it to answer 403 for someone who is not a reviewer
+    at all, and leave the clearer "already decided" (409) to decide().
+    """
+    # Step 1: everything may_decide() checks (pending, in time, not their own, active, a
+    # reviewer). Step 2: and they have not decided it yet.
+    return may_decide(db, user, request) and not has_decided(db, user, request)
+
+
 def decide(db: Session, user: User, request: ApprovalRequest, decision: str) -> None:
     """Record the user's approval or denial (the caller has checked may_decide and taken
     the company's lock). One denial denies; enough approvals approve and apply it. A kind
