@@ -173,3 +173,48 @@ def test_with_two_owners_either_removes_the_other(people: ShiftSetup) -> None:
     assert removed.status_code == 200
     assert owners(people) == ids(people, "owner")
     assert owner.post(f"{URL}/{people.ids['chef']}/remove").status_code == 404  # not one
+
+
+# --- AZ15 counted again: the owners change while a request waits (review of #165) -----
+
+
+def test_an_owner_added_while_a_request_waits_must_agree_too(people: ShiftSetup) -> None:
+    owner = reenter(people.browser("owner"))
+    assert propose_add(owner, people, "admin") == 200  # two owners: owner, admin
+    waiting = owner.post(URL, json={"user_id": str(people.ids["ana"])})
+    joining = owner.post(URL, json={"user_id": str(people.ids["chef"])})
+    assert waiting.status_code == joining.status_code == 202
+    admin = reenter(people.browser("admin"))
+    # chef becomes an owner while ana's request still waits.
+    assert admin.post(f"/api/approval-requests/{joining.json()['id']}/approve").status_code == 200
+    assert owners(people) == ids(people, "owner", "admin", "chef")
+    # admin's approval was all ana's request needed when it was opened: not any more.
+    request = f"/api/approval-requests/{waiting.json()['id']}"
+    still = admin.post(f"{request}/approve")
+    assert still.status_code == 200 and still.json()["status"] == "pending"
+    assert owners(people) == ids(people, "owner", "admin", "chef")
+    # The new owner agrees: done.
+    approved = reenter(people.browser("chef")).post(f"{request}/approve")
+    assert approved.status_code == 200 and approved.json()["status"] == "approved"
+    assert owners(people) == ids(people, "owner", "admin", "chef", "ana")
+
+
+def test_an_owner_removed_while_a_request_waits_is_no_longer_needed(people: ShiftSetup) -> None:
+    three_owners(people)  # owner, admin, chef
+    owner = reenter(people.browser("owner"))
+    waiting = owner.post(URL, json={"user_id": str(people.ids["ana"])})
+    assert waiting.status_code == 202  # needs admin and chef
+    request = f"/api/approval-requests/{waiting.json()['id']}"
+    assert reenter(people.browser("admin")).post(f"{request}/approve").status_code == 200
+    # chef is removed meanwhile (owner proposes, admin agrees).
+    removing = owner.post(f"{URL}/{people.ids['chef']}/remove")
+    assert removing.status_code == 202
+    admin = reenter(people.browser("admin"))
+    assert admin.post(f"/api/approval-requests/{removing.json()['id']}/approve").status_code == 200
+    assert owners(people) == ids(people, "owner", "admin")
+    # chef is no longer a reviewer of ana's request, nor involved in it at all (404).
+    assert reenter(people.browser("chef")).post(f"{request}/approve").status_code == 404
+    # Nobody is left to approve, so it waits until its deadline and is then declined as
+    # not reviewed; the proposer can send it again. It never makes ana an owner unasked.
+    assert owner.get(request).json()["status"] == "pending"
+    assert owners(people) == ids(people, "owner", "admin")
