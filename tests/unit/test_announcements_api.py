@@ -11,6 +11,7 @@ import uuid
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 from app.audit.models import AuditEvent
 from app.authz.roles import _grants_for
@@ -447,10 +448,40 @@ def test_a_mark_saved_at_the_same_moment_is_not_an_error(
     and the answer is still 204 (scripts/check_migrations.py tries the real race on MySQL)."""
     created = post(announcements, "chef", "kitchen")
     assert mark(announcements, "ana", created["id"]) == 204
-    # The second request does not see the first one's mark yet.
-    monkeypatch.setattr(repository, "read_mark", lambda *_: None)
+    # The second request does not see the first one's mark yet (its first look); after
+    # the refusal it looks again and finds it.
+    real = repository.read_mark
+    looks: list[int] = []
+
+    def not_seen_at_first(*arguments: object) -> object:
+        looks.append(1)
+        return None if len(looks) == 1 else real(*arguments)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(repository, "read_mark", not_seen_at_first)
     assert mark(announcements, "ana", created["id"]) == 204
     assert marks_saved(announcements) == 1
+    assert len(looks) == 2  # looked again before answering 204
+
+
+def test_any_other_refusal_is_not_answered_as_saved(
+    announcements: ShiftSetup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal that is not the duplicate mark (review of #158): the database refuses the
+    save for another reason, Ana's mark is not there afterwards, so the error goes on (500)
+    instead of a 204 that would claim it was saved."""
+    created = post(announcements, "chef", "kitchen")
+    assert mark(announcements, "cara", created["id"]) == 204
+
+    cara = announcements.ids["cara"]
+
+    def refused(db: Session, announcement_id: uuid.UUID, user_id: uuid.UUID) -> None:
+        # Something other than Ana's mark that the database refuses: Cara's mark again.
+        db.add(AnnouncementRead(announcement_id=announcement_id, user_id=cara, read_at=utcnow()))
+
+    monkeypatch.setattr(repository, "add_read_mark", refused)
+    # The app's error handler answers 500, never the 204 that would say it was saved.
+    assert mark(announcements, "ana", created["id"]) == 500
+    assert marks_saved(announcements) == 1  # Cara's only: nothing saved for Ana
 
 
 def test_reads_are_not_audited(announcements: ShiftSetup) -> None:
