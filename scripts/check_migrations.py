@@ -315,6 +315,7 @@ def _race_problems(url: str) -> list[str]:
             + _link_race_problems(engine)
             + _role_race_problems(engine)
             + _lapse_race_problems(engine)
+            + _role_view_lock_problems(engine)
             + _assignment_race_problems(engine)
             + _approval_race_problems(engine)
             + _owner_race_problems(engine)
@@ -2018,6 +2019,97 @@ def _owner_race_problems(engine: Engine) -> list[str]:
         else:
             problems.append("a person made an owner meanwhile could be deactivated")
         request_2.rollback()
+    return problems
+
+
+def _role_view_lock_problems(engine: Engine) -> list[str]:
+    """Showing roles while another request holds locks on what they depend on; return
+    what failed (review of #171).
+
+    A role in an answer says `you_may_change`, worked out with above_every_holder(): is the
+    viewer an owner, who holds the role, and is the viewer above each holder. An answer
+    uses ordinary reads (fresh=False), so a page view never waits on, or takes, row
+    locks; only a change, after the company's lock, reads them with locking reads.
+
+    Request 1 locks (SELECT ... FOR UPDATE) the viewer's row, the role's assignment rows,
+    and the reporting lines, and keeps them until it ends. Request 2, with a 1 second lock
+    wait, then builds the answer for the role: with locking reads it would wait, and
+    MySQL would give up on it (error 1205); with ordinary reads it answers at once.
+    """
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    from app.audit import Actor
+    from app.authz.chain import add_reporting_line
+    from app.authz.models import ReportingLine, RoleAssignment
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.modules.org.models import Company, Department, User
+    from app.modules.roles import router
+    from app.modules.roles import service as role_service
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    # A company of its own, made by platform code (a session with no company).
+    with Session(engine) as platform:
+        company = Company(name="role view lock probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # The owner; admin (Administrator), above chef (Manager).
+    with session() as db:
+        office = Department(name="Office")
+        db.add(office)
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        people = {
+            name: User(
+                email=f"{name}@role-view.example.com", display_name=name, department_id=office.id
+            )
+            for name in ("owner", "admin", "chef")
+        }
+        db.add_all(people.values())
+        db.flush()
+        for name, kind in (("owner", "owner"), ("admin", "administrator"), ("chef", "manager")):
+            assign_role(
+                db, Actor.system(), user_id=people[name].id, role=roles[kind], scope_type="company"
+            )
+        add_reporting_line(
+            db, Actor.system(), manager_id=people["admin"].id, employee_id=people["chef"].id
+        )
+        db.commit()
+        ids = {name: person.id for name, person in people.items()}
+        manager_role = roles["manager"].id
+
+    for viewer_name in ("admin", "owner"):
+        with session() as request_1:
+            # Request 1 holds the rows a locking read of the answer would need.
+            request_1.scalars(
+                select(User.id).where(User.id.in_(list(ids.values()))).with_for_update()
+            ).all()
+            request_1.scalars(select(RoleAssignment.id).with_for_update()).all()
+            request_1.scalars(select(ReportingLine.id).with_for_update()).all()
+            with session() as request_2:
+                request_2.execute(text("SET SESSION innodb_lock_wait_timeout = 1"))
+                viewer = request_2.get(User, ids[viewer_name])
+                if viewer is None:  # made above
+                    raise RuntimeError("a role view probe person is missing")
+                try:
+                    role, codes = role_service.view_role(request_2, viewer, manager_role)
+                    answer = router._role(request_2, viewer, role, codes)
+                except OperationalError as error:
+                    problems.append(f"showing a role to {viewer_name} waited on row locks: {error}")
+                else:
+                    if not answer.you_may_change:
+                        problems.append(f"{viewer_name} was told they may not change Manager")
+                request_2.rollback()
+            request_1.rollback()
     return problems
 
 
