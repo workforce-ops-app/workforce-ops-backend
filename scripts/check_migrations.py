@@ -2972,7 +2972,7 @@ def _backup_user_problems(backup_url: str, admin_url: str) -> list[str]:
     # a word, so it stops the check here. Counted as the migration user (admin_url), not
     # the backup user: MySQL shows a user only the definitions it has a right to, and the
     # backup user has no right to these, so it would always count none (second review of
-    # #205). A probe trigger, made and dropped as the migration user, shows the count can
+    # #205). A probe event, made and dropped as the migration user, shows the count can
     # see one.
     admin = create_engine(admin_url, isolation_level="AUTOCOMMIT")
     try:
@@ -2982,19 +2982,21 @@ def _backup_user_problems(backup_url: str, admin_url: str) -> list[str]:
                 " (backup.sh) and give the backup user the right to read it"
                 for kind in _left_out_of_backups(connection)
             ]
+            # An event, not a trigger: with the binary log on, MySQL lets only SUPER
+            # create triggers, which the migration user does not have.
             connection.execute(
                 text(
-                    "CREATE TRIGGER backup_inventory_probe BEFORE INSERT ON sessions"
-                    " FOR EACH ROW SET @backup_inventory_probe = 1"
+                    "CREATE EVENT backup_inventory_probe"
+                    " ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 DAY DO SELECT 1"
                 )
             )
             try:
-                if "trigger" not in _left_out_of_backups(connection):
+                if "event" not in _left_out_of_backups(connection):
                     problems.append(
-                        "the count of definitions the backups leave out missed a trigger"
+                        "the count of definitions the backups leave out missed an event"
                     )
             finally:
-                connection.execute(text("DROP TRIGGER backup_inventory_probe"))
+                connection.execute(text("DROP EVENT backup_inventory_probe"))
     finally:
         admin.dispose()
     engine = create_engine(backup_url, isolation_level="AUTOCOMMIT")
