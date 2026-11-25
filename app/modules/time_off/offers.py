@@ -52,6 +52,7 @@ from sqlalchemy.orm import Session
 
 from app.approvals.service import DecisionError
 from app.audit import Actor, record
+from app.authz.chain import lock_reporting_lines
 from app.authz.check import Forbidden, authorize, grants
 from app.db.base import utcnow
 from app.modules.org import repository as people
@@ -229,7 +230,8 @@ def offerable(db: Session, user: User) -> list[Offerable]:
 
 
 def _locked_request(db: Session, user: User, request_id: uuid.UUID) -> TimeOffRequest:
-    """The request, locked in the time-off order (the employee, then the request), and
+    """The request, locked in the time-off order (the company's lock, the employee, then the
+    request; review of #167), and
     still open for offers. Someone who could not see it as a coworker gets 404 (I10)."""
     from app.modules.time_off.service import send_up_if_due
 
@@ -242,6 +244,7 @@ def _locked_request(db: Session, user: User, request_id: uuid.UUID) -> TimeOffRe
     # the request here; anyone else gets 404.
     if not (takeable(db, user, found) or own_offers(db, user, found)):
         raise NotFound()
+    lock_reporting_lines(db)
     people.person(db, found.employee_id, lock=True)
     request = db.get(TimeOffRequest, request_id, populate_existing=True, with_for_update=True)
     if request is None:  # never deleted
