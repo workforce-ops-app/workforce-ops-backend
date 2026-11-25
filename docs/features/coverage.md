@@ -125,7 +125,7 @@ and the status `collecting` (the `CHECK` lists it). The approval record is opene
 
 Unique `(company_id, time_off_request_id, shift_id, offered_by)`: one answer per coworker per shift.
 
-**Table: `department_settings`** (company-owned, migration `0016`): `department_id` (company-aware foreign key to `departments`), `module` and `setting_key` (as in `company_settings`), `value` (JSON), `created_at`, `updated_at`; primary key `(company_id, department_id, module, setting_key)`. Only for settings a module declares with `per_department=True` (`time_off.offers_close_days` for now), and only stricter than the company's when written; read as the stricter of the two anyway, so a company that later raises its own value is never undercut. (Built in CV3: the design first named one `key` column; `module` and `setting_key` match `company_settings`.)
+**Table: `department_settings`** (company-owned, migration `0017`): `department_id` (company-aware foreign key to `departments`), `module` and `setting_key` (as in `company_settings`), `value` (JSON), `created_at`, `updated_at`; primary key `(company_id, department_id, module, setting_key)`. Only for settings a module declares with `per_department=True` (`time_off.offers_close_days` for now), and only stricter than the company's when written; read as the stricter of the two anyway, so a company that later raises its own value is never undercut. (Built in CV3: the design first named one `key` column; `module` and `setting_key` match `company_settings`.)
 
 **Endpoints** (all under `/api`)
 
