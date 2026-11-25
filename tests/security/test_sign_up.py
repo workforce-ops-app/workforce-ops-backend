@@ -251,3 +251,58 @@ def test_the_password_is_in_no_answer_or_audit_entry(signin: SignInSetup) -> Non
     text = json.dumps(details)
     assert STRONG not in text
     assert all(h is None or h not in text for h in hashes)
+
+
+@pytest.mark.parametrize(
+    "ended",
+    [
+        # Past the session's maximum length, and idle past the timeout.
+        "UPDATE sessions SET expires_at = :past",
+        "UPDATE sessions SET last_seen_at = :past",
+    ],
+)
+def test_an_ended_session_cookie_does_not_stop_a_sign_up(signin: SignInSetup, ended: str) -> None:
+    """Review of #174: a browser that still carries an ended session's cookie can sign up.
+
+    Looking up that session binds a database session to its company. Done on the
+    request's own session, the binding stayed, and saving the new company's cookie then
+    failed with a 500 after the company had been created. Now the lookup has its own.
+    """
+    from datetime import timedelta
+
+    from app.db.base import utcnow
+
+    assert signin.sign_in(signin.client, email(signin, "a_ana")) == 201
+    with signin.engine.begin() as connection:
+        # Written as text in the column's stored form (SQLite has no datetime type).
+        past = (utcnow() - timedelta(days=2)).isoformat(sep=" ")
+        connection.execute(text(ended), {"past": past})
+    answer = signin.client.post(URL, json=form())
+    assert answer.status_code == 201, answer.text
+    assert answer.json()["user"]["email"] == "rosa@harbor.example"
+    # The ended session is gone (deleted when it was found ended), the new one works.
+    assert signin.client.get("/api/sessions/current").status_code == 200
+
+
+def test_requests_with_invalid_fields_count_toward_the_limit(signin: SignInSetup) -> None:
+    """Every sign-up request counts, fields valid or not (review of #174): five refused
+    for their fields, then the sixth, a valid one, gets 429 and creates nothing."""
+    for _ in range(5):
+        answer = signin.client.post(URL, json=form(timezone="Not/AZone", company_name=""))
+        assert answer.status_code == 422
+    before = counts(signin)
+    refused = signin.client.post(URL, json=form())
+    assert refused.status_code == 429
+    assert counts(signin) == before
+
+
+def test_a_sign_up_past_its_limit_still_counts_toward_sign_in(signin: SignInSetup) -> None:
+    """Both counters move even when the sign-up limit refuses (review of #174): 14 sign-in
+    attempts and 6 sign-ups make 20, so the next sign-in attempt is the 21st and gets 429."""
+    unknown = {"email": "nobody@nowhere.example", "password": STRONG}
+    for _ in range(14):
+        assert signin.client.post("/api/sessions", json=unknown).status_code == 401
+    for number in range(6):
+        answer = signin.client.post(URL, json=form(password="short"))
+        assert answer.status_code == (429 if number == 5 else 422)
+    assert signin.client.post("/api/sessions", json=unknown).status_code == 429
