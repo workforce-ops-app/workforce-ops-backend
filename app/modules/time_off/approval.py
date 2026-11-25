@@ -12,6 +12,7 @@ in the order the shifts need (app/modules/time_off/service.py, decide).
 
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.approvals.models import ApprovalRequest
@@ -19,6 +20,7 @@ from app.approvals.service import DecisionError, Handler, register_handler
 from app.audit import Actor, record
 from app.modules.org.models import User
 from app.modules.time_off import review
+from app.modules.time_off.models import TimeOffRequest
 
 _request_for = review.request_for
 
@@ -28,7 +30,8 @@ def sensitive(db: Session, approval: ApprovalRequest) -> bool:
 
 
 def apply(db: Session, approval: ApprovalRequest, approver: User) -> None:
-    request = _request_for(db, approval)
+    # After the locks (decide_request locked it): read it fresh.
+    request = _request_for(db, approval, fresh=True)
     if request is None or request.status not in ("pending", "escalated"):
         raise DecisionError("This request is no longer waiting.")
     review.approve(db, approval, approver)
@@ -45,9 +48,23 @@ def describe(db: Session, approval: ApprovalRequest) -> dict[str, Any]:
     }
 
 
+def lock(db: Session, approval: ApprovalRequest) -> None:
+    """Before a lapse changes the approval record: lock the time-off request first, the
+    order decide_request() and cancel() use (time-off row, then approval record).
+
+    Only the lock (its ID is read): the caller's copy of the row is left as it was, so
+    time off's refresh() can still see that another request lapsed it first and end its
+    old snapshot (review of #166)."""
+    db.execute(
+        select(TimeOffRequest.id)
+        .where(TimeOffRequest.approval_request_id == approval.id)
+        .with_for_update()
+    )
+
+
 def lapsed(db: Session, approval: ApprovalRequest) -> None:
     """Its first day began undecided: the request is declined as not reviewed."""
-    request = _request_for(db, approval)
+    request = _request_for(db, approval, lock=True)  # locked already, by lock()
     if request is None or request.status not in ("pending", "escalated"):
         return
     request.status, request.decided_at = "denied", approval.decided_at
@@ -69,5 +86,6 @@ register_handler(
         describe=describe,
         lapsed=lapsed,
         outcome=review.outcome,
+        lock=lock,
     ),
 )
