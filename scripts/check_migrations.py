@@ -28,14 +28,17 @@
    has no row locks, so this too can only be tried on MySQL. They run as the
    application user, so they also show its rights are enough for the app's own writes
    and locking reads.
-6. The application user's rights (_grant_problems, #43): created by the same first-start
+6. A company that existed before a migration still works after it
+   (_existing_company_problems): its starting roles get the permissions a migration adds
+   (announcement.create in 0014).
+7. The application user's rights (_grant_problems, #43): created by the same first-start
    script Docker Compose uses (docker/mysql/init/01-users.sh) and granted by the
    migrations (app/db/grants.py), it cannot change the structure, cannot change or
    remove audit entries, and can read every table the app uses.
 
 The database is a throwaway Docker container (removed afterwards), unless
 MIGRATION_CHECK_DATABASE_URL points at an empty database to use instead. That one URL
-is then used for everything, and step 6 is skipped: it needs the two users.
+is then used for everything, and step 7 is skipped: it needs the two users.
 """
 
 from __future__ import annotations
@@ -281,6 +284,41 @@ def _database_rule_problems(url: str) -> list[str]:
             if _refused(connection, line_sql, line(company_a, ana["id"], ben["id"])):
                 problems.append("an ended reporting line blocked adding the same line again")
 
+            # 7 and 8. Announcements (AN1): the audience CHECK keeps exactly the ID the
+            # type needs (MySQL only enforces CHECKs from 8.0.16), and the company-aware
+            # keys keep an announcement out of another company's department.
+            announcement_sql = (
+                "INSERT INTO announcements (id, company_id, author_id, audience_type, "
+                "department_id, team_id, title, body, created_at, updated_at) VALUES (:id, "
+                ":company, :author, :type, :department, NULL, 'probe', 'probe', NOW(6), NOW(6))"
+            )
+
+            def announcement(company: bytes, kind: str, dept: bytes | None) -> dict[str, object]:
+                return {
+                    "id": secrets.token_bytes(16),
+                    "company": company,
+                    "author": ana["id"],
+                    "type": kind,
+                    "department": dept,
+                }
+
+            if not _refused(
+                connection, announcement_sql, announcement(company_a, "company", department_a)
+            ):
+                problems.append("a company-wide announcement could name a department")
+            if not _refused(
+                connection, announcement_sql, announcement(company_a, "department", None)
+            ):
+                problems.append("a department announcement could have no department")
+            if not _refused(
+                connection, announcement_sql, announcement(company_b, "department", department_a)
+            ):
+                problems.append("an announcement could point at another company's department")
+            if _refused(
+                connection, announcement_sql, announcement(company_a, "department", department_a)
+            ):
+                problems.append("a valid department announcement was refused")
+
             transaction.rollback()
     finally:
         engine.dispose()
@@ -313,8 +351,10 @@ def _race_problems(url: str) -> list[str]:
             + _people_race_problems(engine)
             + _lockout_race_problems(engine)
             + _link_race_problems(engine)
+            + _sign_up_race_problems(engine)
             + _role_race_problems(engine)
             + _lapse_race_problems(engine)
+            + _time_off_review_race_problems(engine)
             + _role_view_lock_problems(engine)
             + _assignment_race_problems(engine)
             + _approval_race_problems(engine)
@@ -2113,6 +2153,289 @@ def _role_view_lock_problems(engine: Engine) -> list[str]:
     return problems
 
 
+def _time_off_review_race_problems(engine: Engine) -> list[str]:
+    """Reviewing time off while other requests change what a decision depends on; return
+    what failed (review of #167).
+
+    decide_request() (app/modules/time_off/service.py) takes the company's lock, then the
+    employee, the time-off request, and its approval record, and only then works out the
+    reviewers and counts the decisions, with locking reads. Answers (who reviews it, the
+    requests waiting for someone) use ordinary reads. Checks 1 and 2 fix request 2's view
+    first (ordinary reads, as its permission checks make), let request 1 commit, and then
+    run request 2's decision, so only reads after the locks can see the change:
+
+    1. The reviewer's time_off.review taken away meanwhile: the decision is refused (403).
+    2. Two reviewers, two approvals needed: the second sees the first's approval, so the
+       request is approved, not left waiting.
+    3. Answers take no row locks: with request 1 holding FOR UPDATE locks on the people,
+       roles, reporting lines, and time-off rows, request 2 (1 second lock wait) still
+       lists what waits for a reviewer, shows a request, and names its reviewers.
+    4. A decision and a lapse of the same overdue request at the same moment, in two
+       threads, several rounds: both take the time-off row before the approval record,
+       so neither waits for the other (no deadlock), and the request lapses once.
+    """
+    import threading
+    from datetime import timedelta
+
+    from sqlalchemy import delete, func, select, text
+    from sqlalchemy.orm import Session
+
+    import app.modules.time_off.approval  # noqa: F401  (registers the "time_off" handler)
+    import app.modules.time_off.scope  # noqa: F401  (where a time-off request belongs)
+    from app.approvals.models import ApprovalDecision, ApprovalRequest
+    from app.approvals.service import open_request
+    from app.audit import Actor
+    from app.audit.models import AuditEvent
+    from app.authz.chain import add_reporting_line
+    from app.authz.check import Forbidden
+    from app.authz.models import ReportingLine, Role, RoleAssignment, RolePermission
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.db.base import utcnow
+    from app.modules.org.models import Company, Department, TeamMember, User
+    from app.modules.org.service import Conflict
+    from app.modules.time_off import review
+    from app.modules.time_off import service as time_off
+    from app.modules.time_off.models import TimeOffRequest
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    with Session(engine) as platform:
+        company = Company(name="time off review race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # The owner; chef and lead, both direct managers of worker, each reviewing time off
+    # (and seeing it) for Office.
+    with session() as db:
+        office = Department(name="Office")
+        db.add(office)
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        people = {
+            name: User(
+                email=f"{name}@time-off-race.example.com",
+                display_name=name,
+                department_id=office.id,
+            )
+            for name in ("owner", "chef", "lead", "worker")
+        }
+        db.add_all(people.values())
+        db.flush()
+        assign_role(
+            db,
+            Actor.system(),
+            user_id=people["owner"].id,
+            role=roles["owner"],
+            scope_type="company",
+        )
+        reviewer = Role(name="Time off reviewer")
+        db.add(reviewer)
+        db.flush()
+        for code in ("time_off.review", "time_off.view"):
+            db.add(RolePermission(role_id=reviewer.id, permission_code=code))
+        for name in ("chef", "lead"):
+            assign_role(
+                db,
+                Actor.system(),
+                user_id=people[name].id,
+                role=reviewer,
+                scope_type="department",
+                scope_id=office.id,
+            )
+            add_reporting_line(
+                db, Actor.system(), manager_id=people[name].id, employee_id=people["worker"].id
+            )
+        db.commit()
+        ids = {name: person.id for name, person in people.items()}
+        office_id, reviewer_role = office.id, reviewer.id
+
+    def person(db: Session, name: str) -> User:
+        found = db.get(User, ids[name])
+        if found is None:  # made above, in this company
+            raise RuntimeError("a time off race probe person is missing")
+        return found
+
+    days_used = [0]
+
+    def asked(*, needed: int = 1, overdue: bool = False) -> uuid.UUID:
+        """worker asks for one day off (a new day each time), as ask() records it."""
+        days_used[0] += 1
+        day = (utcnow() + timedelta(days=days_used[0])).date()
+        with session() as db:
+            approval = open_request(
+                db,
+                kind="time_off",
+                requested_by=ids["worker"],
+                subject_user_id=ids["worker"],
+                payload={},
+                details={},
+                required_approvals=needed,
+                review_by=utcnow() + timedelta(days=1),
+            )
+            row = TimeOffRequest(
+                employee_id=ids["worker"],
+                first_day=day,
+                last_day=day,
+                status="pending",
+                approval_request_id=approval.id,
+            )
+            db.add(row)
+            db.flush()
+            approval.payload = {"time_off_request_id": str(row.id)}
+            if overdue:  # its first day began undecided
+                approval.review_by = utcnow() - timedelta(seconds=1)
+            db.commit()
+            return row.id
+
+    def fix_view(db: Session) -> None:
+        """Request 2 reads what its checks would: its view is now fixed."""
+        db.scalars(select(RoleAssignment)).all()
+        db.scalars(select(ReportingLine)).all()
+        db.scalars(select(ApprovalDecision)).all()
+        db.scalars(select(TimeOffRequest)).all()
+        db.scalars(select(User)).all()
+
+    def committed(change: Callable[[Session], object]) -> None:
+        with session() as request_1:
+            change(request_1)
+            request_1.commit()
+
+    take_away = delete(RoleAssignment).where(
+        RoleAssignment.user_id == ids["chef"], RoleAssignment.role_id == reviewer_role
+    )
+
+    def give_back(db: Session) -> None:
+        role = db.get(Role, reviewer_role)
+        if role is None:  # made above
+            raise RuntimeError("the time off race probe role is missing")
+        assign_role(
+            db,
+            Actor.system(),
+            user_id=ids["chef"],
+            role=role,
+            scope_type="department",
+            scope_id=office_id,
+        )
+
+    # 1. chef's time_off.review taken away while chef decides.
+    request_id = asked()
+    with session() as request_2:
+        fix_view(request_2)
+        committed(lambda db: db.execute(take_away))
+        try:
+            time_off.decide_request(
+                request_2, person(request_2, "chef"), request_id, "approve", None
+            )
+        except Forbidden:
+            pass  # refused: the removal was seen
+        else:
+            problems.append("a reviewer whose time_off.review was taken away could still decide")
+        request_2.rollback()
+    committed(give_back)
+
+    # 2. Two approvals needed: chef approves while lead's request waits, then lead approves.
+    request_id = asked(needed=2)
+    with session() as request_2:
+        fix_view(request_2)
+        committed(
+            lambda db: time_off.decide_request(db, person(db, "chef"), request_id, "approve", None)
+        )
+        decided = time_off.decide_request(
+            request_2, person(request_2, "lead"), request_id, "approve", None
+        )
+        if decided.status != "approved":
+            problems.append(f"the second of two approvals left the request {decided.status!r}")
+        request_2.rollback()
+
+    # 3. Answers while request 1 holds row locks on everything a locking read would need.
+    request_id = asked()
+    with session() as request_1:
+        for model in (User, RoleAssignment, ReportingLine, TeamMember, TimeOffRequest):
+            request_1.scalars(select(model).with_for_update()).all()
+        with session() as request_2:
+            request_2.execute(text("SET SESSION innodb_lock_wait_timeout = 1"))
+            chef = person(request_2, "chef")
+            try:
+                waiting = time_off.waiting(request_2, chef, limit=50)
+                time_off.view_request(request_2, chef, request_id)
+                row = request_2.get(TimeOffRequest, request_id)
+                approval = request_2.get(ApprovalRequest, row.approval_request_id) if row else None
+                named = review.reviewers(request_2, approval) if approval else set()
+            except OperationalError as error:
+                problems.append(f"time-off answers waited on row locks: {error}"[:300])
+            else:
+                if request_id not in {found.id for found in waiting}:
+                    problems.append("a request waiting for chef was not listed for chef")
+                if named != {ids["chef"], ids["lead"]}:
+                    problems.append("a request's reviewers were not chef and lead")
+            request_2.rollback()
+        request_1.rollback()
+
+    def race_round(request_id: uuid.UUID) -> list[str]:
+        """One round: chef decides and another request lapses it, in two threads."""
+
+        start = threading.Barrier(2)
+        outcomes = ["not run", "not run"]
+
+        def decide_it(index: int, request_id: uuid.UUID = request_id) -> None:
+            with session() as db:
+                chef = person(db, "chef")
+                start.wait()
+                try:
+                    time_off.decide_request(db, chef, request_id, "approve", None)
+                    outcomes[index] = "ok"
+                except Conflict:
+                    outcomes[index] = "refused"  # it lapsed first: declined as not reviewed
+                except Exception as error:  # a deadlock would show up here
+                    outcomes[index] = f"error: {error!r}"[:300]
+
+        def lapse_it(index: int, request_id: uuid.UUID = request_id) -> None:
+            with session() as db:
+                row = db.get(TimeOffRequest, request_id)
+                start.wait()
+                try:
+                    time_off.refresh(db, [row] if row else [])
+                    outcomes[index] = "ok"
+                except Exception as error:  # a deadlock would show up here
+                    outcomes[index] = f"error: {error!r}"[:300]
+
+        threads = [
+            threading.Thread(target=decide_it, args=(0,)),
+            threading.Thread(target=lapse_it, args=(1,)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        return outcomes
+
+    # 4. A decision and a lapse of one overdue request at the same moment.
+    for _ in range(5):
+        request_id = asked(overdue=True)
+        outcomes = race_round(request_id)
+        problems += [f"a decision racing a lapse: {o}" for o in outcomes if o.startswith("error")]
+        with session() as db:
+            row = db.get(TimeOffRequest, request_id)
+            entries = db.scalar(
+                select(func.count()).where(
+                    AuditEvent.chain_id == company_id,
+                    AuditEvent.action == "time_off.not_reviewed",
+                    AuditEvent.target_id == request_id,
+                )
+            )
+        if row is None or row.status != "denied" or entries != 1:
+            status = row.status if row else None
+            problems.append(f"an overdue request ended {status!r} with {entries} lapse entries")
+    return problems
+
+
 def _lockout_race_problems(engine: Engine) -> list[str]:
     """Wrong passwords for one account sent at the same moment; return what failed.
 
@@ -2185,6 +2508,74 @@ def _lockout_race_problems(engine: Engine) -> list[str]:
         problems.append(
             f"{guesses} wrong passwords at the same moment counted {counted} (expected 5, "
             f"then locked), locked={locked}"
+        )
+    return problems
+
+
+def _sign_up_race_problems(engine: Engine) -> list[str]:
+    """Sign-ups racing for the last place under the platform limit; return what failed.
+
+    Each sign-up locks the platform audit chain's head before it counts this hour's new
+    companies (app/modules/sign_up/service.py). Without that, sign-ups sent together
+    would each count the same number and each add a company, past the limit. With one
+    place left, four sign-ups sent together must give exactly one new company; the other
+    three are refused (429). Nothing else in this check writes to the platform chain, so
+    these are the first sign-ups on a new platform: the lock holds the empty head that
+    migration 0013 creates (without it, MySQL stopped the racers as deadlocks).
+    """
+    import threading
+
+    from fastapi import HTTPException
+    from pydantic import SecretStr
+    from sqlalchemy import func, select
+    from sqlalchemy.orm import Session
+
+    from app.modules.org.models import Company
+    from app.modules.sign_up import service
+    from app.modules.sign_up.schemas import SignUpRequest
+
+    with Session(engine) as platform:
+        made_before = platform.scalar(select(func.count(Company.id))) or 0
+    racers = 4
+    # Every company in this throwaway database was made in the last hour: one place left.
+    limit_before = service.PLATFORM_PER_HOUR
+    service.PLATFORM_PER_HOUR = made_before + 1
+    start = threading.Barrier(racers)
+    outcomes: list[str] = []
+    errors: list[str] = []
+
+    def sign_up(number: int) -> None:
+        body = SignUpRequest(
+            company_name=f"Racer {number}",
+            timezone="UTC",
+            display_name=f"Racer {number}",
+            email=f"racer-{number}@sign-up-race.example.com",
+            password=SecretStr("lanterns drift over quiet waters"),
+        )
+        start.wait()
+        try:
+            service.sign_up(engine, body)
+            outcomes.append("made")
+        except HTTPException as error:  # TooManyRequests: the limit was reached
+            outcomes.append(str(error.status_code))
+        except Exception as error:  # a 500 in the app: reported below
+            errors.append(f"error: {error!r}"[:300])
+
+    try:
+        threads = [threading.Thread(target=sign_up, args=(n,)) for n in range(racers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+    finally:
+        service.PLATFORM_PER_HOUR = limit_before
+    with Session(engine) as platform:
+        made_after = platform.scalar(select(func.count(Company.id))) or 0
+    problems = [f"sign-ups at the same moment: {error}" for error in errors]
+    if made_after - made_before != 1 or sorted(outcomes) != ["429", "429", "429", "made"]:
+        problems.append(
+            f"{racers} sign-ups racing for one place made {made_after - made_before} "
+            f"companies (expected 1), answers {sorted(outcomes)}"
         )
     return problems
 
@@ -2597,6 +2988,115 @@ def _grant_problems(app_url: str) -> list[str]:
     return problems
 
 
+def _existing_company_problems(url: str, config: Config) -> list[str]:
+    """A company made before announcements can post after the upgrade; return what failed.
+
+    Migration 0014 gives announcement.create to the Owner, Administrator, and Manager
+    starting roles of companies that already exist (review of #157). This starts from the
+    database as it was just before 0014, adds a company there with its four starting roles
+    and one role of its own (plain SQL, as the app of that time had no announcements),
+    upgrades to the newest migration, and checks:
+    1. exactly those three starting roles now grant it; Employee and the company's own
+       role do not;
+    2. a manager of that company now holds it, through the app's own permission check.
+    main() has upgraded to 0013 before calling this; this upgrades the rest of the way.
+    """
+    import uuid
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    from app.audit import Actor
+    from app.authz.check import effective_permissions
+    from app.authz.models import Role
+    from app.authz.roles import assign_role
+    from app.core.config import get_settings
+    from app.modules.org.models import Department, User
+    from app.tenancy.context import set_company
+
+    # Giving the manager a role below writes a signed audit entry (as in _race_problems).
+    os.environ.setdefault("AUDIT_SIGNING_KEY", secrets.token_urlsafe(32))
+    get_settings.cache_clear()
+
+    company_id = uuid.uuid4()
+    now = datetime.now(UTC).replace(tzinfo=None)
+    engine = create_engine(url)
+    try:
+        # 1. The company as it was made before 0014: four starting roles and one of its own.
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO companies (id, name, timezone, created_at, updated_at) "
+                    "VALUES (:id, 'existing company probe', 'UTC', :now, :now)"
+                ),
+                {"id": company_id.bytes, "now": now},
+            )
+            for built_in, name in (
+                ("owner", "Owner"),
+                ("administrator", "Administrator"),
+                ("manager", "Manager"),
+                ("employee", "Employee"),
+                (None, "Front desk"),
+            ):
+                connection.execute(
+                    text(
+                        "INSERT INTO roles (id, company_id, name, built_in, created_at, updated_at)"
+                        " VALUES (:id, :company, :name, :built_in, :now, :now)"
+                    ),
+                    {
+                        "id": uuid.uuid4().bytes,
+                        "company": company_id.bytes,
+                        "name": name,
+                        "built_in": built_in,
+                        "now": now,
+                    },
+                )
+        # 2. The upgrade, as on a server that already has companies.
+        command.upgrade(config, "head")
+        # 3. Which of the company's roles grant it now.
+        with engine.connect() as connection:
+            granted = connection.execute(
+                text(
+                    "SELECT r.name FROM roles r JOIN role_permissions rp ON rp.role_id = r.id "
+                    "WHERE r.company_id = :company AND rp.permission_code = 'announcement.create'"
+                ),
+                {"company": company_id.bytes},
+            ).scalars()
+            names = sorted(granted)
+        problems = []
+        if names != ["Administrator", "Manager", "Owner"]:
+            problems.append(f"after the upgrade announcement.create is granted by {names}")
+        # 4. A manager of the company, through the app's own check.
+        with Session(engine) as db:
+            set_company(db, company_id)
+            department = Department(name="Kitchen")
+            db.add(department)
+            db.flush()
+            manager = User(
+                email="manager@existing.example.com",
+                display_name="manager",
+                department_id=department.id,
+            )
+            db.add(manager)
+            db.flush()
+            role = db.scalars(select(Role).where(Role.built_in == "manager")).one()
+            assign_role(
+                db,
+                Actor.system(),
+                user_id=manager.id,
+                role=role,
+                scope_type="department",
+                scope_id=department.id,
+            )
+            db.commit()
+            if "announcement.create" not in effective_permissions(db, manager):
+                problems.append("a manager of an existing company cannot post after the upgrade")
+        return problems
+    finally:
+        engine.dispose()
+
+
 def main() -> int:
     config = Config("alembic.ini")
     heads = ScriptDirectory.from_config(config).get_heads()
@@ -2622,14 +3122,17 @@ def main() -> int:
         from app.core.config import get_settings
 
         get_settings.cache_clear()
-        command.upgrade(config, "head")
+        # Up to just before announcements, then an existing company is upgraded the rest
+        # of the way (the function says what it checks).
+        command.upgrade(config, "0013")
+        upgrade_problems = _existing_company_problems(url, config)
         # The race checks commit rows, so they run before the downgrade removes everything.
         # They run as the application user, like the app.
         race_problems = _race_problems(app_url)
         command.downgrade(config, "base")
         command.upgrade(config, "head")
         differences = _differences_from_models(url)
-        rule_problems = _database_rule_problems(url) + race_problems
+        rule_problems = _database_rule_problems(url) + upgrade_problems + race_problems
         # Last, as a refused change that got through could leave the database broken.
         if app_url != url:
             rule_problems += _grant_problems(app_url)

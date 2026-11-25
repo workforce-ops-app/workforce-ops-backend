@@ -1,5 +1,6 @@
 """The rules for asking for time off and following your requests (docs/features/time-off.md,
-states and rules). Reviewing requests is TO2 (#64).
+states and rules). Who reviews a request and what the decisions add up to are in
+review.py.
 
 - Asking needs time_off.request_self; cancelling, time_off.cancel_self. Both only ever
   reach your own requests.
@@ -20,47 +21,46 @@ states and rules). Reviewing requests is TO2 (#64).
   (the scope filter for lists, authorize() for one). Another company's answer 404.
 - The reason is kept as typed (at most 500 characters) and shown only as plain text.
 
-Every change is audited (time_off.requested, time_off.cancelled) and commits once.
+- Deciding: only a current reviewer (review.py), checked after taking the locks, so
+  somebody who lost their role or their place meanwhile cannot decide. Never the
+  employee (AZ7). A comment may go with the decision (plain text, at most 500).
+- Waiting for me: the requests the user may decide right now.
+
+Every change is audited (time_off.requested, time_off.cancelled, time_off.approved,
+time_off.denied, time_off.escalated, shift.opened) and commits once.
+
+Locks, always in this order (review of #167): the company's lock, the employee, the
+time-off request, its approval record, then the employee's shifts. Asking, cancelling,
+deciding, and a lapse (app/approvals/service.py, lapse) all follow it, so none of them can
+hold one lock while waiting for another that the other holds.
 """
 
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time, timedelta
-from zoneinfo import ZoneInfo
+from datetime import date, datetime
 
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
 
 from app.approvals.models import ApprovalDecision, ApprovalRequest
+from app.approvals.service import DecisionError, decide, lapse, may_decide, open_request
 from app.approvals.service import cancel as cancel_approval
-from app.approvals.service import lapse, open_request
 from app.audit import Actor, record
-from app.authz.check import Forbidden, authorize, scope_filter
+from app.authz.chain import lock_reporting_lines
+from app.authz.check import Forbidden, authorize, grants, scope_filter
 from app.authz.scope import ScopeColumns
 from app.db.base import utcnow
 from app.modules.org import repository
-from app.modules.org.models import Department, User
+from app.modules.org.models import User
 from app.modules.org.service import Conflict, Invalid, NotFound
 from app.modules.schedules.models import Shift
-from app.modules.schedules.repository import workplace_zone
+from app.modules.time_off.days import day_starts, zone_of
 from app.modules.time_off.models import HOLDING, TimeOffRequest
+from app.modules.time_off.review import overlapping_shifts
 from app.modules.time_off.schemas import TimeOffCreate
 from app.settings.service import TIME_OFF_REQUIRED_APPROVALS, setting_value
 
 MAX_DAYS = 30
-
-
-def zone_of(db: Session, person: User) -> ZoneInfo:
-    """The person's workplace time zone: their home department's, or the company's."""
-    home = db.get(Department, person.department_id)
-    if home is None:  # everyone has a home department of their own company
-        raise RuntimeError("the person's home department is missing")
-    return ZoneInfo(workplace_zone(db, home))
-
-
-def day_starts(zone: ZoneInfo, day: date) -> datetime:
-    """The UTC moment (without zone, as stored) where a day begins in a zone."""
-    return datetime.combine(day, time(0), zone).astimezone(UTC).replace(tzinfo=None)
 
 
 # --- Keeping requests up to date -------------------------------------------------------
@@ -107,6 +107,12 @@ def not_reviewed(db: Session, rows: list[TimeOffRequest]) -> dict[uuid.UUID, boo
         ).all()
     )
     return {row.id: bool(flags.get(row.approval_request_id)) for row in rows}
+
+
+def comments(db: Session, request: TimeOffRequest) -> dict[str, str]:
+    """The reviewers' comments on a request, by reviewer ID."""
+    approval = db.get(ApprovalRequest, request.approval_request_id)
+    return dict(approval.payload.get("comments", {})) if approval is not None else {}
 
 
 # --- Seeing requests -------------------------------------------------------------------
@@ -191,30 +197,6 @@ class Detail:
     decisions: list[ApprovalDecision]
 
 
-def affected_shifts(db: Session, request: TimeOffRequest) -> list[Shift]:
-    """The employee's scheduled shifts that overlap the requested days (in their zone)."""
-    employee = db.get(User, request.employee_id)
-    if employee is None:
-        return []
-    zone = zone_of(db, employee)
-    start, end = (
-        day_starts(zone, request.first_day),
-        day_starts(zone, request.last_day + timedelta(days=1)),
-    )
-    return list(
-        db.scalars(
-            select(Shift)
-            .where(
-                Shift.employee_id == employee.id,
-                Shift.status == "scheduled",
-                Shift.starts_at < end,
-                Shift.ends_at > start,
-            )
-            .order_by(Shift.starts_at)
-        )
-    )
-
-
 def view_request(db: Session, user: User, request_id: uuid.UUID) -> Detail:
     """One request with its affected shifts and decisions: your own, or one your
     time_off.view covers (403); another company's or an unknown one is 404."""
@@ -222,7 +204,14 @@ def view_request(db: Session, user: User, request_id: uuid.UUID) -> Detail:
     if request is None:
         raise NotFound()
     if request.employee_id != user.id:
-        authorize(db, user, "time_off.view", request)
+        try:
+            authorize(db, user, "time_off.view", request)
+        except Forbidden:
+            # A reviewer sees what they are asked to decide, even without time_off.view
+            # over the employee (a shared manager reached through escalation).
+            approval = db.get(ApprovalRequest, request.approval_request_id)
+            if approval is None or not may_decide(db, user, approval):
+                raise
     refresh(db, [request])
     decisions = list(
         db.scalars(
@@ -231,7 +220,8 @@ def view_request(db: Session, user: User, request_id: uuid.UUID) -> Detail:
             .order_by(ApprovalDecision.decided_at)
         )
     )
-    return Detail(request, affected_shifts(db, request), decisions)
+    shifts = sorted(overlapping_shifts(db, request), key=lambda shift: shift.starts_at)
+    return Detail(request, shifts, decisions)
 
 
 # --- Asking ----------------------------------------------------------------------------
@@ -250,7 +240,11 @@ def ask(db: Session, user: User, body: TimeOffCreate) -> TimeOffRequest:
         raise Invalid("The first day must be tomorrow or later.")
 
     # Take turns with the person's other requests (their row), then check overlaps on
-    # fresh reads, after declining any that have run out of time.
+    # fresh reads, after declining any that have run out of time. The company's lock
+    # first: the order every time-off change takes (the top of review.py), since a lapse
+    # below may take it, and taking it after the person's row could deadlock with a
+    # decision, which takes the company's lock and then the person.
+    lock_reporting_lines(db)
     me = repository.person(db, user.id, lock=True)
     if me is None or me.deactivated_at is not None:
         raise Forbidden()
@@ -263,7 +257,9 @@ def ask(db: Session, user: User, body: TimeOffCreate) -> TimeOffRequest:
                 TimeOffRequest.first_day <= body.last_day,
                 TimeOffRequest.last_day >= body.first_day,
             )
-            .with_for_update(read=True)
+            # FOR UPDATE, not FOR SHARE: a lapse below writes the row (lock order: the
+            # time-off row, then its approval record; app/modules/time_off/approval.py).
+            .with_for_update()
         )
     )
     for row in holding:
@@ -316,7 +312,9 @@ def cancel(db: Session, user: User, request_id: uuid.UUID) -> TimeOffRequest:
     found = db.get(TimeOffRequest, request_id)
     if found is None or found.employee_id != user.id:
         raise NotFound()  # someone else's request is not yours to know about here
-    # Same order as asking: the person, then the request (fresh and locked).
+    # Same order as asking and deciding: the company's lock, the person, then the request
+    # (fresh and locked), then its approval record (review of #167).
+    lock_reporting_lines(db)
     repository.person(db, user.id, lock=True)
     request = db.get(TimeOffRequest, request_id, populate_existing=True, with_for_update=True)
     if request is None:
@@ -342,5 +340,80 @@ def cancel(db: Session, user: User, request_id: uuid.UUID) -> TimeOffRequest:
         target_type="time_off_request",
         target_id=request.id,
     )
+    db.commit()
+    return request
+
+
+# --- Reviewing -------------------------------------------------------------------------
+
+NOT_REVIEWED = "Nobody reviewed this request in time, so it was declined."
+
+
+def waiting(db: Session, user: User, *, limit: int) -> list[TimeOffRequest]:
+    """The requests the user may decide right now, soonest first day first."""
+    if not grants(db, user, "time_off.review"):
+        return []  # nobody without the permission reviews anything
+    rows = list(
+        db.scalars(
+            select(TimeOffRequest)
+            .where(
+                TimeOffRequest.status.in_(("pending", "escalated")),
+                TimeOffRequest.employee_id != user.id,
+            )
+            .order_by(TimeOffRequest.first_day, TimeOffRequest.id)
+        )
+    )
+    refresh(db, rows)
+    found = []
+    for row in rows:
+        approval = db.get(ApprovalRequest, row.approval_request_id)
+        if approval is not None and may_decide(db, user, approval):
+            found.append(row)
+            if len(found) == limit:
+                break
+    return found
+
+
+def decide_request(
+    db: Session, user: User, request_id: uuid.UUID, decision: str, comment: str | None
+) -> TimeOffRequest:
+    """Approve or deny a request the user reviews.
+
+    Locks, in this order: the company's reporting lines (who is above whom stays still
+    while the reviewers are worked out), the employee (as every schedule change does
+    before touching their shifts), the request, and its approval record. Only then are
+    the reviewers worked out, on fresh reads, and the decision recorded.
+    """
+    authorize(db, user, "time_off.review")
+    found = db.get(TimeOffRequest, request_id)
+    if found is None:
+        raise NotFound()
+    lock_reporting_lines(db)
+    repository.person(db, found.employee_id, lock=True)
+    request = db.get(TimeOffRequest, request_id, populate_existing=True, with_for_update=True)
+    approval = db.get(
+        ApprovalRequest, found.approval_request_id, populate_existing=True, with_for_update=True
+    )
+    if request is None or approval is None:  # never deleted
+        raise NotFound()
+    if lapse(db, approval):
+        db.commit()
+        raise Conflict(NOT_REVIEWED)
+    if request.status not in ("pending", "escalated"):
+        raise Conflict("This request is no longer waiting for a decision.")
+    # Fresh: the reviewer's grants, their place, the chain, the owners, and the employee
+    # as committed now, so a reviewer who lost time_off.review while this request waited
+    # for the locks cannot decide (review of #167).
+    if not may_decide(db, user, approval, fresh=True):
+        raise Forbidden()  # their own, or not (or no longer) one of its reviewers
+    if comment:
+        # Kept with the approval record, keyed by who wrote it; never in the audit log.
+        comments = {**approval.payload.get("comments", {}), str(user.id): comment}
+        approval.payload = {**approval.payload, "comments": comments}
+    try:
+        decide(db, user, approval, decision)
+    except DecisionError as error:
+        db.rollback()
+        raise Conflict(str(error)) from error
     db.commit()
     return request
