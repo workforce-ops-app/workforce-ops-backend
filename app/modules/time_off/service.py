@@ -43,7 +43,7 @@ from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
 
 from app.approvals.models import ApprovalDecision, ApprovalRequest
-from app.approvals.service import DecisionError, decide, lapse, may_decide, open_request
+from app.approvals.service import DecisionError, decide, lapse, may_decide, open_request, waits_for
 from app.approvals.service import cancel as cancel_approval
 from app.audit import Actor, record
 from app.authz.chain import lock_reporting_lines
@@ -350,7 +350,8 @@ NOT_REVIEWED = "Nobody reviewed this request in time, so it was declined."
 
 
 def waiting(db: Session, user: User, *, limit: int) -> list[TimeOffRequest]:
-    """The requests the user may decide right now, soonest first day first."""
+    """The requests still waiting for the user's decision, soonest first day first. One
+    they already decided, still waiting for the other reviewers, is not listed."""
     if not grants(db, user, "time_off.review"):
         return []  # nobody without the permission reviews anything
     rows = list(
@@ -367,7 +368,7 @@ def waiting(db: Session, user: User, *, limit: int) -> list[TimeOffRequest]:
     found = []
     for row in rows:
         approval = db.get(ApprovalRequest, row.approval_request_id)
-        if approval is not None and may_decide(db, user, approval):
+        if approval is not None and waits_for(db, user, approval):
             found.append(row)
             if len(found) == limit:
                 break

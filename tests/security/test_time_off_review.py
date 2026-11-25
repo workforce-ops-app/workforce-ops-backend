@@ -284,6 +284,35 @@ def test_disagreement_goes_to_the_nearest_shared_manager(people: ShiftSetup) -> 
     assert status(people, request_id) == "approved"
 
 
+def test_a_reviewer_who_decided_no_longer_sees_it_as_waiting(people: ShiftSetup) -> None:
+    # Reported in review: after denying, the request stayed at the top under "Waiting for
+    # you". With two reviewers (chef and lead), one decision leaves the request pending for
+    # the other; it must leave the list of the one who decided, for a denial and for an
+    # approval alike.
+    with people.db() as db:
+        db.add(TeamMember(team_id=people.ids["crew"], user_id=people.ids["ana"]))
+        db.commit()
+    also_reports_to(people, "ana", "lead")
+    needs_two(people)
+    denied_first = ask(people.browser("ana"), 2, 2)
+    approved_first = ask(people.browser("ana"), 4, 4)
+    both = {denied_first, approved_first}
+    assert set(waiting_for(people, "chef")) == both == set(waiting_for(people, "lead"))
+
+    assert decide(people, "chef", denied_first, "deny") == 200
+    assert decide(people, "chef", approved_first, "approve") == 200
+    # Both still wait for lead, so neither is settled yet.
+    assert status(people, denied_first) == "pending"
+    assert status(people, approved_first) == "pending"
+    assert waiting_for(people, "chef") == []
+    assert set(waiting_for(people, "lead")) == both
+
+    # chef can still open both to follow them, and cannot decide them again.
+    client = people.browser("chef")
+    assert client.get(f"{URL}/{denied_first}").status_code == 200
+    assert decide(people, "chef", denied_first, "approve") == 409
+
+
 def test_with_no_shared_manager_the_owner_settles_it(people: ShiftSetup) -> None:
     # ana reports to chef and to admin, and admin no longer reports to anyone: nobody is
     # above both of them through lines, so the owner decides.

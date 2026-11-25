@@ -102,6 +102,33 @@ def test_with_several_owners_every_other_owner_must_agree(people: ShiftSetup) ->
     assert owners(people) == ids(people, "owner", "admin", "chef", "ana")
 
 
+def test_an_owner_who_approved_no_longer_sees_it_as_waiting(people: ShiftSetup) -> None:
+    # The Approvals page's "waiting for you" list (view=to_review) shows only requests
+    # that still need this person's decision. With three owners, a new owner needs both
+    # other owners: after one approves, the request is still pending, but it waits only
+    # for the other one.
+    three_owners(people)
+    owner = reenter(people.browser("owner"))
+    asked = owner.post(URL, json={"user_id": str(people.ids["ana"])})
+    assert asked.status_code == 202
+    request_id = asked.json()["id"]
+
+    def to_review(name: str) -> list[str]:
+        listed = people.browser(name).get("/api/approval-requests", params={"view": "to_review"})
+        assert listed.status_code == 200, listed.text
+        return [item["id"] for item in listed.json()["items"]]
+
+    assert request_id in to_review("admin") and request_id in to_review("chef")
+    admin = reenter(people.browser("admin"))
+    assert admin.post(f"/api/approval-requests/{request_id}/approve").status_code == 200
+    # Gone from admin's list (they decided), still on chef's (they have not).
+    assert request_id not in to_review("admin")
+    assert request_id in to_review("chef")
+    # admin can still open it to follow it, and deciding again is still refused.
+    assert people.browser("admin").get(f"/api/approval-requests/{request_id}").status_code == 200
+    assert admin.post(f"/api/approval-requests/{request_id}/deny").status_code == 409
+
+
 def test_one_denial_stops_an_owner_change(people: ShiftSetup) -> None:
     three_owners(people)
     owner = reenter(people.browser("owner"))

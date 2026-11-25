@@ -56,6 +56,25 @@ class AudienceOut(BaseModel):
     team_name: str | None
 
 
+class AudienceChoice(BaseModel):
+    """An audience the signed-in person may post to (GET /api/announcements/audiences).
+
+    type, department_id, and team_id are exactly what the POST body needs for it (so for a
+    team, department_id is null). name is the department's or team's name (null for the
+    company); department_name is a team's department, for the screens only.
+    """
+
+    type: str
+    department_id: uuid.UUID | None
+    team_id: uuid.UUID | None
+    name: str | None
+    department_name: str | None
+
+
+class AudienceChoiceList(BaseModel):
+    items: list[AudienceChoice]
+
+
 class AuthorRef(BaseModel):
     id: uuid.UUID
     display_name: str
@@ -81,6 +100,54 @@ class AnnouncementManagedPage(BaseModel):
     """A page of the managed list; next_cursor fetches the next page, null on the last one."""
 
     items: list[AnnouncementManagedOut]
+    next_cursor: str | None
+
+
+class AnnouncementOut(BaseModel):
+    """One announcement as a reader sees it: the same fields, and whether they have read it
+    (never the counts, which are for the people who manage it)."""
+
+    id: uuid.UUID
+    audience: AudienceOut
+    title: str
+    body: str
+    author: AuthorRef
+    posted_at: datetime  # UTC
+    edited_at: datetime | None  # UTC; null until edited
+    archived: bool
+    # Whether the signed-in person has read it.
+    read: bool
+
+
+class AnnouncementPage(BaseModel):
+    """A page of the reader's list; next_cursor fetches the next page, null on the last one."""
+
+    items: list[AnnouncementOut]
+    next_cursor: str | None
+
+
+class AnnouncementDetailOut(AnnouncementOut):
+    """GET /api/announcements/{id}: the reader's fields, and for someone whose
+    announcement.create covers the audience also the read counts (null for everyone else,
+    so a reader never learns how many others have read it)."""
+
+    read_count: int | None
+    audience_count: int | None
+
+
+class ReadOut(BaseModel):
+    """One person in the audience on the read list, and when they read it (null: not yet)."""
+
+    id: uuid.UUID
+    display_name: str
+    read_at: datetime | None  # UTC
+
+
+class ReadPage(BaseModel):
+    """A page of the read list, in name order; next_cursor fetches the next page, null on
+    the last one. The totals are the announcement's read_count and audience_count."""
+
+    items: list[ReadOut]
     next_cursor: str | None
 
 

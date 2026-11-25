@@ -33,7 +33,7 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 | Permission | Kind | Allows |
 |---|---|---|
 | `schedule.view_self` | self | see your own shifts |
-| `schedule.view` | record | see shifts in scope, including open shifts |
+| `schedule.view` | record | see shifts in scope, including open shifts, with the names of each person's roles in the shift's department (not their permissions or scopes; decision 0038) |
 | `schedule.edit` | record | create, change, and cancel shifts in scope |
 | `time_off.request_self` | self | ask for time off for yourself |
 | `time_off.cancel_self` | self | cancel your own pending or approved request |
@@ -245,7 +245,7 @@ Built in `app/modules/approval_requests/` (HTTP), on the shared layer `app/appro
 | Endpoint | Who | What it does |
 |---|---|---|
 | `GET /api/approval-requests?view=mine` | anyone | the newest requests you asked for or that are about you |
-| `GET /api/approval-requests?view=to_review` | anyone | the pending requests you may decide now |
+| `GET /api/approval-requests?view=to_review` | anyone | the pending requests still waiting for your decision: one you already decided, still waiting for the other reviewers, is left out (`waits_for()` in `app/approvals/service.py`) |
 | `GET /api/approval-requests/{id}` | the requester, the person it is about, whoever decided it, its current reviewers | one request; 404 for anyone else |
 | `POST /api/approval-requests/{id}/approve`, `.../deny` | a current reviewer, never the requester or the person it is about (AZ7, AZ14); password re-entry for an admin-level role | one denial denies; enough approvals approve, and the role is given in the same transaction |
 | `POST /api/approval-requests/{id}/cancel` | the requester | takes the request back; never a time-off request (409: it is approved, denied, and cancelled on `/api/time-off-requests`, which changes the time-off request too) |
