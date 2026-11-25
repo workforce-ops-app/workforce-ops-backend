@@ -17,7 +17,8 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Query
 
-# Registers what role requests do on approval, before any request is decided.
+# Registers what each kind of request does on approval, before any request is decided.
+import app.modules.owners.approval  # noqa: F401
 import app.modules.roles.approval  # noqa: F401
 from app.auth.dependencies import Database, SignedInPerson
 from app.modules.approval_requests import service

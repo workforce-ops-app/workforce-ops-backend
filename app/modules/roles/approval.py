@@ -37,7 +37,13 @@ from app.approvals.service import DecisionError, Handler, register_handler
 from app.audit import Actor
 from app.authz.chain import direct_managers_fresh, is_above_in_chain_fresh
 from app.authz.check import ADMIN_LEVEL, Forbidden, NotFound, authorize, is_owner
-from app.authz.delegation import held_for, place_problem, scope_of, what_role_grants
+from app.authz.delegation import (
+    active_owners,
+    held_for,
+    place_problem,
+    scope_of,
+    what_role_grants,
+)
 from app.authz.models import Role, RoleAssignment
 from app.authz.roles import assign_role
 from app.modules.org.models import User
@@ -97,21 +103,6 @@ def _could_give(db: Session, reviewer: User, request: ApprovalRequest, *, fresh:
     return held_for(db, reviewer, codes, place, fresh=fresh) == codes
 
 
-def _owners(db: Session, *, fresh: bool) -> set[uuid.UUID]:
-    """The company's active owners (Owner role, company-wide); locking reads if fresh."""
-    query = (
-        select(RoleAssignment.user_id, Role.id)
-        .join(Role, Role.id == RoleAssignment.role_id)
-        .where(Role.built_in == "owner", RoleAssignment.scope_type == "company")
-    )
-    ids = db.scalars(query.with_for_update(read=True) if fresh else query)
-    return {
-        person
-        for person in ids
-        if (found := _row(db, User, person, fresh)) and found.deactivated_at is None
-    }
-
-
 def reviewers(db: Session, request: ApprovalRequest, *, fresh: bool = False) -> set[uuid.UUID]:
     """Who may decide the request now: the nearest level above the giver where somebody
     could give the role themselves, or else the owners. fresh=True after the company's
@@ -129,7 +120,7 @@ def reviewers(db: Session, request: ApprovalRequest, *, fresh: bool = False) -> 
             return able
         seen |= level
         level = direct_managers_fresh(db, level) - seen
-    return _owners(db, fresh=fresh) - {request.requested_by, request.subject_user_id}
+    return active_owners(db, fresh=fresh) - {request.requested_by, request.subject_user_id}
 
 
 def sensitive(db: Session, request: ApprovalRequest) -> bool:

@@ -75,12 +75,16 @@ class Handler:
         it can no longer be made (say, the role was archived meanwhile). Runs after the
         company's lock, so it reads fresh.
     describe(db, request): what the audit entries show about it (no personal data).
+    ready(db, request, approvers): whether the approvals so far are enough. Without it,
+        `required_approvals` approvals are enough; owner changes instead need every
+        current reviewer, worked out again now, so an owner added meanwhile must agree too.
     """
 
     reviewers: Reviewers
     sensitive: Callable[[Session, ApprovalRequest], bool]
     apply: Callable[[Session, ApprovalRequest, User], None]
     describe: Callable[[Session, ApprovalRequest], dict[str, Any]]
+    ready: Callable[[Session, ApprovalRequest, set[uuid.UUID]], bool] | None = None
 
 
 _handlers: dict[str, Handler] = {}
@@ -270,16 +274,34 @@ def decide(db: Session, user: User, request: ApprovalRequest, decision: str) -> 
         return
 
     db.flush()  # the decision is counted below
-    approvals = db.scalars(
-        select(ApprovalDecision.approver_id)
-        .where(ApprovalDecision.request_id == request.id, ApprovalDecision.decision == "approve")
-        .with_for_update(read=True)
-    ).all()
-    if len(approvals) < request.required_approvals:
+    approvals = set(
+        db.scalars(
+            select(ApprovalDecision.approver_id)
+            .where(
+                ApprovalDecision.request_id == request.id, ApprovalDecision.decision == "approve"
+            )
+            .with_for_update(read=True)
+        )
+    )
+    handler = handler_for(request)
+    enough = (
+        handler.ready(db, request, approvals)
+        if handler.ready is not None
+        else len(approvals) >= request.required_approvals
+    )
+    if not enough:
+        record(
+            db,
+            actor=Actor.user(user.id),
+            action="approval.approved",
+            target_type="approval_request",
+            target_id=request.id,
+            details={**details, "final": False},
+        )
         return  # more approvals needed; it stays pending
     # Approved: the change is made in this same transaction, so either both happen or
     # neither does.
-    handler_for(request).apply(db, request, user)
+    handler.apply(db, request, user)
     request.status, request.decided_at = "approved", now
     record(
         db,
@@ -287,7 +309,7 @@ def decide(db: Session, user: User, request: ApprovalRequest, decision: str) -> 
         action="approval.approved",
         target_type="approval_request",
         target_id=request.id,
-        details=details,
+        details={**details, "final": True},
     )
 
 

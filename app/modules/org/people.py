@@ -299,8 +299,9 @@ def deactivate(
     if person.deactivated_at is not None:
         raise Conflict("This person is already deactivated.")
     # AZ8 and AZ15: owners are removed only through the owner change flow, with the other
-    # owners' approval, and the last owner never.
-    if is_owner(db, person):
+    # owners' approval, and the last owner never. Read fresh: an owner change locks this
+    # person's row too, so one committed while this request waited for it is seen.
+    if is_owner(db, person, fresh=True):
         raise Conflict("An owner cannot be deactivated. Remove them as an owner first.")
     # Sensitive when the person holds an admin-level permission (by what their roles grant,
     # custom roles included): refused with reauth-required unless the password was entered
