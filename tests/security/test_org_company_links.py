@@ -24,12 +24,13 @@ from sqlalchemy.orm import Session
 
 from app.authz.models import ReportingLine
 from app.db.base import Base
-from app.modules.org.models import Company, Department, Team, TeamMember, User
+from app.modules.org.models import Company, CompanyLock, Department, Team, TeamMember, User
 from app.tenancy.context import set_company
 from app.tenancy.filter import UnsafeQueryError, WrongCompanyError
 
 ORG_TABLES = [
-    model.__table__ for model in (Company, Department, Team, User, TeamMember, ReportingLine)
+    model.__table__
+    for model in (Company, CompanyLock, Department, Team, User, TeamMember, ReportingLine)
 ]
 
 

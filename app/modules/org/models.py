@@ -19,14 +19,17 @@ from datetime import datetime
 
 from sqlalchemy import (
     CheckConstraint,
+    Connection,
     ForeignKeyConstraint,
     Index,
     SmallInteger,
     String,
     UniqueConstraint,
+    event,
+    insert,
 )
 from sqlalchemy.dialects import mysql
-from sqlalchemy.orm import Mapped, mapped_column, validates
+from sqlalchemy.orm import Mapped, Mapper, mapped_column, validates
 
 from app.db.base import UTC_DATETIME, Base, IdAndTimestamps, Timestamps
 from app.db.types import UUIDBinary
@@ -55,6 +58,39 @@ class Company(IdAndTimestamps, CompanyRecord, Base):
     timezone: Mapped[str] = mapped_column(String(64))
     # Null while the company is active (decision 0020: archive, never delete).
     archived_at: Mapped[datetime | None] = mapped_column(UTC_DATETIME)
+
+
+class CompanyLock(CompanyOwned, Base):
+    """The company's lock: one row per company, locked by chain.lock_reporting_lines() so
+    that changes to who is above whom, and to the roles and owners that depend on it, take
+    turns within a company (#198).
+
+    A row of its own, not the company's row: every audit entry and most other rows refer
+    to the companies row by a foreign key, and MySQL takes a shared lock on that row for
+    each such insert. With the lock on the companies row, a request writing its audit
+    entry waited for whoever held the company's lock, and two requests could wait for each
+    other (a deadlock, which MySQL ends with an error). Nothing refers to this row, so
+    holding it blocks only other requests that ask for the company's lock.
+
+    Made with the company, in the same transaction (_add_company_lock below), and never
+    changed or removed.
+    """
+
+    __tablename__ = "company_locks"
+    __table_args__ = (ForeignKeyConstraint(["company_id"], ["companies.id"]),)
+
+    # The company it belongs to, which is also its key: exactly one lock per company.
+    company_id: Mapped[uuid.UUID] = mapped_column(UUIDBinary, primary_key=True)
+
+
+@event.listens_for(Company, "after_insert")
+def _add_company_lock(mapper: Mapper[Company], connection: Connection, company: Company) -> None:
+    """Give a new company its lock row, in the same save (so in the same transaction).
+
+    Runs during the save of the company, which the company filter has already checked, so
+    the last guard lets this insert through (app/tenancy/filter.py).
+    """
+    connection.execute(insert(CompanyLock).values(company_id=company.id))
 
 
 class Department(IdAndTimestamps, CompanyOwned, Base):
