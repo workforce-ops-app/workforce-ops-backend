@@ -23,6 +23,8 @@ _VERSION_COMMENT_START = re.compile(r"/\*!\d{0,6}")
 # An ordinary inline comment, which attackers put where a space would go. Bounded, so a
 # value full of "/*" with no end cannot make this search slow (rule DE5).
 _INLINE_COMMENT = re.compile(r"/\*.{0,200}?\*/", re.DOTALL)
+# An old (IIS and JavaScript escape()) encoding of one character: %u003c is "<".
+_PERCENT_U = re.compile(r"%u([0-9a-fA-F]{4})")
 # Any run of whitespace (spaces, tabs, newlines, and the Unicode ones NFKC leaves).
 _WHITESPACE = re.compile(r"\s+")
 
@@ -42,6 +44,9 @@ def normalize(value: str, *, url_decode: bool = True) -> str:
         text = unquote_plus(value)
         if text != value:
             text = unquote_plus(text)
+        # %uXXXX is not standard URL encoding, so unquote_plus leaves it; decode it too
+        # (tuning, backend #199): %u003cscript%u003e is <script>.
+        text = _PERCENT_U.sub(lambda found: chr(int(found.group(1), 16)), text)
 
     # 2. Decode HTML entities: &lt;script&gt; becomes <script>, &#39; becomes a quote.
     text = html.unescape(text)
