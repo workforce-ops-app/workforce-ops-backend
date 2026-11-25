@@ -6,7 +6,7 @@ when someone reads, not stored here, so a person who joins the team later sees i
 Announcements are archived, never deleted (decision 0020).
 
 A read mark says one person has read one announcement. It is added once and never removed
-(AN2 adds the endpoint that writes it; the table is created now with the announcements).
+(POST /api/announcements/{id}/read; the primary key keeps it to one per person).
 """
 
 import uuid

@@ -2,7 +2,7 @@
 
 announcement.create is a record permission: an assignment's scope must cover the
 announcement's audience (app/modules/announcements/scope.py). Reading needs no permission;
-it depends only on being in the audience (AN2).
+it depends only on being in the audience (service.py, reading).
 """
 
 from app.authz.registry import Kind, PermissionDef

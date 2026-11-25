@@ -84,6 +84,54 @@ class AnnouncementManagedPage(BaseModel):
     next_cursor: str | None
 
 
+class AnnouncementOut(BaseModel):
+    """One announcement as a reader sees it: the same fields, and whether they have read it
+    (never the counts, which are for the people who manage it)."""
+
+    id: uuid.UUID
+    audience: AudienceOut
+    title: str
+    body: str
+    author: AuthorRef
+    posted_at: datetime  # UTC
+    edited_at: datetime | None  # UTC; null until edited
+    archived: bool
+    # Whether the signed-in person has read it.
+    read: bool
+
+
+class AnnouncementPage(BaseModel):
+    """A page of the reader's list; next_cursor fetches the next page, null on the last one."""
+
+    items: list[AnnouncementOut]
+    next_cursor: str | None
+
+
+class AnnouncementDetailOut(AnnouncementOut):
+    """GET /api/announcements/{id}: the reader's fields, and for someone whose
+    announcement.create covers the audience also the read counts (null for everyone else,
+    so a reader never learns how many others have read it)."""
+
+    read_count: int | None
+    audience_count: int | None
+
+
+class ReadOut(BaseModel):
+    """One person in the audience on the read list, and when they read it (null: not yet)."""
+
+    id: uuid.UUID
+    display_name: str
+    read_at: datetime | None  # UTC
+
+
+class ReadPage(BaseModel):
+    """A page of the read list, in name order; next_cursor fetches the next page, null on
+    the last one. The totals are the announcement's read_count and audience_count."""
+
+    items: list[ReadOut]
+    next_cursor: str | None
+
+
 def utc(moment: datetime) -> datetime:
     """A stored moment (UTC without a zone, as MySQL keeps it) as a UTC moment for JSON."""
     return moment.replace(tzinfo=UTC)
