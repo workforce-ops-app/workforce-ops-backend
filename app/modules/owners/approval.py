@@ -7,7 +7,8 @@
   so an owner added meanwhile must agree too (not a fixed number).
 - Always sensitive: deciding needs the password entered again.
 - Approval makes the change (app/modules/owners/service.py), which re-checks that it is
-  still possible: never the last owner, never a deactivated person.
+  still possible on fresh reads: never the last owner, never a deactivated person (the
+  person is locked first, so a deactivation cannot slip in alongside).
 """
 
 import uuid
@@ -20,16 +21,18 @@ from app.approvals.service import DecisionError, Handler, register_handler
 from app.audit import Actor
 from app.authz.delegation import active_owners
 from app.modules.org.models import User
-from app.modules.owners.service import make_owner, unmake_owner
+from app.modules.owners.service import locked_person, make_owner, unmake_owner
 
 
 def reviewers(db: Session, request: ApprovalRequest, *, fresh: bool = False) -> set[uuid.UUID]:
-    # active_owners() always reads fresh (FOR SHARE), so fresh changes nothing here.
-    return active_owners(db) - {request.requested_by, request.subject_user_id}
+    """Every current owner but the asker and the subject. fresh=True after the company's
+    lock (locking reads); fresh=False before it, for lists (ordinary reads)."""
+    return active_owners(db, fresh=fresh) - {request.requested_by, request.subject_user_id}
 
 
 def ready(db: Session, request: ApprovalRequest, approvers: set[uuid.UUID]) -> bool:
-    return reviewers(db, request) <= approvers
+    # Runs in decide(), after the company's lock: the owners as they are now.
+    return reviewers(db, request, fresh=True) <= approvers
 
 
 def sensitive(db: Session, request: ApprovalRequest) -> bool:
@@ -41,7 +44,9 @@ def describe(db: Session, request: ApprovalRequest) -> dict[str, Any]:
 
 
 def _subject(db: Session, request: ApprovalRequest) -> User:
-    person = db.get(User, request.subject_user_id)
+    # Locked and read fresh (locked_person), so a deactivation committed while the
+    # request waited is seen, and one still to come waits until this one commits.
+    person = locked_person(db, request.subject_user_id)
     if person is None:  # people are never deleted
         raise DecisionError("This person no longer exists.")
     return person
