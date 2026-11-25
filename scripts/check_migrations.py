@@ -22,10 +22,12 @@
    they waited (grants, the actor's own access, the role limit), and so do giving and
    removing roles (the giver's access, the role's grants and state, the person's place,
    the same-level rule), and so do approval decisions (the reviewer's access, the
-   requested role's grants and state), and an overdue request noticed by two requests
-   lapses once, with both seeing it declined. SQLite has no row locks, so this too can
-   only be tried on MySQL. They run as the application user, so they also show its
-   rights are enough for the app's own writes and locking reads.
+   requested role's grants and state), and so do reporting line changes (the actor's
+   reporting_line.manage, each person's place and active status), and an overdue
+   request noticed by two requests lapses once, with both seeing it declined. SQLite
+   has no row locks, so this too can only be tried on MySQL. They run as the
+   application user, so they also show its rights are enough for the app's own writes
+   and locking reads.
 6. A company that existed before a migration still works after it
    (_existing_company_problems): its starting roles get the permissions a migration adds
    (announcement.create in 0014).
@@ -343,6 +345,7 @@ def _race_problems(url: str) -> list[str]:
     try:
         return (
             _reporting_line_race_problems(engine)
+            + _line_authz_race_problems(engine)
             + _shift_race_problems(engine)
             + _org_race_problems(engine)
             + _people_race_problems(engine)
@@ -353,6 +356,7 @@ def _race_problems(url: str) -> list[str]:
             + _lapse_race_problems(engine)
             + _assignment_race_problems(engine)
             + _approval_race_problems(engine)
+            + _owner_race_problems(engine)
         )
     finally:
         engine.dispose()
@@ -487,6 +491,216 @@ def _reporting_line_race_problems(engine: Engine) -> list[str]:
     waiting.join(timeout=30)
     if waiting.is_alive() or errors:
         problems.append(f"the waiting reporting line change did not finish: {errors}")
+    return problems
+
+
+def _line_authz_race_problems(engine: Engine) -> list[str]:
+    """Adding and ending reporting lines while another request changed who may do it;
+    return what failed (review of #164).
+
+    add_line() and end_line() take the company's lock, then check everything again on
+    fresh reads: the actor's reporting_line.manage over both people, each person's place
+    in its scope, the place above each, and for a new line that both are still active
+    (app/modules/reporting_lines/service.py, top of the file). Each check below fixes
+    request 2's view first (ordinary reads, as its session and permission checks make),
+    lets request 1 commit a change, and then runs request 2's change through the service.
+    Request 2's checks before the lock still see the old view, so only the ones after the
+    lock can catch the change:
+
+    1. A person deactivated meanwhile: no new line for them (409).
+    2. A person moved meanwhile to a department outside the actor's grant: refused (403).
+    3. The actor's reporting_line.manage taken away meanwhile: adding is refused (403).
+    4. The same, for ending a line: refused (403).
+
+    The service commits when it goes ahead, so a check that wrongly passes leaves its
+    line behind: each check uses its own employee, so it cannot change the next one.
+    """
+    from sqlalchemy import delete, select, update
+    from sqlalchemy.orm import Session
+
+    from app.audit import Actor
+    from app.auth.models import UserSession
+    from app.authz.chain import add_reporting_line
+    from app.authz.check import Forbidden
+    from app.authz.models import ReportingLine, Role, RoleAssignment
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.db.base import utcnow
+    from app.modules.org.models import Company, Department, User
+    from app.modules.org.service import Conflict
+    from app.modules.reporting_lines import service as lines
+    from app.modules.reporting_lines.schemas import LineCreate
+    from app.modules.roles import service as role_service
+    from app.modules.roles.schemas import RoleCreate
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    # A company of its own, made by platform code (a session with no company).
+    with Session(engine) as platform:
+        company = Company(name="line authorization race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # A sign-in session whose password was just entered again (changing lines needs
+    # it). It is never saved: require_reauth() only looks at its reauth_at.
+    reauthed = UserSession(reauth_at=utcnow())
+
+    # The owner, and a boss above a and the employees b, d, e (one per check) and c, all
+    # in Office; Floor is elsewhere. The line a -> c is there to be ended (check 4).
+    with session() as db:
+        office, floor = Department(name="Office"), Department(name="Floor")
+        db.add_all([office, floor])
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        people = {
+            name: User(
+                email=f"{name}@line-race.example.com",
+                display_name=name,
+                department_id=office.id,
+            )
+            for name in ("owner", "boss", "a", "b", "c", "d", "e")
+        }
+        db.add_all(people.values())
+        db.flush()
+        assign_role(
+            db,
+            Actor.system(),
+            user_id=people["owner"].id,
+            role=roles["owner"],
+            scope_type="company",
+        )
+        for manager, employee in (
+            ("boss", "a"),
+            ("boss", "b"),
+            ("boss", "c"),
+            ("boss", "d"),
+            ("boss", "e"),
+            ("a", "c"),
+        ):
+            add_reporting_line(
+                db, Actor.system(), manager_id=people[manager].id, employee_id=people[employee].id
+            )
+        db.commit()
+        ids = {name: person.id for name, person in people.items()}
+        office_id, floor_id = office.id, floor.id
+
+    def person(db: Session, name: str) -> User:
+        found = db.get(User, ids[name])
+        if found is None:  # made above, in this company
+            raise RuntimeError("a line race probe person is missing")
+        return found
+
+    # The boss's role: reporting_line.manage for Office, made by the owner.
+    with session() as db:
+        manages = role_service.create_role(
+            db,
+            person(db, "owner"),
+            RoleCreate(name="Line keeper", permissions=["reporting_line.manage"]),
+        ).id
+        db.commit()
+
+    def give_boss_the_role() -> None:
+        with session() as db:
+            found = db.get(Role, manages)
+            if found is None:  # made above
+                raise RuntimeError("the line race probe role is missing")
+            assign_role(
+                db,
+                Actor.system(),
+                user_id=ids["boss"],
+                role=found,
+                scope_type="department",
+                scope_id=office_id,
+            )
+            db.commit()
+
+    give_boss_the_role()
+    with session() as db:
+        line_ac = db.scalars(
+            select(ReportingLine.id).where(
+                ReportingLine.manager_id == ids["a"],
+                ReportingLine.employee_id == ids["c"],
+            )
+        ).one()
+
+    def meanwhile(change: object) -> None:
+        """Request 1: one change, committed."""
+        with session() as request_1:
+            request_1.execute(change)  # type: ignore[call-overload]
+            request_1.commit()
+
+    def fixed_view(db: Session) -> User:
+        """Request 2 reads what its permission checks would, so its view is now fixed."""
+        db.scalars(select(RoleAssignment)).all()
+        for name in ("a", "b", "c", "d", "e"):
+            person(db, name)
+        return person(db, "boss")
+
+    def add_a_over(db: Session, boss: User, employee: str) -> None:
+        lines.add_line(
+            db, boss, LineCreate(manager_id=ids["a"], employee_id=ids[employee]), session=reauthed
+        )
+
+    # 1. b deactivated meanwhile.
+    with session() as request_2:
+        boss = fixed_view(request_2)
+        meanwhile(update(User).where(User.id == ids["b"]).values(deactivated_at=utcnow()))
+        try:
+            add_a_over(request_2, boss, "b")
+        except Conflict:
+            pass  # refused: the deactivation was seen
+        else:
+            problems.append("a reporting line was added for a person deactivated meanwhile")
+        request_2.rollback()
+    meanwhile(update(User).where(User.id == ids["b"]).values(deactivated_at=None))
+
+    # 2. d moved meanwhile to Floor, outside the boss's Office grant.
+    with session() as request_2:
+        boss = fixed_view(request_2)
+        meanwhile(update(User).where(User.id == ids["d"]).values(department_id=floor_id))
+        try:
+            add_a_over(request_2, boss, "d")
+        except Forbidden:
+            pass  # refused: the move was seen
+        else:
+            problems.append("a reporting line was added for a person moved out of scope meanwhile")
+        request_2.rollback()
+    meanwhile(update(User).where(User.id == ids["d"]).values(department_id=office_id))
+
+    take_away = delete(RoleAssignment).where(
+        RoleAssignment.user_id == ids["boss"], RoleAssignment.role_id == manages
+    )
+    # 3. The boss's reporting_line.manage taken away, then adding.
+    with session() as request_2:
+        boss = fixed_view(request_2)
+        meanwhile(take_away)
+        try:
+            add_a_over(request_2, boss, "e")
+        except Forbidden:
+            pass  # refused: the boss's current grants were seen
+        else:
+            problems.append("a reporting line was added after reporting_line.manage was taken away")
+        request_2.rollback()
+    give_boss_the_role()
+
+    # 4. The same, then ending a line.
+    with session() as request_2:
+        boss = fixed_view(request_2)
+        request_2.get(ReportingLine, line_ac)
+        meanwhile(take_away)
+        try:
+            lines.end_line(request_2, boss, line_ac, session=reauthed)
+        except Forbidden:
+            pass  # refused: the boss's current grants were seen
+        else:
+            problems.append("a reporting line was ended after reporting_line.manage was taken away")
+        request_2.rollback()
     return problems
 
 
@@ -1624,6 +1838,225 @@ def _approval_race_problems(engine: Engine) -> list[str]:
         )
         if entries != 1:
             problems.append(f"an overdue request has {entries} not-reviewed audit entries")
+    return problems
+
+
+def _owner_race_problems(engine: Engine) -> list[str]:
+    """Owner changes while another request changed who they depend on; return what
+    failed (review of #165).
+
+    Proposing and approving an owner change take the company's lock, then read the
+    proposer's permission and the owners again with locking reads, and lock the person's
+    row (app/modules/owners/service.py, top of the file). Deactivation locks the same
+    person row and checks for an owner on fresh reads (app/modules/org/people.py). Each
+    check below fixes request 2's view first (an ordinary read, as its session and
+    permission checks make), lets request 1 commit a change, and then runs request 2
+    through the service, so only the checks after the lock can catch the change:
+
+    1. The proposer's Owner role taken away meanwhile: their proposal is refused (403).
+    2. The person deactivated meanwhile, with one owner (added at once): refused (409).
+    3. The person deactivated meanwhile, while a request waits: the last approval is
+       refused (409), and nobody becomes an owner.
+    4. A person made an owner meanwhile: their deactivation is refused (409), so a company
+       never ends up with a deactivated owner.
+    5. An owner added while a request waits: the approval that used to be the last one is
+       no longer enough; the new owner must agree too (AZ15).
+
+    Request 2 always rolls back, so a check that wrongly passes leaves nothing behind.
+    """
+    from sqlalchemy import delete, select, update
+    from sqlalchemy.orm import Session
+
+    import app.modules.owners.approval  # noqa: F401  (registers the owner request kinds)
+    from app.approvals.models import ApprovalRequest
+    from app.audit import Actor
+    from app.auth.models import UserSession
+    from app.authz.check import Forbidden
+    from app.authz.delegation import active_owners
+    from app.authz.models import Role, RoleAssignment
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.db.base import utcnow
+    from app.modules.approval_requests import service as approvals
+    from app.modules.org import people as accounts
+    from app.modules.org.models import Company, Department, User
+    from app.modules.org.service import Conflict
+    from app.modules.owners import service as owners
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    # A company of its own, made by platform code (a session with no company).
+    with Session(engine) as platform:
+        company = Company(name="owner race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # A sign-in session whose password was just entered again (owner changes always need
+    # it). It is never saved: require_reauth() only looks at its reauth_at.
+    reauthed = UserSession(reauth_at=utcnow())
+
+    # Two owners to start with ("first" and "second"), and people to make owners.
+    names = ("first", "second", "third", "dropped", "quitter", "waiting", "promoted", "late")
+    with session() as db:
+        office = Department(name="Office")
+        db.add(office)
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        made = {
+            name: User(
+                email=f"{name}@owner-race.example.com",
+                display_name=name,
+                department_id=office.id,
+            )
+            for name in names
+        }
+        db.add_all(made.values())
+        db.flush()
+        for name in ("first", "second"):
+            assign_role(
+                db, Actor.system(), user_id=made[name].id, role=roles["owner"], scope_type="company"
+            )
+        db.commit()
+        ids = {name: person.id for name, person in made.items()}
+        owner_role = roles["owner"].id
+
+    def person(db: Session, name: str) -> User:
+        found = db.get(User, ids[name])
+        if found is None:  # made above, in this company
+            raise RuntimeError("an owner race probe person is missing")
+        return found
+
+    def fix_view(db: Session) -> None:
+        """Request 2 reads the people and roles: its view is now fixed."""
+        db.scalars(select(User)).all()
+        db.scalars(select(RoleAssignment)).all()
+
+    def committed(change: Callable[[Session], object]) -> None:
+        """Request 1 makes a change and commits."""
+        with session() as request_1:
+            change(request_1)
+            request_1.commit()
+
+    def deactivated(name: str) -> Callable[[Session], object]:
+        return lambda db: db.execute(
+            update(User).where(User.id == ids[name]).values(deactivated_at=utcnow())
+        )
+
+    def made_owner(name: str) -> Callable[[Session], object]:
+        def change(db: Session) -> None:
+            role = db.get(Role, owner_role)
+            if role is None:  # every company has one
+                raise RuntimeError("the owner race probe's Owner role is missing")
+            assign_role(db, Actor.system(), user_id=ids[name], role=role, scope_type="company")
+
+        return change
+
+    def owners_now() -> set[uuid.UUID]:
+        with session() as db:
+            return active_owners(db, fresh=False)
+
+    # 3 first, while "first" and "second" are both owners: "first" asks to make "quitter"
+    # an owner, and "second"'s approval meets the deactivation.
+    with session() as db:
+        asked = owners.add_owner(db, person(db, "first"), ids["quitter"], session=reauthed)
+        if asked.request is None:
+            raise RuntimeError("an owner change with two owners did not wait for approval")
+        quitter_request = asked.request.id
+    with session() as request_2:
+        fix_view(request_2)
+        request_2.get(ApprovalRequest, quitter_request)
+        committed(deactivated("quitter"))
+        try:
+            approvals.approve(
+                request_2, person(request_2, "second"), quitter_request, session=reauthed
+            )
+        except Conflict:
+            pass  # refused: the deactivation was seen
+        else:
+            problems.append("a person deactivated while a request waited was made an owner")
+        request_2.rollback()
+    if ids["quitter"] in owners_now():
+        problems.append("a deactivated person is an owner")
+
+    # 5. "first" asks to make "waiting" an owner (needs "second"); meanwhile "third" is
+    #    made an owner, so "second"'s approval is no longer the last one needed.
+    with session() as db:
+        asked = owners.add_owner(db, person(db, "first"), ids["waiting"], session=reauthed)
+        if asked.request is None:
+            raise RuntimeError("an owner change with two owners did not wait for approval")
+        waiting_request = asked.request.id
+    with session() as request_2:
+        fix_view(request_2)
+        request_2.get(ApprovalRequest, waiting_request)
+        committed(made_owner("third"))
+        decided = approvals.approve(
+            request_2, person(request_2, "second"), waiting_request, session=reauthed
+        )
+        if decided.status != "pending":
+            problems.append("an owner added while a request waited was not asked to agree")
+        request_2.rollback()
+
+    # 1. "second" loses the Owner role while proposing "dropped" as an owner.
+    with session() as request_2:
+        fix_view(request_2)
+        committed(
+            lambda db: db.execute(
+                delete(RoleAssignment).where(
+                    RoleAssignment.user_id == ids["second"], RoleAssignment.role_id == owner_role
+                )
+            )
+        )
+        try:
+            owners.add_owner(
+                request_2, person(request_2, "second"), ids["dropped"], session=reauthed
+            )
+        except Forbidden:
+            pass  # refused: the removal was seen
+        else:
+            problems.append("an owner removed meanwhile could still propose an owner change")
+        request_2.rollback()
+    # "third" too, so "first" is the only owner from here on (owner changes at once).
+    committed(
+        lambda db: db.execute(
+            delete(RoleAssignment).where(
+                RoleAssignment.user_id == ids["third"], RoleAssignment.role_id == owner_role
+            )
+        )
+    )
+
+    # 2. "late" deactivated while the sole owner makes them an owner.
+    with session() as request_2:
+        fix_view(request_2)
+        committed(deactivated("late"))
+        try:
+            owners.add_owner(request_2, person(request_2, "first"), ids["late"], session=reauthed)
+        except Conflict:
+            pass  # refused: the deactivation was seen
+        else:
+            problems.append("a person deactivated meanwhile was made an owner")
+        request_2.rollback()
+
+    # 4. "promoted" made an owner while the sole owner deactivates them.
+    with session() as request_2:
+        fix_view(request_2)
+        committed(
+            lambda db: owners.add_owner(db, person(db, "first"), ids["promoted"], session=reauthed)
+        )
+        try:
+            accounts.deactivate(
+                request_2, person(request_2, "first"), ids["promoted"], session=reauthed
+            )
+        except Conflict:
+            pass  # refused: the new owner was seen
+        else:
+            problems.append("a person made an owner meanwhile could be deactivated")
+        request_2.rollback()
     return problems
 
 
