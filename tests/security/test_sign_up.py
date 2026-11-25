@@ -63,6 +63,7 @@ def counts(setup: SignInSetup) -> dict[str, object]:
     connection, below the company filter, because this check must see every company."""
     tables = [
         "companies",
+        "company_locks",
         "departments",
         "users",
         "roles",
