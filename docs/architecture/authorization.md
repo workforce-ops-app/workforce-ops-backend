@@ -52,6 +52,9 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 | `audit.verify` | company | run verification of the company's audit chain |
 | `security.view` | company | see the company's security events on the security page (built, DT5: [detection](../features/detection.md#backend)) |
 | `announcement.create` | record | post, edit, and archive announcements for an audience in scope; see who has read them ([announcements](../features/announcements.md)) |
+| `coverage.request_self` | self | ask coworkers to cover or swap one of your own shifts; cancel your request ([coverage](../features/coverage.md)) |
+| `coverage.respond_self` | self | answer a coverage request you were asked about: accept, swap, or decline |
+| `coverage.review` | person | approve or deny the coverage requests of people you are above; approving also needs `schedule.edit` on every shift that changes ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)) |
 | `company.transfer_ownership` | company | propose adding or removing an owner (Owner role only; other owners must agree) |
 
 Changing your own password and signing yourself out need no permission; every signed-in user can do both.
@@ -78,11 +81,14 @@ Every new company gets four roles ([0024](https://github.com/workforce-ops-app/.
 | `audit.view`, `audit.verify` | yes | yes | | |
 | `security.view` | yes | yes | | |
 | `announcement.create` | yes | yes | yes | |
+| `coverage.request_self`, `coverage.respond_self` | yes | yes | yes | yes |
+| `coverage.review` | yes | yes | yes | |
 | `company.transfer_ownership` | yes | | | |
 
 - **Typical scopes:** Owner and Administrator are assigned for the whole company; a Manager for their department or team; everyone gets the Employee role scoped to their **home department**, which is what lets employees see their department's schedule. An administrator can remove `schedule.view` from the Employee role to turn that off.
 - **Owner** is locked: its permissions cannot be changed, and it is always assigned for the whole company. An active, company-wide Owner assignment grants **every** registered permission, including ones a module adds after the company's roles were created, and for the whole company even when another of the owner's roles grants the same permission more narrowly; the Owner role's `role_permissions` rows are only a record of that. A company has at least one owner and may have several true co-owners; leaders who are not co-owners (such as a board of directors) get their own role below the owner.
 - Later features add to these roles; for example employees do not get `announcement.create` by default.
+- **Companies that already exist** get a new starting-role permission from the migration that adds the feature, not only new companies: the starting roles of a company are filled with the permissions known when it was created, so the migration adds the new grant to every existing company's matching starting roles (only where it is missing; company-made roles are left alone). `0014_announcements` does this for `announcement.create` (Owner, Administrator, Manager) and `0015_coverage_offers` for `coverage.respond_self`. `scripts/check_migrations.py` upgrades a company made before 0014 and checks a manager can post afterwards.
 
 ## How a check works
 
@@ -139,7 +145,7 @@ query.where(
 
 The filter follows exactly the rules of `authorize()` for each kind: self permissions list the user's own rows; company permissions list everything, but only with a company-wide assignment; person permissions list only people the user is above, never the user. A department's people and a team's members are looked up first (in the company's session, so the company filter applies), and the condition names their IDs; so are the people below the user in the reporting chain, for the same reason (the company filter does not accept a recursive query nested inside a query on another table). Security tests check that the filter and `authorize()` agree for every pair of people, for a record permission and two person permissions, and again along a chain with several levels, two managers, and peers (`tests/security/test_reporting_chain.py`).
 
-`ScopeColumns` names a department column and an employee column. Announcements, whose audience can be a team, add an optional `team` column (planned, AN1 in [announcements](../features/announcements.md#backend)): a team assignment then also matches its team's rows, and a department assignment its teams' rows, with the team IDs looked up first like a department's people.
+`ScopeColumns` names a department column, an employee column, and an optional `team` column, used by announcements, whose audience can be a team (built, AN1 in [announcements](../features/announcements.md#backend)): a team assignment then also matches its team's rows, and a department assignment the rows of its active teams, with the team IDs looked up first like a department's people. An archived team's rows are left to company-wide assignments, as the announcement's scope resolver says. Tables without a team column (people, shifts) keep exactly their conditions. Scope tests check that the managed announcements list and `authorize()` agree for every pair of an assignment (company, each department, each team) and an audience (company, each department, a team in each department), also after a team or department is archived (`tests/security/test_announcements.py`).
 
 ## The reporting chain
 
@@ -242,7 +248,9 @@ Built in `app/modules/approval_requests/` (HTTP), on the shared layer `app/appro
 | `GET /api/approval-requests?view=to_review` | anyone | the pending requests you may decide now |
 | `GET /api/approval-requests/{id}` | the requester, the person it is about, whoever decided it, its current reviewers | one request; 404 for anyone else |
 | `POST /api/approval-requests/{id}/approve`, `.../deny` | a current reviewer, never the requester or the person it is about (AZ7, AZ14); password re-entry for an admin-level role | one denial denies; enough approvals approve, and the role is given in the same transaction |
-| `POST /api/approval-requests/{id}/cancel` | the requester | takes the request back |
+| `POST /api/approval-requests/{id}/cancel` | the requester | takes the request back; never a time-off request (409: it is approved, denied, and cancelled on `/api/time-off-requests`, which changes the time-off request too) |
+
+Time-off requests (kind `time_off`) are listed here too, but decided only on `/api/time-off-requests/{id}/approve` and `.../deny` (409 here): those lock the employee and their shifts in the order schedule changes use ([time off](../features/time-off.md#backend)). Their kind has its own outcome rule (`Handler.outcome`): reviewers who disagree send the request up to their nearest shared manager instead of one denial denying it.
 
 **Each answer lists `reviewers`** (ID and name of who may decide it now, worked out as for a decision; never someone who already approved it, as with an owner change waiting for more owners; empty once decided), including the 202 from giving a role or proposing an owner change, so the interface can say "Sent for approval to ..." (#168). They are people above the requester, so the list shows nobody the requester could not find out anyway. Each answer also names `requested_by_name`, `subject_name`, and, for role requests, `role_name`, so the Approvals screen says what is being decided without lookups the viewer may not be allowed to make (#170). These are people the viewer already deals with: the requester and the subject are below every reviewer, and "mine" lists only the viewer's own requests and those about them.
 
