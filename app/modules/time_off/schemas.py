@@ -25,6 +25,26 @@ class TimeOffCreate(Strict):
     reason: Reason | None = None
 
 
+class Step(BaseModel):
+    """One reviewer's decision so far (names only; comments stay on the request page)."""
+
+    approver_id: uuid.UUID
+    approver_name: str
+    decision: str  # approve or deny
+
+
+class Person(BaseModel):
+    id: uuid.UUID
+    display_name: str
+
+
+class Progress(BaseModel):
+    """Where an open request stands."""
+
+    decided: list[Step]  # oldest first
+    waiting_for: list[Person]  # reviewers who have not decided yet, by name
+
+
 class TimeOffOut(BaseModel):
     """A request as its employee and its reviewers see it."""
 
@@ -40,6 +60,10 @@ class TimeOffOut(BaseModel):
     not_reviewed: bool  # denied because nobody reviewed it before its first day
     created_at: datetime
     decided_at: datetime | None
+    # While the request is open (pending or escalated): who has decided so far and who
+    # still has to, so a request one manager already denied does not read as untouched.
+    # None once it is settled. The employee already sees these decisions on the request.
+    progress: Progress | None = None
 
 
 class AffectedShift(BaseModel):

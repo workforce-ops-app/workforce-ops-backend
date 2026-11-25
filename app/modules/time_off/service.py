@@ -43,7 +43,15 @@ from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
 
 from app.approvals.models import ApprovalDecision, ApprovalRequest
-from app.approvals.service import DecisionError, decide, lapse, may_decide, open_request, waits_for
+from app.approvals.service import (
+    DecisionError,
+    decide,
+    handler_for,
+    lapse,
+    may_decide,
+    open_request,
+    waits_for,
+)
 from app.approvals.service import cancel as cancel_approval
 from app.audit import Actor, record
 from app.authz.chain import lock_reporting_lines
@@ -107,6 +115,59 @@ def not_reviewed(db: Session, rows: list[TimeOffRequest]) -> dict[uuid.UUID, boo
         ).all()
     )
     return {row.id: bool(flags.get(row.approval_request_id)) for row in rows}
+
+
+@dataclass
+class Progress:
+    """Where a request still open (pending or escalated) stands: who has decided so far,
+    and who still has to."""
+
+    decided: list[ApprovalDecision]  # oldest first
+    waiting_for: list[uuid.UUID]  # the reviewers who have not decided yet
+
+
+def progress(db: Session, rows: list[TimeOffRequest]) -> dict[uuid.UUID, Progress]:
+    """For each request still open, its Progress (closed requests are left out).
+
+    Found in review: after one of two managers denied a request, it still read "Waiting
+    for review", as if nobody had looked at it. A request with several reviewers waits
+    for all of them (review.py, outcome), so the screens show who decided and who is
+    still to decide.
+
+    Who still has to decide is worked out the same way as for a decision (review.py,
+    reviewers, on the lines as they are now), minus everyone who already decided and
+    anyone deactivated, so the names match who can actually act.
+    """
+    # Step 1: only open requests have anyone left to decide.
+    open_rows = [row for row in rows if row.status in ("pending", "escalated")]
+    if not open_rows:
+        return {}
+    # Step 2: every decision on those requests, in one query, oldest first.
+    approval_ids = [row.approval_request_id for row in open_rows]
+    decisions: dict[uuid.UUID, list[ApprovalDecision]] = {i: [] for i in approval_ids}
+    for decision in db.scalars(
+        select(ApprovalDecision)
+        .where(ApprovalDecision.request_id.in_(approval_ids))
+        .order_by(ApprovalDecision.decided_at, ApprovalDecision.approver_id)
+    ):
+        decisions[decision.request_id].append(decision)
+    # Step 3: per request, the reviewers now, minus those who decided (and the employee,
+    # who never reviews their own), keeping only active people.
+    found: dict[uuid.UUID, Progress] = {}
+    for row in open_rows:
+        approval = db.get(ApprovalRequest, row.approval_request_id)
+        if approval is None:  # never deleted
+            continue
+        made = decisions[approval.id]
+        left = handler_for(approval).reviewers(db, approval) - {d.approver_id for d in made}
+        left.discard(row.employee_id)
+        active = [
+            person.id
+            for person_id in left
+            if (person := db.get(User, person_id)) is not None and person.deactivated_at is None
+        ]
+        found[row.id] = Progress(decided=made, waiting_for=sorted(active))
+    return found
 
 
 def comments(db: Session, request: TimeOffRequest) -> dict[str, str]:

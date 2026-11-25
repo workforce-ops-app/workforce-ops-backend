@@ -101,6 +101,8 @@ stateDiagram-v2
 
 Every answer names the employee (`employee_name`), and each decision its reviewer (`approver_name`), so the review screen needs no lookups the reviewer may not be allowed to make (#172). Names are read in one query per answer. Anyone who may see a request may see these names.
 
+**Progress of an open request:** while a request is pending or escalated, every answer about it also carries `progress`: `decided` (each reviewer who has decided so far, with `approver_name` and `decision`, oldest first) and `waiting_for` (the reviewers who still have to, by `display_name`, worked out as for a decision, without anyone who already decided or is deactivated). Once the request is settled, `progress` is `null`. A request needing several reviewers waits for all of them, so after one denial it is still pending; the screens use `progress` to say so ("You declined. Waiting for Felix Grant.") instead of reading as untouched. Found in review (2026-11-20). The employee already saw these decisions on the request itself; comments stay on the request page only.
+
 **Table: `time_off_requests`** (feature table; the shared approval tables are on the [data model](../architecture/data-model.md#approval_requests) page)
 
 | Column | Type | Rules |
