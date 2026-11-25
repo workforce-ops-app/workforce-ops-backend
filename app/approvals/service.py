@@ -209,11 +209,10 @@ def lapse(db: Session, request: ApprovalRequest) -> bool:
         return False
     # 2. The locks, in the order a decision takes them (review of #167): the company's
     #    lock first, then the feature's own rows (Handler.lock), then the approval record
-    #    (the UPDATE below). The company's lock must come first because every audit entry
-    #    refers to the company's row (a foreign key): writing one takes a shared lock on
-    #    that row, so it waits while a decision holds the company's lock. A lapse holding
-    #    the request's rows while it waited would leave the decision waiting on them in
-    #    turn: a deadlock. Only an overdue request gets here, so lists rarely lock.
+    #    (the UPDATE below). The company's lock must come first because a decision takes
+    #    it first: a lapse holding the request's rows while it waited for the company's
+    #    lock, held by a decision waiting for those rows, would be a deadlock. Only an
+    #    overdue request gets here, so lists rarely lock.
     lock_reporting_lines(db)
     locker = handler_for(request).lock
     if locker is not None:
