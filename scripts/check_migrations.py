@@ -3038,6 +3038,46 @@ def _people_race_problems(engine: Engine) -> list[str]:
 _NO_RIGHT = {1044, 1142, 1143, 1227}
 
 
+def _strict_mode_problems(urls: list[str]) -> list[str]:
+    """Whether MySQL refuses numbers past a column's range instead of clipping them (#105,
+    threat T6).
+
+    MySQL 8.4 starts in strict mode, which refuses an out-of-range value with an error; a
+    server or connection without it would silently store 32,767 in place of 40,000. The
+    request limits keep such numbers out, and strict mode is the second layer. Nothing in
+    the application sets sql_mode, and this checks that every user's connection is strict
+    and that a write past a SMALLINT really fails (on a temporary table, so nothing stays).
+    """
+    from sqlalchemy.exc import DBAPIError
+
+    problems = []
+    for url in urls:
+        engine = create_engine(url)
+        try:
+            with engine.connect() as connection:
+                mode = connection.execute(text("SELECT @@SESSION.sql_mode")).scalar_one()
+                if "STRICT_TRANS_TABLES" not in str(mode).split(","):
+                    problems.append(f"a connection is not in strict mode: sql_mode is {mode!r}")
+        finally:
+            engine.dispose()
+    # The write itself, as the first user (the migrations user may create temporary tables).
+    engine = create_engine(urls[0])
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("CREATE TEMPORARY TABLE strict_probe (n SMALLINT)"))
+            try:
+                connection.execute(text("INSERT INTO strict_probe (n) VALUES (40000)"))
+            except DBAPIError:
+                pass  # refused: strict mode works
+            else:
+                stored = connection.execute(text("SELECT n FROM strict_probe")).scalar_one()
+                problems.append(f"40000 in a SMALLINT was not refused; {stored} was stored")
+            connection.rollback()
+    finally:
+        engine.dispose()
+    return problems
+
+
 def _grant_problems(app_url: str) -> list[str]:
     """What the application user can do that it must not, or cannot that it must.
 
@@ -3237,6 +3277,7 @@ def main() -> int:
         command.upgrade(config, "head")
         differences = _differences_from_models(url)
         rule_problems = _database_rule_problems(url) + upgrade_problems + race_problems
+        rule_problems += _strict_mode_problems([url, app_url])
         # Last, as a refused change that got through could leave the database broken.
         if app_url != url:
             rule_problems += _grant_problems(app_url)

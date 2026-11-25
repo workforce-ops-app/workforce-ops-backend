@@ -81,6 +81,12 @@ class SettingDef:
         raise SettingRejected(f"{self.name} cannot go past the platform's limit of {self.limit}.")
 
 
+# The widest range any setting may declare (threat T6): request bodies are limited to it
+# before a setting's own, narrower range is checked, so no number past it reaches the
+# service or the JSON column.
+MIN_VALUE = 0
+MAX_VALUE = 1000
+
 # Module and key names: lowercase letters and underscores, as in permission codes.
 _NAME = re.compile(r"^[a-z_]+$")
 
@@ -132,6 +138,10 @@ def check_declaration(setting: SettingDef) -> None:
         raise ValueError(f"setting {setting.name!r}: its limit is below its default")
     if setting.stricter is Stricter.LOWER and setting.limit > setting.default:
         raise ValueError(f"setting {setting.name!r}: its limit is above its default")
+    # Inside the range request bodies are limited to (threat T6).
+    for value in (setting.default, setting.limit):
+        if not MIN_VALUE <= value <= MAX_VALUE:
+            raise ValueError(f"setting {setting.name!r}: {value} is outside 0 to {MAX_VALUE}")
 
 
 @lru_cache

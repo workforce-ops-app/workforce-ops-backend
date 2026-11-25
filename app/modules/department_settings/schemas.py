@@ -6,15 +6,18 @@ department, a company, or who confirms (threat T2).
 
 import uuid
 
-from pydantic import BaseModel, StrictInt
+from pydantic import BaseModel, Field, StrictInt
 
 from app.modules.org.schemas import Strict
+from app.settings.registry import MAX_VALUE, MIN_VALUE
 
 
 class SettingChange(Strict):
     """A department's new value. Checked against the setting's rules by the service."""
 
-    value: StrictInt  # a whole number as sent, never a string turned into one
+    # A whole number as sent, never a string turned into one, inside the widest range any
+    # setting allows (threat T6); the setting's own range is checked by the service.
+    value: StrictInt = Field(ge=MIN_VALUE, le=MAX_VALUE)
 
 
 class PendingChange(BaseModel):
