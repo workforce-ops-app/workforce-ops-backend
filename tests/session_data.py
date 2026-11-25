@@ -27,7 +27,7 @@ from app.core.config import Settings
 from app.db.base import Base, utcnow
 from app.db.session import get_session
 from app.main import create_app
-from app.modules.org.models import Company, Department, Team, TeamMember, User
+from app.modules.org.models import Company, CompanyLock, Department, Team, TeamMember, User
 from app.settings.models import CompanySetting
 from app.tenancy.context import set_company
 from tests.audit_data import TEST_KEY, use_key
@@ -42,6 +42,7 @@ OTHER_PASSWORD = "a different long passphrase"
 
 TABLES = [
     Company.__table__,
+    CompanyLock.__table__,  # every new company gets its lock row in the same save (#198)
     Department.__table__,
     Team.__table__,
     User.__table__,
