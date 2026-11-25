@@ -117,7 +117,8 @@ def send_up_if_due(db: Session, request: TimeOffRequest) -> bool:
 
 def refresh(db: Session, rows: list[TimeOffRequest]) -> None:
     """Bring requests up to date and save that at once: collecting requests past their
-    send-up deadline go up (locked in the usual order: the employee, then the request),
+    send-up deadline go up (locked in the usual order: the company's lock, the employee,
+    then the request),
     and requests whose first day has begun undecided are declined as not reviewed (the
     approval layer's lapse; its hook updates the request itself).
 
@@ -133,6 +134,8 @@ def refresh(db: Session, rows: list[TimeOffRequest]) -> None:
     now = utcnow()
     for row in rows:
         if row.status == "collecting" and row.offers_close_at and row.offers_close_at <= now:
+            # The time-off lock order (the top of this file): the company's lock first.
+            lock_reporting_lines(db)
             repository.person(db, row.employee_id, lock=True)
             fresh = db.get(TimeOffRequest, row.id, populate_existing=True, with_for_update=True)
             if fresh is not None and send_up_if_due(db, fresh):
@@ -449,7 +452,9 @@ def send_up(db: Session, user: User, request_id: uuid.UUID) -> TimeOffRequest:
     found = db.get(TimeOffRequest, request_id)
     if found is None or found.employee_id != user.id:
         raise NotFound()  # someone else's request is not yours to send
-    # Same order as asking: the person, then the request (fresh and locked).
+    # Same order as asking: the company's lock, the person, then the request (fresh and
+    # locked; review of #167).
+    lock_reporting_lines(db)
     repository.person(db, user.id, lock=True)
     request = db.get(TimeOffRequest, request_id, populate_existing=True, with_for_update=True)
     if request is None:
