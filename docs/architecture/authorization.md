@@ -248,7 +248,7 @@ Built in `app/modules/approval_requests/` (HTTP), on the shared layer `app/appro
 | `GET /api/approval-requests?view=to_review` | anyone | the pending requests still waiting for your decision: one you already decided, still waiting for the other reviewers, is left out (`waits_for()` in `app/approvals/service.py`) |
 | `GET /api/approval-requests/{id}` | the requester, the person it is about, whoever decided it, its current reviewers | one request; 404 for anyone else |
 | `POST /api/approval-requests/{id}/approve`, `.../deny` | a current reviewer, never the requester or the person it is about (AZ7, AZ14); password re-entry for an admin-level role | one denial denies; enough approvals approve, and the role is given in the same transaction |
-| `POST /api/approval-requests/{id}/cancel` | the requester | takes the request back |
+| `POST /api/approval-requests/{id}/cancel` | the requester | takes the request back; never a time-off request (409: it is approved, denied, and cancelled on `/api/time-off-requests`, which changes the time-off request too) |
 
 Time-off requests (kind `time_off`) are listed here too, but decided only on `/api/time-off-requests/{id}/approve` and `.../deny` (409 here): those lock the employee and their shifts in the order schedule changes use ([time off](../features/time-off.md#backend)). Their kind has its own outcome rule (`Handler.outcome`): reviewers who disagree send the request up to their nearest shared manager instead of one denial denying it.
 

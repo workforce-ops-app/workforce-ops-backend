@@ -375,6 +375,7 @@ def _race_problems(url: str) -> list[str]:
             + _read_mark_race_problems(engine)
             + _role_race_problems(engine)
             + _lapse_race_problems(engine)
+            + _time_off_review_race_problems(engine)
             + _role_view_lock_problems(engine)
             + _assignment_race_problems(engine)
             + _approval_race_problems(engine)
@@ -2253,6 +2254,289 @@ def _role_view_lock_problems(engine: Engine) -> list[str]:
                         problems.append(f"{viewer_name} was told they may not change Manager")
                 request_2.rollback()
             request_1.rollback()
+    return problems
+
+
+def _time_off_review_race_problems(engine: Engine) -> list[str]:
+    """Reviewing time off while other requests change what a decision depends on; return
+    what failed (review of #167).
+
+    decide_request() (app/modules/time_off/service.py) takes the company's lock, then the
+    employee, the time-off request, and its approval record, and only then works out the
+    reviewers and counts the decisions, with locking reads. Answers (who reviews it, the
+    requests waiting for someone) use ordinary reads. Checks 1 and 2 fix request 2's view
+    first (ordinary reads, as its permission checks make), let request 1 commit, and then
+    run request 2's decision, so only reads after the locks can see the change:
+
+    1. The reviewer's time_off.review taken away meanwhile: the decision is refused (403).
+    2. Two reviewers, two approvals needed: the second sees the first's approval, so the
+       request is approved, not left waiting.
+    3. Answers take no row locks: with request 1 holding FOR UPDATE locks on the people,
+       roles, reporting lines, and time-off rows, request 2 (1 second lock wait) still
+       lists what waits for a reviewer, shows a request, and names its reviewers.
+    4. A decision and a lapse of the same overdue request at the same moment, in two
+       threads, several rounds: both take the time-off row before the approval record,
+       so neither waits for the other (no deadlock), and the request lapses once.
+    """
+    import threading
+    from datetime import timedelta
+
+    from sqlalchemy import delete, func, select, text
+    from sqlalchemy.orm import Session
+
+    import app.modules.time_off.approval  # noqa: F401  (registers the "time_off" handler)
+    import app.modules.time_off.scope  # noqa: F401  (where a time-off request belongs)
+    from app.approvals.models import ApprovalDecision, ApprovalRequest
+    from app.approvals.service import open_request
+    from app.audit import Actor
+    from app.audit.models import AuditEvent
+    from app.authz.chain import add_reporting_line
+    from app.authz.check import Forbidden
+    from app.authz.models import ReportingLine, Role, RoleAssignment, RolePermission
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.db.base import utcnow
+    from app.modules.org.models import Company, Department, TeamMember, User
+    from app.modules.org.service import Conflict
+    from app.modules.time_off import review
+    from app.modules.time_off import service as time_off
+    from app.modules.time_off.models import TimeOffRequest
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    with Session(engine) as platform:
+        company = Company(name="time off review race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # The owner; chef and lead, both direct managers of worker, each reviewing time off
+    # (and seeing it) for Office.
+    with session() as db:
+        office = Department(name="Office")
+        db.add(office)
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        people = {
+            name: User(
+                email=f"{name}@time-off-race.example.com",
+                display_name=name,
+                department_id=office.id,
+            )
+            for name in ("owner", "chef", "lead", "worker")
+        }
+        db.add_all(people.values())
+        db.flush()
+        assign_role(
+            db,
+            Actor.system(),
+            user_id=people["owner"].id,
+            role=roles["owner"],
+            scope_type="company",
+        )
+        reviewer = Role(name="Time off reviewer")
+        db.add(reviewer)
+        db.flush()
+        for code in ("time_off.review", "time_off.view"):
+            db.add(RolePermission(role_id=reviewer.id, permission_code=code))
+        for name in ("chef", "lead"):
+            assign_role(
+                db,
+                Actor.system(),
+                user_id=people[name].id,
+                role=reviewer,
+                scope_type="department",
+                scope_id=office.id,
+            )
+            add_reporting_line(
+                db, Actor.system(), manager_id=people[name].id, employee_id=people["worker"].id
+            )
+        db.commit()
+        ids = {name: person.id for name, person in people.items()}
+        office_id, reviewer_role = office.id, reviewer.id
+
+    def person(db: Session, name: str) -> User:
+        found = db.get(User, ids[name])
+        if found is None:  # made above, in this company
+            raise RuntimeError("a time off race probe person is missing")
+        return found
+
+    days_used = [0]
+
+    def asked(*, needed: int = 1, overdue: bool = False) -> uuid.UUID:
+        """worker asks for one day off (a new day each time), as ask() records it."""
+        days_used[0] += 1
+        day = (utcnow() + timedelta(days=days_used[0])).date()
+        with session() as db:
+            approval = open_request(
+                db,
+                kind="time_off",
+                requested_by=ids["worker"],
+                subject_user_id=ids["worker"],
+                payload={},
+                details={},
+                required_approvals=needed,
+                review_by=utcnow() + timedelta(days=1),
+            )
+            row = TimeOffRequest(
+                employee_id=ids["worker"],
+                first_day=day,
+                last_day=day,
+                status="pending",
+                approval_request_id=approval.id,
+            )
+            db.add(row)
+            db.flush()
+            approval.payload = {"time_off_request_id": str(row.id)}
+            if overdue:  # its first day began undecided
+                approval.review_by = utcnow() - timedelta(seconds=1)
+            db.commit()
+            return row.id
+
+    def fix_view(db: Session) -> None:
+        """Request 2 reads what its checks would: its view is now fixed."""
+        db.scalars(select(RoleAssignment)).all()
+        db.scalars(select(ReportingLine)).all()
+        db.scalars(select(ApprovalDecision)).all()
+        db.scalars(select(TimeOffRequest)).all()
+        db.scalars(select(User)).all()
+
+    def committed(change: Callable[[Session], object]) -> None:
+        with session() as request_1:
+            change(request_1)
+            request_1.commit()
+
+    take_away = delete(RoleAssignment).where(
+        RoleAssignment.user_id == ids["chef"], RoleAssignment.role_id == reviewer_role
+    )
+
+    def give_back(db: Session) -> None:
+        role = db.get(Role, reviewer_role)
+        if role is None:  # made above
+            raise RuntimeError("the time off race probe role is missing")
+        assign_role(
+            db,
+            Actor.system(),
+            user_id=ids["chef"],
+            role=role,
+            scope_type="department",
+            scope_id=office_id,
+        )
+
+    # 1. chef's time_off.review taken away while chef decides.
+    request_id = asked()
+    with session() as request_2:
+        fix_view(request_2)
+        committed(lambda db: db.execute(take_away))
+        try:
+            time_off.decide_request(
+                request_2, person(request_2, "chef"), request_id, "approve", None
+            )
+        except Forbidden:
+            pass  # refused: the removal was seen
+        else:
+            problems.append("a reviewer whose time_off.review was taken away could still decide")
+        request_2.rollback()
+    committed(give_back)
+
+    # 2. Two approvals needed: chef approves while lead's request waits, then lead approves.
+    request_id = asked(needed=2)
+    with session() as request_2:
+        fix_view(request_2)
+        committed(
+            lambda db: time_off.decide_request(db, person(db, "chef"), request_id, "approve", None)
+        )
+        decided = time_off.decide_request(
+            request_2, person(request_2, "lead"), request_id, "approve", None
+        )
+        if decided.status != "approved":
+            problems.append(f"the second of two approvals left the request {decided.status!r}")
+        request_2.rollback()
+
+    # 3. Answers while request 1 holds row locks on everything a locking read would need.
+    request_id = asked()
+    with session() as request_1:
+        for model in (User, RoleAssignment, ReportingLine, TeamMember, TimeOffRequest):
+            request_1.scalars(select(model).with_for_update()).all()
+        with session() as request_2:
+            request_2.execute(text("SET SESSION innodb_lock_wait_timeout = 1"))
+            chef = person(request_2, "chef")
+            try:
+                waiting = time_off.waiting(request_2, chef, limit=50)
+                time_off.view_request(request_2, chef, request_id)
+                row = request_2.get(TimeOffRequest, request_id)
+                approval = request_2.get(ApprovalRequest, row.approval_request_id) if row else None
+                named = review.reviewers(request_2, approval) if approval else set()
+            except OperationalError as error:
+                problems.append(f"time-off answers waited on row locks: {error}"[:300])
+            else:
+                if request_id not in {found.id for found in waiting}:
+                    problems.append("a request waiting for chef was not listed for chef")
+                if named != {ids["chef"], ids["lead"]}:
+                    problems.append("a request's reviewers were not chef and lead")
+            request_2.rollback()
+        request_1.rollback()
+
+    def race_round(request_id: uuid.UUID) -> list[str]:
+        """One round: chef decides and another request lapses it, in two threads."""
+
+        start = threading.Barrier(2)
+        outcomes = ["not run", "not run"]
+
+        def decide_it(index: int, request_id: uuid.UUID = request_id) -> None:
+            with session() as db:
+                chef = person(db, "chef")
+                start.wait()
+                try:
+                    time_off.decide_request(db, chef, request_id, "approve", None)
+                    outcomes[index] = "ok"
+                except Conflict:
+                    outcomes[index] = "refused"  # it lapsed first: declined as not reviewed
+                except Exception as error:  # a deadlock would show up here
+                    outcomes[index] = f"error: {error!r}"[:300]
+
+        def lapse_it(index: int, request_id: uuid.UUID = request_id) -> None:
+            with session() as db:
+                row = db.get(TimeOffRequest, request_id)
+                start.wait()
+                try:
+                    time_off.refresh(db, [row] if row else [])
+                    outcomes[index] = "ok"
+                except Exception as error:  # a deadlock would show up here
+                    outcomes[index] = f"error: {error!r}"[:300]
+
+        threads = [
+            threading.Thread(target=decide_it, args=(0,)),
+            threading.Thread(target=lapse_it, args=(1,)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        return outcomes
+
+    # 4. A decision and a lapse of one overdue request at the same moment.
+    for _ in range(5):
+        request_id = asked(overdue=True)
+        outcomes = race_round(request_id)
+        problems += [f"a decision racing a lapse: {o}" for o in outcomes if o.startswith("error")]
+        with session() as db:
+            row = db.get(TimeOffRequest, request_id)
+            entries = db.scalar(
+                select(func.count()).where(
+                    AuditEvent.chain_id == company_id,
+                    AuditEvent.action == "time_off.not_reviewed",
+                    AuditEvent.target_id == request_id,
+                )
+            )
+        if row is None or row.status != "denied" or entries != 1:
+            status = row.status if row else None
+            problems.append(f"an overdue request ended {status!r} with {entries} lapse entries")
     return problems
 
 
