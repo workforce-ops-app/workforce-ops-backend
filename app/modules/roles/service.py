@@ -138,7 +138,7 @@ def _changeable_role(db: Session, user: User, role_id: uuid.UUID) -> Role:
         raise NotFound()
     if role.archived_at is not None:
         raise Conflict("This role is archived. It cannot be changed.")
-    if not above_every_holder(db, user, role):
+    if not above_every_holder(db, user, role, fresh=True):
         raise Forbidden()
     return role
 
