@@ -12,7 +12,7 @@ from sqlalchemy import Engine, create_engine, select
 from sqlalchemy.orm import Session
 
 from app.db.base import Base
-from app.modules.org.models import Company, Department, User
+from app.modules.org.models import Company, CompanyLock, Department, User
 from app.tenancy.context import set_company
 from app.tenancy.filter import UnsafeQueryError, WrongCompanyError
 
@@ -21,7 +21,8 @@ from app.tenancy.filter import UnsafeQueryError, WrongCompanyError
 def engine() -> Iterator[Engine]:
     """An in-memory database with two companies; returns the engine."""
     engine = create_engine("sqlite://")
-    tables = [Company.__table__, Department.__table__, User.__table__]
+    # CompanyLock: every new company gets its lock row in the same save (#198).
+    tables = [Company.__table__, CompanyLock.__table__, Department.__table__, User.__table__]
     Base.metadata.create_all(engine, tables=tables)
     with Session(engine) as session:
         session.add_all([Company(name="A", timezone="UTC"), Company(name="B", timezone="UTC")])

@@ -1,7 +1,7 @@
 """Add the department_settings table.
 
-Revision: 0016
-Revises: 0015
+Revision: 0017
+Revises: 0016
 
 As in docs/features/coverage.md and app/settings/models.py: a department's own, stricter
 value for a setting declared per_department (time_off.offers_close_days for now). Company-
@@ -18,8 +18,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import mysql
 
-revision: str = "0016"
-down_revision: str | None = "0015"
+revision: str = "0017"
+down_revision: str | None = "0016"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
