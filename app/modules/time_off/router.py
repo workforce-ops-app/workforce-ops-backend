@@ -20,11 +20,13 @@ from datetime import date
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Query
+from sqlalchemy import select
 
 # Registers what time-off approval records do, and where a request belongs.
 import app.modules.time_off.approval  # noqa: F401
 import app.modules.time_off.scope  # noqa: F401
 from app.auth.dependencies import Database, SignedInPerson
+from app.modules.org.models import User
 from app.modules.time_off import service
 from app.modules.time_off.models import TimeOffRequest
 from app.modules.time_off.schemas import (
@@ -40,10 +42,19 @@ from app.modules.time_off.schemas import (
 router = APIRouter(prefix="/api/time-off-requests", tags=["time off"])
 
 
-def _out(item: TimeOffRequest, not_reviewed: bool) -> TimeOffOut:
+def _names(db: Database, ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
+    """Display names by ID, in one query for a whole answer (not one per row)."""
+    if not ids:
+        return {}
+    rows = db.execute(select(User.id, User.display_name).where(User.id.in_(ids)))
+    return {person_id: name for person_id, name in rows}
+
+
+def _out(item: TimeOffRequest, not_reviewed: bool, names: dict[uuid.UUID, str]) -> TimeOffOut:
     return TimeOffOut(
         id=item.id,
         employee_id=item.employee_id,
+        employee_name=names.get(item.employee_id, "Unknown"),
         first_day=item.first_day,
         last_day=item.last_day,
         reason=item.reason,
@@ -58,8 +69,9 @@ def _detail(db: Database, detail: service.Detail) -> TimeOffDetail:
     item = detail.request
     flags = service.not_reviewed(db, [item])
     comments = service.comments(db, item)
+    names = _names(db, {item.employee_id} | {d.approver_id for d in detail.decisions})
     return TimeOffDetail(
-        **_out(item, flags[item.id]).model_dump(),
+        **_out(item, flags[item.id], names).model_dump(),
         affected_shifts=[
             AffectedShift(
                 id=s.id, department_id=s.department_id, starts_at=s.starts_at, ends_at=s.ends_at
@@ -69,6 +81,7 @@ def _detail(db: Database, detail: service.Detail) -> TimeOffDetail:
         decisions=[
             Decision(
                 approver_id=d.approver_id,
+                approver_name=names.get(d.approver_id, "Unknown"),
                 decision=d.decision,
                 decided_at=d.decided_at,
                 comment=comments.get(str(d.approver_id)),
@@ -76,6 +89,16 @@ def _detail(db: Database, detail: service.Detail) -> TimeOffDetail:
             for d in detail.decisions
         ],
     )
+
+
+def _list(db: Database, rows: list[TimeOffRequest]) -> TimeOffList:
+    flags = service.not_reviewed(db, rows)
+    names = _names(db, {row.employee_id for row in rows})
+    return TimeOffList(items=[_out(row, flags[row.id], names) for row in rows])
+
+
+def _one(db: Database, request: TimeOffRequest) -> TimeOffOut:
+    return _list(db, [request]).items[0]
 
 
 @router.get("")
@@ -99,8 +122,7 @@ def list_requests(
         last=last,
         limit=limit,
     )
-    flags = service.not_reviewed(db, rows)
-    return TimeOffList(items=[_out(row, flags[row.id]) for row in rows])
+    return _list(db, rows)
 
 
 @router.get("/waiting")
@@ -108,8 +130,7 @@ def waiting(
     current: SignedInPerson, db: Database, limit: Annotated[int, Query(ge=1, le=200)] = 50
 ) -> TimeOffList:
     rows = service.waiting(db, current.user, limit=limit)
-    flags = service.not_reviewed(db, rows)
-    return TimeOffList(items=[_out(row, flags[row.id]) for row in rows])
+    return _list(db, rows)
 
 
 @router.get("/{request_id}")
@@ -126,7 +147,7 @@ def ask(body: TimeOffCreate, current: SignedInPerson, db: Database) -> TimeOffDe
 @router.post("/{request_id}/cancel")
 def cancel(request_id: uuid.UUID, current: SignedInPerson, db: Database) -> TimeOffOut:
     request = service.cancel(db, current.user, request_id)
-    return _out(request, service.not_reviewed(db, [request])[request.id])
+    return _one(db, request)
 
 
 @router.post("/{request_id}/approve")
@@ -135,7 +156,7 @@ def approve(
 ) -> TimeOffOut:
     comment = body.comment if body else None
     request = service.decide_request(db, current.user, request_id, "approve", comment)
-    return _out(request, service.not_reviewed(db, [request])[request.id])
+    return _one(db, request)
 
 
 @router.post("/{request_id}/deny")
@@ -144,4 +165,4 @@ def deny(
 ) -> TimeOffOut:
     comment = body.comment if body else None
     request = service.decide_request(db, current.user, request_id, "deny", comment)
-    return _out(request, service.not_reviewed(db, [request])[request.id])
+    return _one(db, request)
