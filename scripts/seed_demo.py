@@ -45,6 +45,11 @@ assigns a shift to someone who has not set up their account.
 Reporting lines (Z2) come right after the company: REPORTING_LINES below, added through the
 same service the application uses, once per company.
 
+Announcements (AN3) come after the shifts: DEMO_ANNOUNCEMENTS below, posted, read, corrected,
+and archived through the announcements service as the people in the plan, so each passes
+the same checks as on the website and is audited under its poster's name. Added once: a
+company that already has announcements is left alone.
+
 Security events (DT6) come last, so the security page has something to show before any
 real traffic exists: DEMO_ATTACKS below, over the last 30 days, by several people, of every
 attack type, plus one burst that the rate cap cuts short (a detection.summary row). Each
@@ -63,6 +68,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
@@ -77,6 +83,14 @@ from app.authz.roles import assign_role, create_starting_roles
 from app.core.config import get_settings
 from app.db.base import utcnow
 from app.detection.detector import inspect
+from app.modules.announcements.models import Announcement
+from app.modules.announcements.schemas import AnnouncementCreate, AnnouncementUpdate
+from app.modules.announcements.service import (
+    archive_announcement,
+    edit_announcement,
+    mark_read,
+    post_announcement,
+)
 from app.modules.org.models import Company, Department, Team, TeamMember, User
 from app.modules.schedules import repository as shift_repository
 from app.modules.schedules.models import Shift
@@ -279,6 +293,80 @@ WEEK_PATTERN = (
 
 # How many days of shifts each company gets, starting on the day the script runs.
 DEMO_DAYS = 14
+
+
+# --- Demo announcements (AN3) ---------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AnnouncementPlan:
+    """One demo announcement: who posts it, to whom, its text, who has read it, and what
+    happens to it afterwards (corrected, or archived)."""
+
+    author: int  # place in the company's list of people (as in REPORTING_LINES)
+    # "company", or the name of a department or a team (DEPARTMENTS above).
+    audience: str
+    title: str
+    body: str
+    # The people who have opened it, by their place in the list; each must be in the
+    # audience, or the application refuses the read mark and the script stops.
+    readers: tuple[int, ...] = ()
+    # A corrected body, sent afterwards as an edit by the author (shown as "Edited").
+    corrected_body: str | None = None
+    # Archived afterwards by the author: readers no longer see it; managers still do.
+    archived: bool = False
+
+
+# Posted in this order, so the last one is the newest. They show every case the screens
+# handle (announcements.md, demo data): each kind of audience, one edited and one archived,
+# bold text, text that would run if shown unsafely, and read counts that differ. Who is in
+# each audience: everyone for the company; the Kitchen's four (its manager, the two cooks,
+# the crew lead) for the Kitchen; the Weekend Crew's three (the two cooks and the crew
+# lead) for the crew.
+DEMO_ANNOUNCEMENTS = (
+    AnnouncementPlan(
+        author=OWNER,
+        audience="company",
+        title="Holiday hours",
+        body="We close early on the holiday. Your manager will post the shorter shifts.",
+        readers=(OWNER, ADMINISTRATOR, KITCHEN_MANAGER),
+        # Out of date now, so the owner archived it: managers still see it in their list.
+        archived=True,
+    ),
+    AnnouncementPlan(
+        author=OWNER,
+        audience="company",
+        title="Welcome to the new schedule",
+        body=(
+            "Your shifts, time off, and announcements are now in one place.\n"
+            "Check **My week** when you start each day, and ask your manager if anything "
+            "looks wrong."
+        ),
+        readers=(OWNER, ADMINISTRATOR, KITCHEN_MANAGER, FRONT_MANAGER, KITCHEN_A, FRONT_A),
+    ),
+    AnnouncementPlan(
+        author=KITCHEN_MANAGER,
+        audience="Kitchen",
+        title="New allergen labels",
+        # The tag is here on purpose: the screens must show it as the plain text it is,
+        # never as an image that runs code (threat T5).
+        body=(
+            "From Monday, label every container with **the date and its allergens**.\n"
+            "For the security demo, this should show as plain text: "
+            "<img src=x onerror=alert(1)>"
+        ),
+        readers=(KITCHEN_MANAGER, KITCHEN_A),
+    ),
+    AnnouncementPlan(
+        author=CREW_LEAD,
+        audience="Weekend Crew",
+        title="Sunday brunch rush",
+        body="Brunch starts at 8:00 this Sunday. Please be in by 7:45.",
+        readers=(CREW_LEAD,),
+        # The time was wrong, so the crew lead corrected it.
+        corrected_body="Brunch starts at 7:30 this Sunday. Please be in by **7:15**.",
+    ),
+)
 
 
 # --- Demo security events (DT6) -------------------------------------------------------
@@ -771,6 +859,83 @@ def seed_shifts(engine: Engine, plan: CompanyPlan, now: datetime | None = None) 
         return added
 
 
+def seed_announcements(engine: Engine, plan: CompanyPlan) -> int:
+    """Give a company its demo announcements (DEMO_ANNOUNCEMENTS), unless it already has
+    some. Returns how many were added: 0 if it had announcements already.
+
+    Each step goes through the announcements service, as the person in the plan, exactly
+    as on the website: posting (authorize() checks the author may post to that audience,
+    and the entry announcement.posted is written under their name), the read marks (only
+    people in the audience may add one), the correction, and the archiving. A step the
+    application refuses stops the script and says which one. All or nothing, like the
+    shifts: one transaction for the whole company.
+    """
+    # Find the company, as platform code (no company on the session).
+    with Session(engine) as platform:
+        company_id = platform.scalars(select(Company.id).where(Company.name == plan.name)).one()
+
+    # The service commits after each step, as it does for a request; "rollback_only" keeps
+    # those commits inside this one transaction (see seed_shifts).
+    with (
+        engine.begin() as connection,
+        Session(connection, join_transaction_mode="rollback_only") as session,
+    ):
+        set_company(session, company_id)
+        # Already has announcements (an earlier run): leave them as they are. Counting a
+        # column of the model lets the company filter apply.
+        if session.scalar(select(func.count(Announcement.company_id))):
+            return 0
+
+        people = {u.display_name: u for u in session.scalars(select(User))}
+        departments = {d.name: d.id for d in session.scalars(select(Department))}
+        teams = {t.name: t.id for t in session.scalars(select(Team))}
+
+        def person(index: int) -> User:
+            return people[plan.people[index].name]
+
+        for item in DEMO_ANNOUNCEMENTS:
+            # The request body the website sends: the audience's type and its one ID.
+            if item.audience == "company":
+                audience: dict[str, Any] = {"audience_type": "company"}
+            elif item.audience in departments:
+                audience = {
+                    "audience_type": "department",
+                    "department_id": departments[item.audience],
+                }
+            else:
+                audience = {"audience_type": "team", "team_id": teams[item.audience]}
+            author = person(item.author)
+            step = "posting"
+            try:
+                posted = post_announcement(
+                    session,
+                    author,
+                    AnnouncementCreate(**audience, title=item.title, body=item.body),
+                )
+                # Read before it is archived: once archived, readers can no longer open it.
+                step = "a read mark"
+                for reader in item.readers:
+                    mark_read(session, person(reader), posted.id)
+                if item.corrected_body is not None:
+                    step = "the correction"
+                    edit_announcement(
+                        session,
+                        author,
+                        posted.id,
+                        AnnouncementUpdate(body=item.corrected_body),
+                    )
+                if item.archived:
+                    step = "archiving"
+                    archive_announcement(session, author, posted.id)
+            except HTTPException as refused:
+                # Name the announcement and the step, so a broken plan is easy to fix.
+                raise SeedRefused(
+                    f"{plan.name}: announcement {item.title!r} by {author.display_name}, "
+                    f"{step}: {refused.status_code} {refused.detail}"
+                ) from refused
+        return len(DEMO_ANNOUNCEMENTS)
+
+
 def _planner(item: ShiftPlan) -> int:
     """Who creates a shift: its own planner, or else its department's manager."""
     return item.planner if item.planner is not None else DEPARTMENT_MANAGER[item.department]
@@ -860,10 +1025,14 @@ def seed(
         added = seed_shifts(engine, plan, now)
         shifts = "shifts wait for passwords" if added is None else f"{added} shifts added"
 
+        # Announcements need only the people (invited people are in audiences too), so
+        # they never wait; a company seeded before them gets them on the next run.
+        news = f"{seed_announcements(engine, plan)} announcements added"
+
         # Security events need only the people, but come last: they are the least
         # important part, and a demo database without them still works.
         events = f"{seed_security_events(engine, plan, now)} security events added"
-        lines.append(f"{plan.name}: {state}; {reporting}; {passwords}; {shifts}; {events}")
+        lines.append(f"{plan.name}: {state}; {reporting}; {passwords}; {shifts}; {news}; {events}")
     # Events of people not signed in belong to no company: added once, for the platform.
     lines.append(f"Platform: {seed_platform_events(engine, now)} security events added")
     return lines
