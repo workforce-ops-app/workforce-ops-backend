@@ -109,12 +109,21 @@ def view_request(db: Session, user: User, request_id: uuid.UUID) -> ApprovalRequ
 # --- Deciding --------------------------------------------------------------------------
 
 
+TIME_OFF_ELSEWHERE = "Time-off requests are reviewed and cancelled on the time-off page."
+
+
 def _locked(db: Session, user: User, request_id: uuid.UUID) -> ApprovalRequest:
     """The request, after the company's lock, read fresh and locked; 404 for anyone not
     involved; 409 (after saving the lapse) if it ran out of time meanwhile."""
     found = db.get(ApprovalRequest, request_id)
     if found is None or not _involved(db, user, found):
         raise NotFound()
+    if found.kind == "time_off":
+        # Decided and cancelled on its own endpoints (app/modules/time_off/service.py),
+        # which also change the time-off request and take the locks in its order: done
+        # here, the approval record would stop waiting while the time-off request stays
+        # pending. Refused before any lock is taken (review of #167).
+        raise Conflict(TIME_OFF_ELSEWHERE)
     lock_reporting_lines(db)
     request = db.get(ApprovalRequest, request_id, populate_existing=True, with_for_update=True)
     if request is None:  # requests are never deleted
@@ -130,11 +139,7 @@ def _locked(db: Session, user: User, request_id: uuid.UUID) -> ApprovalRequest:
 def _decide(
     db: Session, user: User, request_id: uuid.UUID, decision: str, session: UserSession
 ) -> ApprovalRequest:
-    request = _locked(db, user, request_id)
-    if request.kind == "time_off":
-        # Decided on its own endpoints, which lock the employee and their shifts first
-        # (app/modules/time_off/service.py): deciding here would take them in another order.
-        raise Conflict("Time-off requests are reviewed on the time-off page.")
+    request = _locked(db, user, request_id)  # never a time-off request (refused there)
     if not may_decide(db, user, request, fresh=True):
         raise Forbidden()  # involved (they asked, or it is about them), but not a reviewer
     if handler_for(request).sensitive(db, request):

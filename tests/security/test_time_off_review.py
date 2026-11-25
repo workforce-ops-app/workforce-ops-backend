@@ -192,6 +192,27 @@ def test_time_off_is_not_decided_through_the_general_approvals_page(people: Shif
     assert status(people, request_id) == "pending"
 
 
+def test_time_off_is_not_cancelled_through_the_general_approvals_page(people: ShiftSetup) -> None:
+    # Review of #167: cancelling there would stop the approval record waiting while the
+    # time-off request stays pending. Refused (409); the time-off page cancels both.
+    request_id = ask(people.browser("ana"), 2, 2)
+    with people.db() as db:
+        found = db.get(TimeOffRequest, uuid.UUID(request_id))
+        assert found is not None
+        approval_id = found.approval_request_id
+    ana = people.browser("ana")
+    refused = ana.post(f"/api/approval-requests/{approval_id}/cancel")
+    assert refused.status_code == 409, refused.text
+    assert status(people, request_id) == "pending"
+    with people.db() as db:
+        approval = db.get(ApprovalRequest, approval_id)
+        assert approval is not None and approval.status == "pending"
+    assert actions(people, "approval.cancelled") == []
+    # The time-off page cancels both.
+    assert ana.post(f"{URL}/{request_id}/cancel").status_code == 200
+    assert status(people, request_id) == "cancelled"
+
+
 # --- Denying ---------------------------------------------------------------------------
 
 
@@ -361,3 +382,28 @@ def test_with_no_shared_manager_the_owner_settles_it(people: ShiftSetup) -> None
     assert waiting_for(people, "owner") == [request_id]
     assert decide(people, "owner", request_id, "deny") == 200
     assert status(people, request_id) == "denied"
+
+
+def test_every_decision_is_audited_even_while_the_request_waits(people: ShiftSetup) -> None:
+    # Review of #167 (AZ12): a decision that leaves the request waiting, or sends it up the
+    # chain, has its own entry (final: false); the settling one is final.
+    with people.db() as db:
+        db.add(TeamMember(team_id=people.ids["crew"], user_id=people.ids["ana"]))
+        db.commit()
+    also_reports_to(people, "ana", "lead")
+    needs_two(people)
+    request_id = ask(people.browser("ana"), 2, 2)
+    assert decide(people, "chef", request_id, "approve") == 200  # one of two
+    assert decide(people, "lead", request_id, "deny") == 200  # escalated
+    assert decide(people, "admin", request_id, "approve") == 200  # settles it
+    with people.db() as db:
+        entries = db.execute(
+            select(AuditEvent.action, AuditEvent.actor_id, AuditEvent.details)
+            .where(AuditEvent.action.in_(("approval.approved", "approval.denied")))
+            .order_by(AuditEvent.seq)
+        ).all()
+    assert [(action, actor, details["final"]) for action, actor, details in entries] == [
+        ("approval.approved", people.ids["chef"], False),
+        ("approval.denied", people.ids["lead"], False),
+        ("approval.approved", people.ids["admin"], True),
+    ]
