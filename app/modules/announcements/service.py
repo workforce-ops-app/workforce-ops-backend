@@ -352,11 +352,17 @@ def mark_read(db: Session, user: User, announcement_id: uuid.UUID) -> None:
     #    both get past step 2; the primary key on (announcement, person) then refuses the
     #    second one. That is not an error for the person: the mark they asked for exists,
     #    so the refused one is undone and the answer is the same 204.
+    #    Any other refusal is an error (review of #158): after undoing, the mark is read
+    #    again, in a new transaction that sees what the other request committed. Only if
+    #    it is there now is the refusal the duplicate; otherwise the error goes on (500),
+    #    so a 204 always means the mark is saved.
     repository.add_read_mark(db, item.id, user.id)
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
+        if repository.read_mark(db, item.id, user.id) is None:
+            raise
 
 
 def list_reads(
