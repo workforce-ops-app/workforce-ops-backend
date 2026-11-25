@@ -228,7 +228,9 @@ Built in `app/modules/owners/` (the owner kinds of approval request in `approval
 | `POST /api/owners` `{user_id}` | an owner (`company.transfer_ownership`), password re-entry | with one owner, adds at once (200); with several, opens an `owner_add` request (202) that every other owner must approve |
 | `POST /api/owners/{user_id}/remove` | as for adding | removes at once (200) when no other owner needs to agree, otherwise opens an `owner_remove` request (202) for every owner except the one being removed; never the last owner (409) |
 
-The owner who proposes a change counts as agreeing to it. So with two owners, either may remove the other at once: "every owner except the one being removed" is then only the proposer. For these kinds, "enough approvals" is every current reviewer, counted again at the last approval (`ready` in the kind's handler), so an owner added while a request waits must agree too. Approval re-checks that the change is still possible: never the last owner, never a deactivated person.
+The owner who proposes a change counts as agreeing to it. So with two owners, either may remove the other at once: "every owner except the one being removed" is then only the proposer. This is on purpose (agreed in the review of #165): the other choice, needing the removed owner's agreement too, would let a rogue co-owner block their own removal for good (decision 0032, alternatives). The removal is audited and needs the password re-entered. For these kinds, "enough approvals" is every current reviewer, counted again at the last approval (`ready` in the kind's handler), so an owner added while a request waits must agree too. Approval re-checks that the change is still possible: never the last owner, never a deactivated person.
+
+After the company's lock, a proposal checks the proposer's `company.transfer_ownership` again on fresh reads (an owner removed while the request waited proposes nothing), and both proposing and approving lock the person's row before checking that they are active. Deactivation locks the same row and checks for an owner on fresh reads, so the two take turns: a person is never made an owner while being deactivated (`_owner_race_problems` in `scripts/check_migrations.py`, MySQL).
 
 ### Approval request endpoints
 
@@ -268,7 +270,7 @@ Each rule becomes a security test in `tests/security/` when the code is built. T
 | AZ12 | Every role, permission, assignment, reporting line, ownership, and approval change writes an audit entry. | R1 |
 | AZ13 | A role can be changed, renamed, or archived only by someone above every current holder (or the Owner). | E9 |
 | AZ14 | A role at the granter's own level grants nothing until someone above the granter approves it; the granter and the person receiving the role cannot approve. | E2 |
-| AZ15 | Adding an owner needs every current owner; removing one needs every other owner; no owner acts alone when there are several. | E6 |
+| AZ15 | Adding an owner needs every current owner; removing one needs every owner except the one being removed, so nobody blocks their own removal. The proposer counts as agreeing, so a sole owner adds alone, and with two owners either may remove the other; with three or more, no owner acts alone. | E6 |
 
 ## Sensitive actions
 
