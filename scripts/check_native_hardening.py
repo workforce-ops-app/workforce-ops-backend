@@ -25,13 +25,17 @@ with the defenses that make an overflow hard to turn into running an attacker's 
 It needs only Docker and this file's standard library: each image's files are read from
 `docker export`, and the ELF headers are parsed here (the slim images have no readelf).
 
-    python scripts/check_native_hardening.py BACKEND_IMAGE FRONTEND_IMAGE
+    python scripts/check_native_hardening.py BACKEND_IMAGE [FRONTEND_IMAGE]
 
-for example workforce-ops-backend:local and workforce-ops-frontend:local.
+for example workforce-ops-backend:local and workforce-ops-frontend:local. The backend's CI
+runs it on the image it has just built, with no frontend image (ci.toml,
+native-hardening); with both, it checks both, as for a release.
 
 Prints a table per image and exits 1 if a required defense is missing from a file that
 must have it (REQUIRED below), unless docs/security/native-hardening.md states the limit
-(KNOWN_LIMITS below). It also prints the container's ASLR setting, which must be 2.
+(KNOWN_LIMITS below), or if a library that a checked file loads cannot be found in the
+image, unless the same page explains why (KNOWN_UNRESOLVED below): a library that is not
+looked at could be anything. It also prints the container's ASLR setting, which must be 2.
 """
 
 import io
@@ -50,6 +54,8 @@ PT_DYNAMIC, PT_INTERP, PT_NOTE = 2, 3, 4
 PT_GNU_STACK, PT_GNU_RELRO, PT_GNU_PROPERTY = 0x6474E551, 0x6474E552, 0x6474E553
 PF_X = 1  # the segment's "executable" permission
 DT_NULL, DT_NEEDED, DT_BIND_NOW, DT_FLAGS, DT_FLAGS_1 = 0, 1, 24, 30, 0x6FFFFFFB
+# Folders a file names for its own libraries ("$ORIGIN" is the file's own folder).
+DT_RPATH, DT_RUNPATH = 15, 29
 DF_BIND_NOW, DF_1_NOW, DF_1_PIE = 0x8, 0x1, 0x08000000
 SHT_DYNSYM = 11
 # The C library functions FORTIFY_SOURCE can replace with a checked __*_chk version. A
@@ -160,6 +166,11 @@ KNOWN_LIMITS: dict[tuple[str, str], str] = {
     ("markupsafe", "canary"): "no function with a buffer on the stack",
 }
 
+# Libraries a checked file names but the image does not hold, each with the reason it is
+# safe not to look at them (docs/security/native-hardening.md). Empty: every library
+# found so far is in the image. Add one only with its reason on that page.
+KNOWN_UNRESOLVED: dict[str, str] = {}
+
 # Packages whose compiled code may come from PyPI as it is (every other package with
 # compiled code must be built in the Dockerfile's first stage, with the defenses).
 PREBUILT_ALLOWED = {"pydantic_core": _RUST}
@@ -191,6 +202,8 @@ class Hardening:
     fortify: str  # "yes (n)" checked calls, "none needed", "unseen" (musl), or "NO (...)"
     cfi: str
     needed: list[str] = field(default_factory=list)  # the libraries it loads (DT_NEEDED)
+    # Where it says its own libraries are (DT_RUNPATH, or the older DT_RPATH), in order.
+    search: list[str] = field(default_factory=list)
 
     def value(self, defense: str) -> str:
         return {
@@ -221,7 +234,7 @@ def read_elf(path: str, data: bytes, musl: bool) -> Hardening | None:
     types = {segment[0] for segment in segments}
 
     # 3. The dynamic section: the libraries it needs and the loader's flags.
-    needed_offsets, bind_now, flags_1 = [], False, 0
+    needed_offsets, search_offsets, bind_now, flags_1 = [], [], False, 0
     for p_type, _flags, offset, size in segments:
         if p_type != PT_DYNAMIC:
             continue
@@ -231,6 +244,8 @@ def read_elf(path: str, data: bytes, musl: bool) -> Hardening | None:
                 break
             if tag == DT_NEEDED:
                 needed_offsets.append(value)
+            if tag in (DT_RPATH, DT_RUNPATH):
+                search_offsets.append(value)
             if tag == DT_BIND_NOW or (tag == DT_FLAGS and value & DF_BIND_NOW):
                 bind_now = True
             if tag == DT_FLAGS_1:
@@ -238,7 +253,7 @@ def read_elf(path: str, data: bytes, musl: bool) -> Hardening | None:
                 bind_now = bind_now or bool(value & DF_1_NOW)
 
     # 4. The dynamic symbol table, from the section headers: which functions it calls.
-    symbols, needed = set(), []
+    symbols, needed, search = set(), [], []
     sections = [
         struct.unpack_from("<IIQQQQIIQQ", data, e_shoff + number * e_shentsize)
         for number in range(e_shnum if e_shoff else 0)
@@ -256,6 +271,10 @@ def read_elf(path: str, data: bytes, musl: bool) -> Hardening | None:
             (st_name,) = struct.unpack_from("<I", data, entry)
             symbols.add(name_at(st_name))
         needed = [name_at(offset) for offset in needed_offsets]
+        # Each entry is a list of folders separated by ":".
+        search = [
+            folder for offset in search_offsets for folder in name_at(offset).split(":") if folder
+        ]
 
     # 5. The answers. A program with an interpreter is an executable; ET_DYN without one
     #    is a shared library, which is position-independent by definition.
@@ -291,6 +310,7 @@ def read_elf(path: str, data: bytes, musl: bool) -> Hardening | None:
         fortify=fortify,
         cfi=_control_flow_marks(data, segments, e_machine),
         needed=needed,
+        search=search,
     )
 
 
@@ -376,17 +396,35 @@ def _find(files: dict[str, bytes], path: str) -> str | None:
     return matches[0] if matches else None
 
 
-def _library_path(files: dict[str, bytes], name: str) -> str | None:
-    """Where the loader would find a needed library, in the usual folders."""
-    for folder in (
-        "/usr/local/lib",
-        "/lib",
-        "/usr/lib",
-        "/lib/x86_64-linux-gnu",
-        "/usr/lib/x86_64-linux-gnu",
-        "/lib/aarch64-linux-gnu",
-        "/usr/lib/aarch64-linux-gnu",
-    ):
+# The folders the loader searches after a file's own (glibc's and musl's defaults, and
+# Debian's per-architecture folders, which /etc/ld.so.conf adds).
+_SYSTEM_FOLDERS = (
+    "/usr/local/lib",
+    "/lib",
+    "/usr/lib",
+    "/lib64",
+    "/usr/lib64",
+    "/lib/x86_64-linux-gnu",
+    "/usr/lib/x86_64-linux-gnu",
+    "/lib/aarch64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+)
+
+
+def _library_path(
+    files: dict[str, bytes], name: str, origin: str = "/", search: tuple[str, ...] = ()
+) -> str | None:
+    """Where the loader would find a needed library: a path as it is; otherwise the
+    folders the loading file names for itself (`search`, with $ORIGIN as `origin`, its
+    own folder), then the system's folders. None if it is in none of them."""
+    if "/" in name:
+        found = posixpath.normpath(posixpath.join(origin, name))
+        return found if found in files else None
+    own = [
+        posixpath.normpath(folder.replace("$ORIGIN", origin).replace("${ORIGIN}", origin))
+        for folder in search
+    ]
+    for folder in (*own, *_SYSTEM_FOLDERS):
         if f"{folder}/{name}" in files:
             return f"{folder}/{name}"
     return None
@@ -428,10 +466,16 @@ def check_image(role: str, image: str) -> tuple[list[tuple[str, Hardening]], lis
                 value = result.value(defense)
                 if is_missing(defense, value) and (short, defense) not in KNOWN_LIMITS:
                     problems.append(f"{role}: {short} ({path}) has no {defense}")
+        # Every library it loads is checked in turn. One that is not in the image is a
+        # problem: it would be left out of the table, so the check would look complete
+        # while it was not (review of #204), unless KNOWN_UNRESOLVED explains it.
+        origin = posixpath.dirname(path)
         for name in result.needed:
-            library = _library_path(files, name)
+            library = _library_path(files, name, origin, tuple(result.search))
             if library is not None:
                 queue.append((name, library, False))
+            elif name not in KNOWN_UNRESOLVED:
+                problems.append(f"{role}: {short} ({path}) loads {name}, not found in the image")
     return rows, problems
 
 
@@ -468,11 +512,12 @@ def aslr_setting(image: str) -> str:
 
 
 def main(arguments: list[str]) -> int:
-    if len(arguments) != 2:
+    if len(arguments) not in (1, 2):
         print(__doc__)
         return 2
     problems = []
-    for role, image in zip(("backend", "frontend"), arguments, strict=True):
+    # The backend's image, and the frontend's if given.
+    for role, image in zip(("backend", "frontend"), arguments, strict=False):
         rows, found = check_image(role, image)
         problems += found
         print(f"\n{role} ({image})\n")

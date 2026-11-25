@@ -27,18 +27,21 @@ def make_elf(
     bind_now: bool = True,
     symbols: tuple[str, ...] = ("__stack_chk_fail", "__memcpy_chk"),
     needed: tuple[str, ...] = (),
+    runpath: str | None = None,
     property_note: bytes | None = None,
 ) -> bytes:
     """A minimal 64-bit little-endian x86-64 ELF file with the given properties."""
     # The strings: library names and symbol names, each ending in a zero byte.
     strings = b"\0"
     offsets = {}
-    for name in (*needed, *symbols):
+    for name in (*needed, *([runpath] if runpath else []), *symbols):
         offsets[name] = len(strings)
         strings += name.encode() + b"\0"
 
     # The dynamic section: needed libraries, BIND_NOW if asked, and the end marker.
     dynamic = b"".join(struct.pack("<qQ", check.DT_NEEDED, offsets[n]) for n in needed)
+    if runpath:
+        dynamic += struct.pack("<qQ", check.DT_RUNPATH, offsets[runpath])
     if bind_now:
         dynamic += struct.pack("<qQ", check.DT_FLAGS, check.DF_BIND_NOW)
     dynamic += struct.pack("<qQ", check.DT_NULL, 0)
@@ -200,3 +203,56 @@ def test_compiled_packages_must_be_built_in_the_image(
     name: str, tag: str, compiled: bool, refused: bool
 ) -> None:
     assert bool(check.prebuilt_problems("backend", _package(name, tag, compiled))) is refused
+
+
+# --- Libraries a checked file loads (review of #204) -----------------------------------
+
+SITE = "/usr/local/lib/python3.13/site-packages"
+
+
+def test_the_folders_a_file_names_for_itself_are_read() -> None:
+    result = read(make_elf(program=False, needed=("libz.so.1",), runpath="$ORIGIN/../pkg.libs"))
+    assert result.needed == ["libz.so.1"]
+    assert result.search == ["$ORIGIN/../pkg.libs"]
+
+
+@pytest.mark.parametrize(
+    ("name", "search", "found"),
+    [
+        # In the loading file's own folder list, with $ORIGIN as its folder.
+        ("libz.so.1", ("$ORIGIN/../pkg.libs",), f"{SITE}/pkg.libs/libz.so.1"),
+        # In a system folder, here the one glibc's loader itself lives in on amd64.
+        ("ld-linux-x86-64.so.2", (), "/lib64/ld-linux-x86-64.so.2"),
+        # Nowhere: not guessed.
+        ("libgone.so.1", ("$ORIGIN",), None),
+    ],
+)
+def test_a_needed_library_is_looked_for_where_the_loader_would(
+    name: str, search: tuple[str, ...], found: str | None
+) -> None:
+    files = {f"{SITE}/pkg.libs/libz.so.1": b"", "/lib64/ld-linux-x86-64.so.2": b""}
+    assert check._library_path(files, name, f"{SITE}/pkg", search) == found
+
+
+def test_a_library_that_is_not_in_the_image_is_a_problem(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A library left out would be missing from the table without a word, so the check
+    would look complete while it was not."""
+    files = {
+        f"{SITE}/pkg/_speedups.so": make_elf(program=False, needed=("libgone.so.1",)),
+        f"{SITE}/other/_fast.so": make_elf(program=False, needed=("libz.so.1",), runpath="$ORIGIN"),
+        f"{SITE}/other/libz.so.1": make_elf(program=False),
+    }
+    monkeypatch.setattr(check, "image_files", lambda image: files)
+    _rows, problems = check.check_image("backend", "any")
+    loading = [problem for problem in problems if " loads " in problem]
+    assert loading == [
+        f"backend: pkg ({SITE}/pkg/_speedups.so) loads libgone.so.1, not found in the image"
+    ]
+
+
+def test_a_documented_missing_library_is_not_a_problem(monkeypatch: pytest.MonkeyPatch) -> None:
+    files = {f"{SITE}/pkg/_speedups.so": make_elf(program=False, needed=("libgone.so.1",))}
+    monkeypatch.setattr(check, "image_files", lambda image: files)
+    monkeypatch.setitem(check.KNOWN_UNRESOLVED, "libgone.so.1", "a reason on the page")
+    _rows, problems = check.check_image("backend", "any")
+    assert not [problem for problem in problems if " loads " in problem]

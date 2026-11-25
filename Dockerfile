@@ -13,7 +13,10 @@
 FROM python:3.13-slim AS build
 
 # A C compiler and the headers they need; Rust for cryptography.
-RUN apt-get update     && apt-get install -y --no-install-recommends         gcc libc6-dev libffi-dev libssl-dev pkg-config cargo rustc     && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        gcc libc6-dev libffi-dev libssl-dev pkg-config cargo rustc \
+    && rm -rf /var/lib/apt/lists/*
 
 # The defenses, for every C file compiled below:
 #   -fstack-protector-strong  a canary before each return address in functions with
@@ -21,18 +24,31 @@ RUN apt-get update     && apt-get install -y --no-install-recommends         gcc
 #   -D_FORTIFY_SOURCE=3       copies with a size the compiler knows are checked as they run
 #   -z relro -z now           the table of library addresses is filled at start-up, then
 #                             made read-only (full RELRO)
-ENV CFLAGS="-O2 -fstack-protector-strong -D_FORTIFY_SOURCE=3"     LDFLAGS="-Wl,-z,relro,-z,now"     PIP_NO_CACHE_DIR=1     PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV CFLAGS="-O2 -fstack-protector-strong -D_FORTIFY_SOURCE=3" \
+    LDFLAGS="-Wl,-z,relro,-z,now" \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# Wheels for the app and every pinned dependency, in /wheels. The versions come from
-# pyproject.toml, so a Dependabot update changes them here too; the ones with C code are
-# built from source, the rest are downloaded as they are (pydantic-core is pure Rust,
-# which checks its own bounds, so its wheel is used as it is).
-# scripts/check_native_hardening.py fails if a new dependency brings C code that is not
-# listed here.
+# 1. Wheels for every pinned dependency, in /wheels. The versions come from
+#    pyproject.toml, so a Dependabot update changes them here too; the ones with C code
+#    are built from source, the rest are downloaded as they are (pydantic-core is pure
+#    Rust, which checks its own bounds, so its wheel is used as it is).
+#    scripts/check_native_hardening.py fails if a new dependency brings C code that is
+#    not listed here.
+#    Only pyproject.toml is copied for this step, and only its dependency list is used,
+#    so the slow compiling is done again only when pyproject.toml changes, never for a
+#    change to the app's code (review of #204).
 WORKDIR /build
-COPY pyproject.toml README.md ./
+COPY pyproject.toml ./
+RUN python -c "import tomllib; print(*tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies'], sep='\n')" > requirements.txt \
+    && pip wheel --wheel-dir /wheels -r requirements.txt \
+        --no-binary cffi,argon2-cffi-bindings,cryptography,markupsafe,sqlalchemy
+
+# 2. The app's own wheel, without its dependencies (they are all in /wheels already). A
+#    change to the app's code starts again from here, in seconds.
+COPY README.md ./
 COPY app ./app
-RUN pip wheel --wheel-dir /wheels     --no-binary cffi,argon2-cffi-bindings,cryptography,markupsafe,sqlalchemy .
+RUN pip wheel --wheel-dir /wheels --no-deps .
 
 # --- Stage 2: the image that runs ----------------------------------------------------
 # Start from the official Python 3.13 image, "slim" variant: a small Debian Linux
@@ -51,7 +67,8 @@ WORKDIR /srv
 # Install the app and its pinned dependencies from the wheels built above, and only from
 # them (--no-index): nothing is downloaded here, so no unhardened wheel can slip in. The
 # wheels are mounted for this step only and are not kept in the image.
-RUN --mount=type=bind,from=build,source=/wheels,target=/wheels     pip install --no-index --find-links /wheels workforce-ops-backend
+RUN --mount=type=bind,from=build,source=/wheels,target=/wheels \
+    pip install --no-index --find-links /wheels workforce-ops-backend
 
 # Migrations travel with the image, so they can be applied with the migrations user
 # (Compose's migrate tool, never the running API):

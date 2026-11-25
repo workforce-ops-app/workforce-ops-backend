@@ -20,7 +20,7 @@ A buffer overflow writes past the end of an array. In C nothing stops it, so an 
 | **FORTIFY_SOURCE** | copies and formatting whose destination size the compiler knows are checked as they run | calls such as `__memcpy_chk` |
 | **CET / BTI** (hardware control flow integrity) | the processor refuses jumps to places that are not marked as jump targets (IBT on x86, BTI on ARM), and keeps a second copy of return addresses (shadow stack) | the GNU property note; reported, not required (see limits) |
 
-The check reads the same marks as `checksec`, from the files themselves: it exports each image with `docker export`, finds the required files and every library they load, and parses their ELF headers (the slim images have no `readelf`). Like `checksec`, it can only see a canary or FORTIFY where the code calls the checking functions. A file that has no function with a buffer on the stack has no canary to see, and FORTIFY cannot check a copy whose size is only known as the program runs. The table says "none needed" when a file calls nothing FORTIFY could check.
+The check reads the same marks as `checksec`, from the files themselves: it exports each image with `docker export`, finds the required files and every library they load (looked for where the loader would look: the folders the file names for itself, `DT_RUNPATH` or `DT_RPATH` with `$ORIGIN`, then the system's folders), and parses their ELF headers (the slim images have no `readelf`). Like `checksec`, it can only see a canary or FORTIFY where the code calls the checking functions. A file that has no function with a buffer on the stack has no canary to see, and FORTIFY cannot check a copy whose size is only known as the program runs. The table says "none needed" when a file calls nothing FORTIFY could check.
 
 ## How to run it
 
@@ -30,7 +30,11 @@ docker build -t workforce-ops-frontend:local ../workforce-ops-frontend
 python scripts/check_native_hardening.py workforce-ops-backend:local workforce-ops-frontend:local
 ```
 
-It prints a table per image and the ASLR setting, and exits 1 if a required file lacks a defense that is not a stated limit below, or if a package with compiled code was installed from PyPI's build instead of being built in the image.
+It prints a table per image and the ASLR setting, and exits 1 if a required file lacks a defense that is not a stated limit below, if a package with compiled code was installed from PyPI's build instead of being built in the image, or if a file it checks loads a library it cannot find in the image. A library that is not found would be left out of the table without a word, so the check would look complete while it was not (review of #204). A library may be missing only with its reason in `KNOWN_UNRESOLVED` in the script and here; there are none: every library either image loads was found (2026-11-25).
+
+The frontend image is optional: `python scripts/check_native_hardening.py workforce-ops-backend:local` checks the backend only.
+
+**In CI:** the `native-hardening` operation in `ci.toml` builds the backend image as it ships and runs the check on it, on every pull request and push, so a dependency update that brings an unhardened binary fails CI before it reaches an image. It needs Docker and takes several minutes, so it runs in CI only (`local = false`); run the commands above to check by hand. The frontend image is built in the frontend repository; checking it there in the same way is a follow-up.
 
 ## Results (2026-11-25)
 
@@ -87,7 +91,7 @@ The fix is a first stage in the `Dockerfile` that builds those five from source 
 - the versions are the pinned ones from `pyproject.toml`, so a Dependabot update builds the new version the same way;
 - the final image installs only from those wheels (`--no-index`) and has no compiler.
 
-The check now fails if a package with compiled code arrives as a PyPI wheel, so a new C dependency cannot slip in unhardened. The cost is build time: the first build compiles `cryptography`'s Rust code, about six more minutes (Docker's cache skips it until a pin changes). CI does not build the image; the deploy workflow does.
+The check now fails if a package with compiled code arrives as a PyPI wheel, so a new C dependency cannot slip in unhardened. The cost is build time: the first build compiles `cryptography`'s Rust code, about six more minutes. The first stage builds the dependencies from `pyproject.toml` alone, before the app's code is copied in, and the app's own wheel in a step after it, so Docker's cache skips the compiling until `pyproject.toml` changes (a pin, or anything else in that file); a change to the app's code rebuilds only its own wheel (review of #204).
 
 We confirmed the rebuilt image works: it ran the migrations on MySQL 8.4 with Docker Compose, signed in to MySQL as the application user (MySQL 8's sign-in method goes through `cryptography`), answered `/api/health`, and checked a password with Argon2 at sign-in.
 
