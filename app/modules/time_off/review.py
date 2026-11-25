@@ -2,7 +2,12 @@
 states and rules; decision 0029). Used by approval.py, the handler the shared approval layer
 calls.
 
-Who reviews it (worked out again at every decision, on fresh reads, never stored):
+Who reviews it (worked out again at every decision, never stored). With fresh=True, after
+the company's lock, everything is read with locking reads (the reviewers' rows, grants,
+and places, the chain, the owners, the employee), so a change committed while the decision
+waited counts; with fresh=False (who reviews a request, shown on a page; the requests
+waiting for someone) ordinary reads, so a page view never takes or waits for row locks
+(review of #167, the pattern of #165 and #171):
 
 1. Pending: the employee's DIRECT managers who can review it (active, and holding
    time_off.review over the employee). If none of them can, the next level up, one level
@@ -28,10 +33,15 @@ On approval, every scheduled shift of the employee that overlaps the approved da
 open, each with its own shift.opened audit entry naming the request.
 
 Course topic, SQL JOINs: finding the nearest shared manager. Each step up the chain is one
-query joining reporting_lines to the people found so far (direct_managers_fresh); the
+query joining reporting_lines to the people found so far (chain.direct_managers); the
 walk keeps how many steps up each manager was found, and the shared managers are the ones
 every walk found, nearest first. It walks one level per query, not as one recursive
 query, because a decision needs the newest committed lines (see is_above_in_chain_fresh).
+
+Lock order (review of #167): the company's lock, the employee, the time-off row, then
+its approval record (the top of service.py). A lapse takes the company's lock and the
+time-off row before it changes the approval record (approval.lock, called by the shared
+lapse()).
 """
 
 import uuid
@@ -42,9 +52,9 @@ from sqlalchemy.orm import Session
 
 from app.approvals.models import ApprovalDecision, ApprovalRequest
 from app.audit import Actor, record
-from app.authz.chain import direct_managers_fresh
+from app.authz.chain import direct_managers
 from app.authz.check import grants
-from app.authz.models import Role, RoleAssignment
+from app.authz.delegation import active_owners
 from app.authz.scope import covers, person_scope
 from app.db.base import utcnow
 from app.modules.org.models import User
@@ -55,57 +65,61 @@ from app.modules.time_off.models import TimeOffRequest
 # --- Who may review --------------------------------------------------------------------
 
 
-def request_for(db: Session, approval: ApprovalRequest) -> TimeOffRequest | None:
-    """The time-off request an approval record belongs to."""
-    return db.scalars(
-        select(TimeOffRequest).where(TimeOffRequest.approval_request_id == approval.id)
-    ).one_or_none()
+def request_for(
+    db: Session, approval: ApprovalRequest, *, fresh: bool = False, lock: bool = False
+) -> TimeOffRequest | None:
+    """The time-off request an approval record belongs to. fresh=True: a locking read
+    (FOR SHARE) of the newest committed row; lock=True: locked for a change (FOR UPDATE)."""
+    query = select(TimeOffRequest).where(TimeOffRequest.approval_request_id == approval.id)
+    if lock:
+        query = query.with_for_update()
+    elif fresh:
+        query = query.with_for_update(read=True)
+    if lock or fresh:
+        query = query.execution_options(populate_existing=True)
+    return db.scalars(query).one_or_none()
 
 
-def can_review(db: Session, person_id: uuid.UUID, employee: User) -> bool:
+def _person(db: Session, person_id: uuid.UUID, *, fresh: bool) -> User | None:
+    """A person's row; fresh=True reads the newest committed one (FOR SHARE)."""
+    if fresh:
+        return db.get(User, person_id, with_for_update={"read": True}, populate_existing=True)
+    return db.get(User, person_id)
+
+
+def can_review(db: Session, person_id: uuid.UUID, employee: User, *, fresh: bool) -> bool:
     """Whether the person may review this employee's time off: active, not the employee,
-    and holding time_off.review somewhere that covers the employee."""
-    person = db.get(User, person_id)
+    and holding time_off.review somewhere that covers the employee. fresh: as at the top."""
+    person = _person(db, person_id, fresh=fresh)
     if person is None or person.deactivated_at is not None or person.id == employee.id:
         return False
-    scope = person_scope(db, employee)
-    return any(covers(grant, scope) for grant in grants(db, person, "time_off.review"))
+    scope = person_scope(db, employee, fresh=fresh)
+    held = grants(db, person, "time_off.review", fresh=fresh)
+    return any(covers(grant, scope) for grant in held)
 
 
-def owners(db: Session) -> set[uuid.UUID]:
-    """The company's active owners (Owner role, company-wide): the last resort."""
-    ids = db.scalars(
-        select(RoleAssignment.user_id, Role.id)
-        .join(Role, Role.id == RoleAssignment.role_id)
-        .where(Role.built_in == "owner", RoleAssignment.scope_type == "company")
-    )
-    return {
-        person for person in ids if (found := db.get(User, person)) and found.deactivated_at is None
-    }
-
-
-def first_reviewers(db: Session, employee: User) -> set[uuid.UUID]:
+def first_reviewers(db: Session, employee: User, *, fresh: bool) -> set[uuid.UUID]:
     """Step 1: the nearest level above the employee where somebody can review, or else the
     owners (never the employee)."""
     seen = {employee.id}
-    level = direct_managers_fresh(db, {employee.id})
+    level = direct_managers(db, {employee.id}, fresh=fresh)
     while level:
-        able = {person for person in level if can_review(db, person, employee)}
+        able = {person for person in level if can_review(db, person, employee, fresh=fresh)}
         if able:
             return able
         # Only people not met before go on, so even a loop in the lines ends the walk.
         seen |= level
-        level = direct_managers_fresh(db, level) - seen
-    return owners(db) - {employee.id}
+        level = direct_managers(db, level, fresh=fresh) - seen
+    return active_owners(db, fresh=fresh) - {employee.id}
 
 
-def _steps_above(db: Session, person_id: uuid.UUID) -> dict[uuid.UUID, int]:
+def _steps_above(db: Session, person_id: uuid.UUID, *, fresh: bool) -> dict[uuid.UUID, int]:
     """Everyone above the person, with how many steps up each one is (1: a direct manager)."""
     found: dict[uuid.UUID, int] = {}
     seen, level, steps = {person_id}, {person_id}, 0
     while level:
         steps += 1
-        managers = direct_managers_fresh(db, level) - seen
+        managers = direct_managers(db, level, fresh=fresh) - seen
         for manager in managers:
             found[manager] = steps
         seen |= managers
@@ -113,14 +127,16 @@ def _steps_above(db: Session, person_id: uuid.UUID) -> dict[uuid.UUID, int]:
     return found
 
 
-def nearest_shared(db: Session, deciders: set[uuid.UUID], employee: User) -> set[uuid.UUID]:
+def nearest_shared(
+    db: Session, deciders: set[uuid.UUID], employee: User, *, fresh: bool
+) -> set[uuid.UUID]:
     """Step 2: the lowest people above every decider who can review, or else the owners.
     Neither the employee nor anyone who already decided is included."""
-    walks = [_steps_above(db, person) for person in deciders]
+    walks = [_steps_above(db, person, fresh=fresh) for person in deciders]
     shared = set.intersection(*(set(walk) for walk in walks)) if walks else set()
-    able = {p for p in shared if can_review(db, p, employee)} - deciders
+    able = {p for p in shared if can_review(db, p, employee, fresh=fresh)} - deciders
     if not able:
-        return owners(db) - {employee.id} - deciders
+        return active_owners(db, fresh=fresh) - {employee.id} - deciders
     # How near a shared manager is: the longest of its distances to the deciders, so the
     # nearest is the one closest to all of them, not just to one.
     distance = {p: max(walk[p] for walk in walks) for p in able}
@@ -129,15 +145,15 @@ def nearest_shared(db: Session, deciders: set[uuid.UUID], employee: User) -> set
 
 
 def reviewers(db: Session, approval: ApprovalRequest, *, fresh: bool = False) -> set[uuid.UUID]:
-    """Who may decide now: step 2 when escalated, otherwise step 1. fresh is part of the
-    shared Handler interface (app/approvals/service.py); time off does not use it yet."""
-    request = request_for(db, approval)
-    employee = db.get(User, approval.subject_user_id)
+    """Who may decide now: step 2 when escalated, otherwise step 1. fresh=True after the
+    company's lock (a decision), fresh=False for answers (the top of this file)."""
+    request = request_for(db, approval, fresh=fresh)
+    employee = _person(db, approval.subject_user_id, fresh=fresh)
     if request is None or employee is None:
         return set()
     if request.status == "escalated":
-        return nearest_shared(db, _escalated_from(approval), employee)
-    return first_reviewers(db, employee)
+        return nearest_shared(db, _escalated_from(approval), employee, fresh=fresh)
+    return first_reviewers(db, employee, fresh=fresh)
 
 
 def _escalated_from(approval: ApprovalRequest) -> set[uuid.UUID]:
@@ -148,19 +164,24 @@ def _escalated_from(approval: ApprovalRequest) -> set[uuid.UUID]:
 
 
 def _decisions(db: Session, approval: ApprovalRequest) -> dict[uuid.UUID, str]:
+    """Every decision on the request so far, with a locking read (FOR SHARE), as the shared
+    count in app/approvals/service.py does: a decision another reviewer committed while
+    this one waited for the locks must be counted, or a complete approval could stay
+    waiting and a disagreement go unnoticed (review of #167)."""
     return dict(
         db.execute(
-            select(ApprovalDecision.approver_id, ApprovalDecision.decision).where(
-                ApprovalDecision.request_id == approval.id
-            )
+            select(ApprovalDecision.approver_id, ApprovalDecision.decision)
+            .where(ApprovalDecision.request_id == approval.id)
+            .with_for_update(read=True)
         ).all()
     )
 
 
 def outcome(db: Session, approval: ApprovalRequest) -> str | None:
-    """After a decision: "approved", "denied", or None (waiting, or just escalated)."""
-    request = request_for(db, approval)
-    employee = db.get(User, approval.subject_user_id)
+    """After a decision: "approved", "denied", or None (waiting, or just escalated). Runs
+    inside a decision, after the locks, so everything is read fresh."""
+    request = request_for(db, approval, fresh=True)
+    employee = _person(db, approval.subject_user_id, fresh=True)
     if request is None or employee is None:
         return None
     decisions = _decisions(db, approval)
@@ -172,7 +193,7 @@ def outcome(db: Session, approval: ApprovalRequest) -> str | None:
 
     approvals = sum(1 for d in decisions.values() if d == "approve")
     denials = len(decisions) - approvals
-    level = first_reviewers(db, employee)
+    level = first_reviewers(db, employee, fresh=True)
     if approvals and denials:
         _escalate(db, request, approval, set(decisions), employee)
         return None
@@ -198,7 +219,7 @@ def _escalate(
         **approval.payload,
         "escalated_from": sorted(str(person) for person in deciders),
     }
-    to = nearest_shared(db, deciders, employee)
+    to = nearest_shared(db, deciders, employee, fresh=True)
     record(
         db,
         actor=Actor.system(),
