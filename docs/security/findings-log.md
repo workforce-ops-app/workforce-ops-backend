@@ -15,4 +15,4 @@
 
 | Finding | Found by | Threat | Severity | Issue | Fixed in |
 |---|---|---|---|---|---|
-| Compiled Python packages (libargon2, cffi, cryptography's OpenSSL, SQLAlchemy, MarkupSafe) installed from PyPI wheels built without stack canaries or FORTIFY_SOURCE, most with partial RELRO; now built in the image with them ([native hardening](native-hardening.md)) | `scripts/check_native_hardening.py` (#107) | E10 | low | #107 | this PR |
+| Compiled Python packages (libargon2, cffi, cryptography's OpenSSL, SQLAlchemy, MarkupSafe) installed from PyPI wheels built without stack canaries or FORTIFY_SOURCE, most with partial RELRO; now built in the image with them ([native hardening](native-hardening.md)) | `scripts/check_native_hardening.py` (#107) | E10 | low | #107 | #204 |
