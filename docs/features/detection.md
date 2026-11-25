@@ -80,7 +80,7 @@ Each pattern has a stable ID (for example `SQLI-03`) so events, tests, and the s
 
 Attackers disguise input, so each value is simplified before matching, in this order:
 
-1. URL-decode, at most twice (catches `%2527`, a double-encoded quote).
+1. URL-decode, at most twice (catches `%2527`, a double-encoded quote), then decode the old `%uXXXX` form (`%u003c` is `<`), which standard URL decoding leaves as it is (added in tuning).
 2. Decode HTML entities (`&lt;script&gt;`).
 3. Unicode NFKC, which turns look-alike characters such as full-width `＜` into plain ones.
 4. Lowercase.
@@ -239,6 +239,47 @@ How the detector is measured for the report. The scripts, datasets, and results 
 - The split is committed, with each file's SHA-256 checksum, **before any pattern is tuned**. Nobody looks at the test set while writing patterns.
 - When tuning ends, the detector is tagged (for example `detector-v1`) and scored on the test set **once**. A later change is a new version with its own score; the first score stays in the report.
 - The field set is scored with the same tagged version.
+
+### Tuning (backend #199)
+
+Tuning read only `datasets/detection/tuning.jsonl` in the research repository; `test.jsonl` was never opened. Each run was scored on the tuning split; the final run, from the merged backend, is committed in the research repository (`results/detection/tuning-<commit>`). A pattern added in tuning describes how a kind of attack is built, never one payload from the data.
+
+| Type | Before (precision / recall) | After (precision / recall) |
+|---|---|---|
+| SQL injection | 98.8% / 53.5% | 99.1% / 74.7% |
+| Cross-site scripting | 99.4% / 87.7% | 99.5% / 91.0% |
+| Path traversal | 95.7% / 37.3% | 98.0% / 91.3% |
+| Command injection | 99.3% / 96.2% | 99.2% / 98.2% |
+| Format string | 27.5% / 71.8% | 95.7% / 76.1% |
+
+False alarms on harmless tuning text: the team's tricky text went from 8 of 187 to 4; ordinary text (demo and census) stayed at 0 of 1,535. The tuning numbers are not the result: the tuned detector is scored once on the test split (research #8).
+
+**What changed:**
+
+| Pattern | What it adds |
+|---|---|
+| `SQLI-07` | a test between two literals with no quote before it (`or 1=1`, `and 1=0`): numeric injection |
+| `SQLI-08` | a quote, then a clause that changes the query (`' having 1=1`), and `order by <n>` cut off by a comment |
+| `SQLI-09` | a subquery (`(select count(*)`), a function selected on its own (`select version()`), `select * from`, a full `case when ... then ... else ... end` |
+| `SQLI-10` | server variables and error-based functions (`@@version`, `xp_cmdshell`, `extractvalue(`, `convert(int,`), DB2's catalogs |
+| `SQLI-11` | a quote, then `or`/`and` a constant, then a comment (`")or true#`): the login-bypass family |
+| `XSS-06` | a quote ending an attribute, then an event handler (`" onfocus=alert(1)`) |
+| `XSS-07` | a script call right after a character that ends a string or statement (`'-alert(1)-'`) |
+| `XSS-08` | script run from CSS (`width:expression(`, `behavior:url(`) |
+| `XSS-09` | script in another namespace or XML (`<html:script`, `<?xml-stylesheet`) |
+| `PATH-04` | steps up with the slash disguised (`..0x5c..`, `..%u2216..`, `..2f..`) and runs of `/.` and `/..` |
+| `PATH-05` | a full path into a system folder (`/etc/...`, `/var/log/...`, `c:\windows`), but not `c:\users\...`, where people keep their own files |
+| `PATH-06` | a well-known system file whatever its slash became (`etc0x2fpasswd`) |
+| `CMD-04` | a separator, then a Windows or network command (`& ipconfig`, `; netstat`); after a single `&`, only commands that are not everyday words (`dog & cat` is a note) |
+| `CMD-05` | a program by its full path (`/usr/bin/id`), a server-side include (`<!--#exec`), a PHP call that runs a command (`system('id')`) |
+| `FMT-05` | replaces `FMT-04`: `${...}` or `#{...}` only when it computes something (an operator, call, dot, quote, or bracket), so `${price}` and the shell's `${str1}` are not flagged |
+| `FMT-06` | replaces `FMT-03` for the same reason: `{{customer}}` is a mail-merge field |
+| `FMT-07` | a template reaching into the server's objects (`{{''.__class__`, `\|attr(`, `{$smarty.`, `{php}`), including payloads too long for `FMT-06` |
+| `FMT-08` | a run of printf number conversions (`%d%d%d`, `%u%u%u`) |
+
+`FMT-03` and `FMT-04` are **retired** (`RETIRED` in `patterns.py`): their IDs are never used again, so a stored event still means what its ID meant. Most of `FMT-04`'s false alarms were command injection payloads using the shell's `${#str}`, which made format string precision 27.5%.
+
+**What tuning left alone, and why:** most remaining SQL injection misses are fragments such as `")` or `'^'` (SecLists `login_bypass.txt`) that ordinary text also contains, so a pattern for them would flag names like O'Brien; sqlmap's templates with placeholders (`[randnum]`) are not what is sent on the wire; event handler names on their own (`onmousedown`) are words, not attacks. The four remaining tricky harmless alarms (`/etc/hosts` in a class title, a `<script>` for a video, `Sleep(8)`, `%n` in a manual) look exactly like the attack and stay as the measured cost.
 
 ### Timing
 
