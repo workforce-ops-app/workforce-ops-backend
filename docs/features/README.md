@@ -10,10 +10,10 @@ New pages start from the [feature template](https://github.com/workforce-ops-app
 | Roles, role assignments, reporting lines, owners, account changes | [organization](organization.md), rules in [authorization](../architecture/authorization.md) | core | design |
 | Schedules and shifts | [schedules](schedules.md) | core | design |
 | Time-off requests | [time off](time-off.md) | core | design |
-| Shift coverage and swaps | not yet | next | planned |
+| Shift coverage and swaps | [coverage](coverage.md) | final demo | design |
 | Draft-and-publish schedules | not yet | next | planned |
 | Shift tasks, with photos on task notes (secure file uploads) | not yet | next | planned |
-| Announcements | [announcements](announcements.md) | final demo | design |
+| Announcements | [announcements](announcements.md) | final demo | posting and managing built (AN1); reading planned (AN2) |
 | Notifications | not yet | next | planned |
 | Company settings, display name, and logo | the settings table and its rules: [data model](../architecture/data-model.md#company_settings); a settings screen, display name, and logo not yet | next | settings built (no API yet); the rest planned |
 | Audit log viewer and verification | verification built (#58); viewer not yet | next | planned |

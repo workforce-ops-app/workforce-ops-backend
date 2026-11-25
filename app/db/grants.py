@@ -81,6 +81,12 @@ APP_RIGHTS: dict[str, frozenset[str]] = {
     # Time-off requests (app/modules/time_off/): added when asked, then changed in place as
     # they are decided, cancelled, or lapse (UPDATE). Never removed: they are history.
     "time_off_requests": frozenset({"SELECT", "INSERT", "UPDATE"}),
+    # Announcements (docs/features/announcements.md): posted (INSERT), corrected and
+    # archived (UPDATE; also needed to lock a row with SELECT ... FOR UPDATE while it
+    # changes). Archived, never deleted (decision 0020), so no DELETE.
+    "announcements": frozenset({"SELECT", "INSERT", "UPDATE"}),
+    # Read marks are added once and never changed or removed.
+    "announcement_reads": frozenset({"SELECT", "INSERT"}),
 }
 
 # Alembic's own bookkeeping: only the migrations user needs it.
