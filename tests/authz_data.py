@@ -32,7 +32,7 @@ from app.authz.models import Permission, ReportingLine, Role, RoleAssignment, Ro
 from app.authz.roles import assign_role, create_starting_roles
 from app.authz.scope import Scope, scope_resolver
 from app.db.base import Base, utcnow
-from app.modules.org.models import Company, Department, Team, TeamMember, User
+from app.modules.org.models import Company, CompanyLock, Department, Team, TeamMember, User
 from app.tenancy.context import set_company
 from tests.audit_data import TEST_KEY, use_key
 
@@ -40,6 +40,7 @@ TABLES = [
     model.__table__
     for model in (
         Company,
+        CompanyLock,  # every new company gets its lock row in the same save (#198)
         Department,
         Team,
         User,

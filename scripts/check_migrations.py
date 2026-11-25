@@ -24,10 +24,11 @@
    the same-level rule), and so do approval decisions (the reviewer's access, the
    requested role's grants and state), and so do reporting line changes (the actor's
    reporting_line.manage, each person's place and active status), and an overdue
-   request noticed by two requests lapses once, with both seeing it declined. SQLite
-   has no row locks, so this too can only be tried on MySQL. They run as the
-   application user, so they also show its rights are enough for the app's own writes
-   and locking reads.
+   request noticed by two requests lapses once, with both seeing it declined, and
+   requests that lock a person and write audit never deadlock with requests holding
+   the company's lock (#198). SQLite has no row locks, so this too can only be tried
+   on MySQL. They run as the application user, so they also show its rights are enough
+   for the app's own writes and locking reads.
 6. A company that existed before a migration still works after it
    (_existing_company_problems): its starting roles get the permissions a migration adds
    (announcement.create in 0014).
@@ -63,7 +64,7 @@ from sqlalchemy.exc import DBAPIError, OperationalError
 
 if TYPE_CHECKING:  # names used only in type hints
     import uuid
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from datetime import datetime
 
     from sqlalchemy.orm import Session
@@ -381,6 +382,7 @@ def _race_problems(url: str) -> list[str]:
             + _assignment_race_problems(engine)
             + _approval_race_problems(engine)
             + _owner_race_problems(engine)
+            + _company_lock_deadlock_problems(engine)
         )
     finally:
         engine.dispose()
@@ -1945,6 +1947,250 @@ def _approval_race_problems(engine: Engine) -> list[str]:
         )
         if entries != 1:
             problems.append(f"an overdue request has {entries} not-reviewed audit entries")
+    return problems
+
+
+def _company_lock_deadlock_problems(engine: Engine) -> list[str]:
+    """Requests that lock a person and write audit, meeting requests that take the
+    company's lock and then that person; return what failed (#198).
+
+    The company's lock (chain.lock_reporting_lines) used to be the company's own row.
+    Every audit entry refers to that row by a foreign key, so writing one takes a shared
+    lock on it, and waits while another request holds the company's lock. Two requests
+    could then wait for each other: one holds a person and is writing its audit entry,
+    the other holds the company's lock and waits for that person. MySQL ends one of them
+    with error 1213 (deadlock), a 500 for its user. The lock is now a row of its own
+    (company_locks), which nothing refers to, so the audit entry no longer waits for it.
+
+    Each pair is run in a fixed order, several rounds, with each request in a thread of
+    its own: request A takes the person's lock and pauses; request B takes the company's
+    lock, then A goes on to its audit entry while B asks for the person. Both must end
+    without a database error (either may be refused for what the other did):
+
+    1. Deactivating a person (people.deactivate: the person, then audit) and making them
+       an owner (owners.add_owner: the company's lock, then the person).
+    2. Giving a shift to an employee (schedules.assign_shift: the employee, then audit)
+       and deciding the employee's time off (time_off.decide_request: the company's lock,
+       then the employee).
+    """
+    import threading
+    from contextlib import contextmanager
+    from datetime import UTC, timedelta
+    from unittest import mock
+
+    from sqlalchemy.exc import DBAPIError
+    from sqlalchemy.orm import Session
+
+    import app.modules.time_off.approval  # noqa: F401  (registers the "time_off" handler)
+    import app.modules.time_off.scope  # noqa: F401  (where a time-off request belongs)
+    from app.approvals.service import open_request
+    from app.audit import Actor
+    from app.auth.models import UserSession
+    from app.authz.chain import add_reporting_line
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.db.base import utcnow
+    from app.modules.org import people as accounts
+    from app.modules.org.models import Company, Department, User
+    from app.modules.owners import service as owners
+    from app.modules.schedules import service as schedules
+    from app.modules.schedules.schemas import ShiftCreate
+    from app.modules.time_off import service as time_off
+    from app.modules.time_off.models import TimeOffRequest
+    from app.tenancy.context import set_company
+
+    rounds = 3
+    problems: list[str] = []
+    with Session(engine) as platform:
+        company = Company(name="company lock deadlock probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # The owner; chef, Office's manager and every worker's direct manager; the workers,
+    # one for each round of each pair.
+    with session() as db:
+        office = Department(name="Office")
+        db.add(office)
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        names = ["owner", "chef"] + [f"worker{n}" for n in range(2 * rounds)]
+        made = {
+            name: User(
+                email=f"{name}@lock-deadlock.example.com",
+                display_name=name,
+                department_id=office.id,
+                # Set up (any value): only people with a password are given shifts.
+                password_hash="not a real hash",  # noqa: S106 (no one signs in with it)
+            )
+            for name in names
+        }
+        db.add_all(made.values())
+        db.flush()
+        assign_role(
+            db, Actor.system(), user_id=made["owner"].id, role=roles["owner"], scope_type="company"
+        )
+        assign_role(
+            db,
+            Actor.system(),
+            user_id=made["chef"].id,
+            role=roles["manager"],
+            scope_type="department",
+            scope_id=office.id,
+        )
+        for name in names[2:]:
+            add_reporting_line(
+                db, Actor.system(), manager_id=made["chef"].id, employee_id=made[name].id
+            )
+        db.commit()
+        ids = {name: person.id for name, person in made.items()}
+        office_id = office.id
+
+    @contextmanager
+    def pause_after(
+        module: object, name: str, thread: str, reached: threading.Event, go: threading.Event | None
+    ) -> Iterator[None]:
+        """Wrap module.name so that, in the given thread only, it signals `reached` once it
+        has returned (its lock is held), and then waits for `go`."""
+        real = getattr(module, name)
+
+        def wrapped(*args: object, **kwargs: object) -> object:
+            result = real(*args, **kwargs)
+            if threading.current_thread().name == thread and not reached.is_set():
+                reached.set()
+                if go is not None:
+                    go.wait(timeout=10)
+            return result
+
+        with mock.patch.object(module, name, wrapped):
+            yield
+
+    def run_pair(
+        label: str,
+        request_a: Callable[[Session], None],
+        request_b: Callable[[Session], None],
+        lock_a: tuple[object, str],
+        lock_b: tuple[object, str],
+        expected: dict[str, str],
+    ) -> None:
+        """Run A and B in the order above; note any database error, or any outcome other
+        than the expected one (a request refused for the wrong reason proves nothing)."""
+        a_locked, b_locked = threading.Event(), threading.Event()
+        outcomes: dict[str, str] = {}
+
+        def run(key: str, request: Callable[[Session], None]) -> None:
+            with session() as db:
+                try:
+                    request(db)
+                    outcomes[key] = "done"
+                except DBAPIError as error:
+                    outcomes[key] = f"database error: {error.orig}"
+                    db.rollback()
+                except Exception as error:  # refused because of the other request: fine
+                    outcomes[key] = f"refused: {type(error).__name__}"
+                    db.rollback()
+
+        with (
+            pause_after(*lock_a, "A", a_locked, b_locked),
+            pause_after(*lock_b, "B", b_locked, None),
+        ):
+            first = threading.Thread(target=run, args=("A", request_a), name="A")
+            first.start()
+            a_locked.wait(timeout=20)
+            second = threading.Thread(target=run, args=("B", request_b), name="B")
+            second.start()
+            first.join(timeout=120)
+            second.join(timeout=120)
+        errors = [
+            f"{key}: {text}" for key, text in sorted(outcomes.items()) if "database error" in text
+        ]
+        if errors:
+            problems.append(f"{label}: {'; '.join(errors)}")
+        elif outcomes != expected:
+            problems.append(f"{label}: wanted {expected}, got {outcomes}")
+
+    reauthed = UserSession(reauth_at=utcnow())
+    for number in range(rounds):
+        # 1. Deactivation against an owner change, for the same person.
+        person = ids[f"worker{number}"]
+
+        def deactivate(db: Session, person: uuid.UUID = person) -> None:
+            acting = db.get(User, ids["owner"])
+            accounts.deactivate(db, acting, person, session=reauthed)  # type: ignore[arg-type]
+
+        def make_owner(db: Session, person: uuid.UUID = person) -> None:
+            acting = db.get(User, ids["owner"])
+            owners.add_owner(db, acting, person, session=reauthed)  # type: ignore[arg-type]
+
+        run_pair(
+            f"round {number + 1}, deactivating someone while they are made an owner",
+            deactivate,
+            make_owner,
+            (accounts, "_person_to_change"),
+            (owners, "lock_reporting_lines"),
+            # A has the person first, so it is deactivated; B then finds them deactivated.
+            {"A": "done", "B": "refused: Conflict"},
+        )
+
+        # 2. A shift given to an employee against a decision on their time off.
+        worker = ids[f"worker{rounds + number}"]
+        tomorrow = (utcnow() + timedelta(days=1)).replace(microsecond=0, tzinfo=UTC)
+        with session() as db:
+            chef = db.get(User, ids["chef"])
+            shift = schedules.create_shift(
+                db,
+                chef,  # type: ignore[arg-type]
+                ShiftCreate(
+                    department_id=office_id,
+                    starts_at=tomorrow + timedelta(hours=9 + number),
+                    ends_at=tomorrow + timedelta(hours=10 + number),
+                ),
+            )
+            shift_id = shift.id
+            day = (utcnow() + timedelta(days=10 + number)).date()
+            approval = open_request(
+                db,
+                kind="time_off",
+                requested_by=worker,
+                subject_user_id=worker,
+                payload={},
+                details={},
+                required_approvals=1,
+                review_by=utcnow() + timedelta(days=1),
+            )
+            row = TimeOffRequest(
+                employee_id=worker,
+                first_day=day,
+                last_day=day,
+                status="pending",
+                approval_request_id=approval.id,
+            )
+            db.add(row)
+            db.flush()
+            approval.payload = {"time_off_request_id": str(row.id)}
+            db.commit()
+            request_id = row.id
+
+        def assign(db: Session, shift_id: uuid.UUID = shift_id, worker: uuid.UUID = worker) -> None:
+            schedules.assign_shift(db, db.get(User, ids["chef"]), shift_id, worker)  # type: ignore[arg-type]
+
+        def decide(db: Session, request_id: uuid.UUID = request_id) -> None:
+            time_off.decide_request(db, db.get(User, ids["chef"]), request_id, "approve", None)  # type: ignore[arg-type]
+
+        run_pair(
+            f"round {number + 1}, giving someone a shift while their time off is decided",
+            assign,
+            decide,
+            (schedules, "_lock_for_change"),
+            (time_off, "lock_reporting_lines"),
+            # Different days: the shift and the time off do not clash, so both go through.
+            {"A": "done", "B": "done"},
+        )
     return problems
 
 
