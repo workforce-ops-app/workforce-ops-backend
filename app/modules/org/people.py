@@ -32,9 +32,9 @@ Rules:
 Changes take turns with each other, and with team and shift changes, through row locks,
 always taken in one order so two requests never wait for each other forever:
 the department (when one is involved), then the person, then the reporting lines (the
-company row), then the audit log. Archiving a department locks it and then reads its
-people the same way, so a person cannot be created in, moved to, or reactivated into a
-department that is being archived at that moment.
+company's lock, its row in company_locks), then the audit log. Archiving a department
+locks it and then reads its people the same way, so a person cannot be created in,
+moved to, or reactivated into a department that is being archived at that moment.
 
 Each request first checks permission with ordinary reads, so a request that may not act
 on the person never waits for, or holds, their lock. After taking the lock it checks
