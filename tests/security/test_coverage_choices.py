@@ -306,3 +306,30 @@ def stored_first_day(setup: ShiftSetup, request_id: str) -> str:
         found = db.get(TimeOffRequest, uuid.UUID(request_id))
         assert found is not None
         return found.first_day.isoformat()
+
+
+# --- The new assignments are checked too (#209) -----------------------------------------
+
+
+def test_choosing_cannot_hand_a_shift_to_someone_outside_the_reviewers_scope(
+    people: ShiftSetup,
+) -> None:
+    # lead manages the Weekend Crew (team scope) and is ben's manager, so lead reviews
+    # ben's time off and may edit ben's Kitchen shift. cara works in Kitchen but is not on
+    # the crew: lead may not give her a shift. Choosing her cover would do just that, so
+    # it is refused (403), the same rule as assigning (#183), and nothing changes.
+    day5 = shift_for(people, "ben", 5)
+    request = ask(people.browser("ben"))
+    answered = offer(people, "cara", request, day5, "cover")
+    assert answered.status_code == 200, answered.json()
+    cover = answered.json()["id"]
+    sent = people.browser("ben").post(f"{URL}/{request}/send-up")
+    assert sent.status_code == 200, sent.json()
+    body = {"choices": [{"shift_id": day5, "offer_id": cover}]}
+    response = people.browser("lead").post(f"{URL}/{request}/approve", json=body)
+    assert response.status_code == 403, response.json()
+    assert stored_status(people, request) == "pending"
+    assert holder(people, day5) == (people.ids["ben"], "scheduled")
+    assert offer_statuses(people) == {cover: "offered"}
+    # Approving without choosing her offer is still lead's to do.
+    assert people.browser("lead").post(f"{URL}/{request}/approve").status_code == 200
