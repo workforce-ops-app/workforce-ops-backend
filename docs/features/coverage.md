@@ -15,7 +15,7 @@ Without the tick, a time-off request works exactly as before ([time off](time-of
 |---|---|---|---|
 | Employee asking for time off | tick the box; see every offer on their own request; send it up early; cancel it | `time_off.request_self`, `time_off.cancel_self` | own requests |
 | Coworker | see the requests they could help with; offer to cover, offer to swap, or decline, per shift; change or take back their own answer until the request goes up | `coverage.respond_self` | only requests with a shift they could be assigned |
-| Reviewer (the time-off reviewers) | see the time off with every offer; choose none or one offer per shift and approve, or decline | `time_off.review` (above the employee), and `schedule.edit` covering every shift a chosen offer changes | as for time off |
+| Reviewer (the time-off reviewers) | see the time off with every offer; choose none or one offer per shift and approve, or decline | `time_off.review` (above the employee), and `schedule.edit` covering every shift a chosen offer changes, both as it is and as it will be | as for time off |
 | Manager of the department | raise the department's send-up minimum (more days before, never fewer than the company's); with several managers, all must confirm | `time_off.review` through a grant for that department, or company-wide (see "The send-up minimum") | their department |
 
 ## How it works
@@ -93,8 +93,9 @@ stateDiagram-v2
 **Deciding**
 - Who reviews, how decisions add up, escalation, and lapsing are exactly as for time off. **The reviewer whose approval settles the request chooses the offers** (the choices sent with that approval apply); the others only approve or decline the time off.
 - Choices are `{shift_id: offer_id}` for any of the request's shifts; a shift left out gets none. Sent as a list, `choices: [{shift_id, offer_id}]`, at most one per shift. A choice that is not a cover or swap offer made on this request for that shift (another request's, a declined answer, an unknown or another company's ID) is 422; an offer no longer open is 409. Every approval's choices are kept with the approval record (`payload.choices`, by reviewer), but only the settling one's are applied (built in CV2).
-- Choosing an offer needs `schedule.edit` covering every shift it changes (the requested shift and, for a swap, the offered one); otherwise 403 and nothing changes. Approving without choices needs only what time off needs.
+- Choosing an offer needs `schedule.edit` covering every shift it changes (the requested shift and, for a swap, the offered one), both as it is now and as it will be: with the coworker on the requested shift, and with the employee on the swap's shift (#209, the rule assignments follow). A manager who covers the employee but not the coworker cannot hand the shift over. Otherwise 403 and nothing changes. Approving without choices needs only what time off needs.
 - **The re-check at approval** runs in the same transaction, after the time-off locks (lines, the employee, the request, its approval) and then the coworkers' rows and every shift involved, in ID order (the order of every schedule change): each chosen offer must still pass every rule above. If one fails, nothing changes, the answer is 409 naming the shift and the reason, and the reviewer can choose another offer or none. The chosen offers are read fresh and locked too, right after the time-off locks: an ordinary read could still show an answer the coworker has since changed or taken back, and the approval would move a shift on it (review of #193; tried on MySQL in `scripts/check_migrations.py`).
+- **The people's locks** come first, all together and sorted by ID: the employee and every coworker of the chosen offers, the same order as every schedule change, so an approval and a reassignment between the same people take turns instead of deadlocking (#209; tried on MySQL in `scripts/check_migrations.py`).
 - Applying: chosen covers and swaps reassign their shifts (`shift.assigned`, details: the request and the offer); every other shift of the employee on those days becomes open (`shift.opened`), as today.
 
 **Endings**
@@ -163,7 +164,7 @@ Someone from another department gets no card (not eligible).
 - A coworker who could not be assigned the shift, has an overlapping shift, or is on time off then cannot offer to cover (409); a swap with someone else's shift, a shift in another department, one inside the employee's time off, or one the employee could not work, is refused.
 - The employee cannot offer on their own request; nobody can offer after it went up (409).
 - A coworker sees only their own answers; a person who could not take any of its shifts gets 404.
-- Nothing on the schedule changes before approval; choices sent with a non-settling approval do not apply; choosing without `schedule.edit` over the changed shifts is 403 and changes nothing.
+- Nothing on the schedule changes before approval; choices sent with a non-settling approval do not apply; choosing without `schedule.edit` over the changed shifts, as they are or as they would be, is 403 and changes nothing.
 - A reviewer cannot choose their own offer (a reviewer who offered is refused that choice, E12).
 - The re-check refuses a chosen offer whose coworker was deactivated, got an overlapping shift or time off, or whose swap shift was reassigned, and nothing changes.
 - A collecting request is on nobody's waiting list and cannot be decided (403); after its deadline the first read sends it up. A list sends up the ones past their deadline before it filters by status, so the employee's own list filtered on "collecting" never shows one that should have gone up (review of #193).
