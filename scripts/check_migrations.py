@@ -379,6 +379,7 @@ def _race_problems(url: str) -> list[str]:
             + _time_off_review_race_problems(engine)
             + _time_off_assign_race_problems(engine)
             + _offer_race_problems(engine)
+            + _coverage_approval_lock_problems(engine)
             + _role_view_lock_problems(engine)
             + _assignment_race_problems(engine)
             + _approval_race_problems(engine)
@@ -3200,6 +3201,177 @@ def _offer_race_problems(engine: Engine) -> list[str]:
     if outcome != "422" or moved:
         where = "moved" if moved else "still ana's"
         problems.append(f"choosing an offer changed to decline meanwhile: {outcome}, shift {where}")
+    return problems
+
+
+def _coverage_approval_lock_problems(engine: Engine) -> list[str]:
+    """Approving time off with a coworker's offer while the same two people's shifts are
+    reassigned, at the same moment, in two threads; return what failed (#209).
+
+    A schedule change locks everyone it touches together, sorted by ID
+    (schedules/service.py, _lock_for_change). An approval with offers locked the employee
+    first and the coworker later, so when the coworker's ID sorts first the two took the
+    same two locks in opposite orders, and MySQL ended one with a deadlock (1213). Now
+    decide_request() locks the employee and the chosen coworkers in one sorted pass.
+
+    Each round: ana's shift with cara's cover offer, sent up; then chef approves choosing
+    it while the owner gives ana one of cara's other shifts. cara is made first, so her ID
+    sorts before ana's. Either order is fine (the reassignment may be refused, 409, if
+    the approval came first); an error is not.
+    """
+    import threading
+    from datetime import timedelta
+
+    from fastapi import HTTPException
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    import app.modules.time_off.approval  # noqa: F401  (registers the "time_off" handler)
+    import app.modules.time_off.scope  # noqa: F401  (where a time-off request belongs)
+    from app.audit import Actor
+    from app.authz.chain import add_reporting_line
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.db.base import utcnow
+    from app.modules.org.models import Company, Department, User
+    from app.modules.schedules import service as schedules
+    from app.modules.schedules.models import Shift
+    from app.modules.time_off import offers
+    from app.modules.time_off import service as time_off
+    from app.modules.time_off.models import CoverageOffer
+    from app.modules.time_off.schemas import Choice, OfferBody, TimeOffCreate
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    with Session(engine) as platform:
+        company = Company(name="coverage approval lock probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # cara first, so her ID sorts before ana's (IDs are time-ordered).
+    with session() as db:
+        office = Department(name="Office")
+        db.add(office)
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        ids: dict[str, uuid.UUID] = {}
+        for name in ("cara", "ana", "chef", "owner"):
+            person = User(
+                email=f"{name}@coverage-lock.example.com",
+                display_name=name,
+                department_id=office.id,
+                # Set up (random text is never a valid Argon2id hash: no sign-in).
+                password_hash=secrets.token_hex(16),
+            )
+            db.add(person)
+            db.flush()
+            ids[name] = person.id
+        for name, role, scope in (
+            ("cara", "employee", "department"),
+            ("ana", "employee", "department"),
+            ("chef", "manager", "department"),
+            ("owner", "owner", "company"),
+        ):
+            assign_role(
+                db,
+                Actor.system(),
+                user_id=ids[name],
+                role=roles[role],
+                scope_type=scope,
+                scope_id=office.id if scope == "department" else None,
+            )
+        add_reporting_line(db, Actor.system(), manager_id=ids["chef"], employee_id=ids["ana"])
+        db.commit()
+        office_id = office.id
+    if not ids["cara"] < ids["ana"]:
+        return ["coverage approval lock probe: cara's ID does not sort first"]
+
+    def person(db: Session, name: str) -> User:
+        found = db.get(User, ids[name])
+        if found is None:  # made above, in this company
+            raise RuntimeError("a coverage approval lock probe person is missing")
+        return found
+
+    def a_case(number: int) -> tuple[uuid.UUID, Choice, uuid.UUID]:
+        """ana's shift on day `number` with cara's cover offer, sent up; and one of cara's
+        own shifts two days later, to give to ana."""
+        start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=number)
+
+        def shift(who: str, day: timedelta) -> Shift:
+            return Shift(
+                department_id=office_id,
+                employee_id=ids[who],
+                starts_at=start + day + timedelta(hours=9),
+                ends_at=start + day + timedelta(hours=17),
+                timezone="UTC",
+                status="scheduled",
+            )
+
+        with session() as db:
+            anas, caras = shift("ana", timedelta(0)), shift("cara", timedelta(days=2))
+            db.add_all([anas, caras])
+            db.commit()
+            anas_id, caras_id = anas.id, caras.id
+        with session() as db:
+            body = TimeOffCreate(first_day=start.date(), last_day=start.date(), offer_coverage=True)
+            request_id = time_off.ask(db, person(db, "ana"), body).id
+        with session() as db:
+            offers.answer(db, person(db, "cara"), request_id, anas_id, OfferBody(answer="cover"))
+        with session() as db:
+            offer_id = db.scalars(
+                select(CoverageOffer.id).where(CoverageOffer.time_off_request_id == request_id)
+            ).one()
+        with session() as db:
+            time_off.send_up(db, person(db, "ana"), request_id)
+        return request_id, Choice(shift_id=anas_id, offer_id=offer_id), caras_id
+
+    def race_round(request_id: uuid.UUID, choice: Choice, caras_id: uuid.UUID) -> list[str]:
+        """chef approves with cara's offer while the owner gives ana cara's other shift."""
+        start = threading.Barrier(2)
+        outcomes = ["not run", "not run"]
+
+        def approve() -> None:
+            with session() as db:
+                chef = person(db, "chef")
+                start.wait()
+                try:
+                    time_off.decide_request(db, chef, request_id, "approve", None, [choice])
+                    outcomes[0] = "ok"
+                except HTTPException as refused:
+                    outcomes[0] = str(refused.status_code)
+                except Exception as error:  # a deadlock would show up here
+                    outcomes[0] = f"error: {error!r}"[:300]
+
+        def reassign() -> None:
+            with session() as db:
+                owner = person(db, "owner")
+                start.wait()
+                try:
+                    schedules.assign_shift(db, owner, caras_id, ids["ana"])
+                    outcomes[1] = "ok"
+                except HTTPException as refused:
+                    outcomes[1] = str(refused.status_code)
+                except Exception as error:  # a deadlock would show up here
+                    outcomes[1] = f"error: {error!r}"[:300]
+
+        threads = [threading.Thread(target=approve), threading.Thread(target=reassign)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        return outcomes
+
+    for number in range(3, 18, 3):  # several rounds, days apart
+        outcomes = race_round(*a_case(number))
+        if outcomes[0] != "ok" or outcomes[1] not in ("ok", "409"):
+            problems.append(f"approving with an offer while reassigning, day {number}: {outcomes}")
+            break
     return problems
 
 
