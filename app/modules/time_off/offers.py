@@ -374,7 +374,14 @@ def choose(
     for choice in choices:
         if choice.shift_id not in shifts or choice.shift_id in chosen:
             raise Invalid("Choose at most one offer for each of this request's shifts.")
-        offer = db.get(CoverageOffer, choice.offer_id)  # another company's: None
+        # Read fresh and locked (another company's: None). An ordinary read would answer
+        # from this transaction's first snapshot, taken by the checks before the time-off
+        # locks: it could still show an answer the coworker has since changed or taken
+        # back, and the approval would move a shift on it (review of #193, the same
+        # stale read). Every change to an offer holds the request's lock first, which the
+        # caller holds now, so this lock waits for nobody. apply_choices() then uses
+        # this same fresh copy.
+        offer = db.get(CoverageOffer, choice.offer_id, populate_existing=True, with_for_update=True)
         if (
             offer is None
             or offer.time_off_request_id != request.id
