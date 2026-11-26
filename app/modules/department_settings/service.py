@@ -88,18 +88,28 @@ def managers(db: Session, department_id: uuid.UUID, *, fresh: bool = False) -> s
     return found
 
 
-def company_wide(db: Session, user: User) -> bool:
-    """Whether the user holds time_off.review for the whole company."""
-    return any(grant.scope_type == "company" for grant in grants(db, user, MANAGES))
+def company_wide(db: Session, user: User, *, fresh: bool = False) -> bool:
+    """Whether the user holds time_off.review for the whole company (fresh: locking reads,
+    as in managers())."""
+    return any(grant.scope_type == "company" for grant in grants(db, user, MANAGES, fresh=fresh))
 
 
-def _department(db: Session, user: User, department_id: uuid.UUID) -> Department:
+def _department(
+    db: Session, user: User, department_id: uuid.UUID, *, fresh: bool = False
+) -> Department:
     """The department, if the user may manage its settings (403); another company's or an
-    unknown or archived one is 404."""
-    department = db.get(Department, department_id)
+    unknown or archived one is 404. fresh: after the company's lock, every read is a
+    locking read (managers())."""
+    department = (
+        db.get(Department, department_id, with_for_update={"read": True}, populate_existing=True)
+        if fresh
+        else db.get(Department, department_id)
+    )
     if department is None or department.archived_at is not None:
         raise NotFound()
-    if user.id not in managers(db, department_id) and not company_wide(db, user):
+    if user.id not in managers(db, department_id, fresh=fresh) and not company_wide(
+        db, user, fresh=fresh
+    ):
         raise Forbidden()
     return department
 
@@ -134,14 +144,18 @@ class Shown:
     pending: Pending | None  # a change waiting for the other managers
 
 
-def pending_change(db: Session, department_id: uuid.UUID, name: str) -> ApprovalRequest | None:
+def pending_change(
+    db: Session, department_id: uuid.UUID, name: str, *, fresh: bool = False
+) -> ApprovalRequest | None:
     """The change of this setting still waiting for this department's managers, if any.
-    Requests past their deadline are left out (they lapse when next read or decided)."""
-    rows = db.scalars(
-        select(ApprovalRequest).where(
-            ApprovalRequest.kind == KIND, ApprovalRequest.status == "pending"
-        )
+    Requests past their deadline are left out (they lapse when next read or decided).
+    fresh: a locking read, after the company's lock (as in managers())."""
+    query = select(ApprovalRequest).where(
+        ApprovalRequest.kind == KIND, ApprovalRequest.status == "pending"
     )
+    if fresh:
+        query = query.with_for_update(read=True).execution_options(populate_existing=True)
+    rows = db.scalars(query)
     now = datetime.now(UTC).replace(tzinfo=None)
     for row in rows:
         if (
@@ -213,16 +227,20 @@ def change(db: Session, user: User, department_id: uuid.UUID, name: str, value: 
     approval request every other manager must approve."""
     setting = _per_department(name)
     # Take turns with every other role, line, and setting change in the company, then read
-    # the person, the department, and its managers fresh.
+    # the person, the department, its managers, and a waiting change fresh. Every read
+    # after the lock is a locking read (review of #193, the same stale read): an ordinary
+    # one answers from this transaction's first snapshot, taken before the wait, so a
+    # manager who lost the role meanwhile could still change the setting, the managers to
+    # ask could be out of date, and two changes at once would both open a request.
     lock_reporting_lines(db)
     me = repository.person(db, user.id, lock=True)
     if me is None or me.deactivated_at is not None:
         raise Forbidden()
-    _department(db, me, department_id)
+    _department(db, me, department_id, fresh=True)
     checked = check_value(db, setting, value)
-    if pending_change(db, department_id, setting.name) is not None:
+    if pending_change(db, department_id, setting.name, fresh=True) is not None:
         raise Conflict("A change of this setting is already waiting for the other managers.")
-    others = managers(db, department_id) - {me.id}
+    others = managers(db, department_id, fresh=True) - {me.id}
     if not others:
         change_department_setting(db, setting.name, department_id, checked, actor=Actor.user(me.id))
         db.commit()
