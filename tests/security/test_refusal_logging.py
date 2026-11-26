@@ -224,5 +224,50 @@ def test_a_security_event_and_the_log_line_share_the_request_id(
     lines.clear()
     chef.patch(f"/api/shifts/{front}", json={"notes": "' OR 1=1 --"})
     [line] = refusals(lines)
-    [copy] = [detection.queue.get_nowait() for _ in range(detection.queue.qsize())]
-    assert copy.request_id == line["request_id"]
+    copies = [detection.queue.get_nowait() for _ in range(detection.queue.qsize())]
+    # Detection's copy of the values, and the refusal's own: the same request, one ID.
+    assert len(copies) == 2
+    assert {copy.request_id for copy in copies} == {line["request_id"]}
+
+
+# --- Refusals as security events (#92) -------------------------------------------------
+
+
+def queued_refusals(shifts: ShiftSetup) -> list:
+    """The refusal copies waiting for the detection worker (it does not run in tests)."""
+    detection = shifts.app.state.detection  # type: ignore[attr-defined]
+    copies = [detection.queue.get_nowait() for _ in range(detection.queue.qsize())]
+    return [copy for copy in copies if copy.refusal is not None]
+
+
+def test_a_refusal_is_handed_to_detection_with_nothing_that_was_sent(
+    shifts: ShiftSetup, lines: pytest.LogCaptureFixture
+) -> None:
+    front = a_front_shift(shifts)
+    chef = shifts.browser("chef")
+    queued_refusals(shifts)  # empty the queue
+    marker = "a note that must never be stored"
+    chef.patch(f"/api/shifts/{front}", json={"notes": marker})
+    chef.post("/api/shifts", json={}, headers={"Origin": "https://evil.example"})
+    denied, forged = queued_refusals(shifts)
+    assert (denied.refusal.kind, denied.refusal.permission) == (AUTHZ_DENIED, "schedule.edit")
+    assert denied.identity.user_id == shifts.ids["chef"]
+    assert denied.route == "/api/shifts/{shift_id}" and denied.values == []
+    # Forged: refused before the session was checked, so a platform event (DE9).
+    assert forged.refusal.kind == CSRF_REFUSED and forged.identity is None
+    assert marker not in repr([denied, forged]) and "evil.example" not in repr(forged)
+
+
+def test_being_asked_for_the_password_is_not_an_event(
+    shifts: ShiftSetup, lines: pytest.LogCaptureFixture
+) -> None:
+    # The ordinary first step of every sensitive action: logged, but not on the page.
+    owner = shifts.browser("owner")
+    with shifts.db() as db:
+        db.execute(update(UserSession).values(reauth_at=None))
+        db.commit()
+    queued_refusals(shifts)
+    body = {"manager_id": str(shifts.ids["chef"]), "employee_id": str(shifts.ids["ana"])}
+    assert owner.post("/api/reporting-lines", json=body).status_code == 403
+    assert [line["event"] for line in refusals(lines)][-1] == REAUTH_REQUIRED
+    assert queued_refusals(shifts) == []

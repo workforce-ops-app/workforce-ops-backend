@@ -18,27 +18,41 @@ How a request goes through it (RequestContextMiddleware below, the outermost lay
    method, the route TEMPLATE (/api/shifts/{shift_id}, never the raw path, which may carry
    attacker text), and the answer's status. Never the body, a header, a cookie, or a
    token: none of them is ever read here.
+4. Hand most refusals (RECORDED_KINDS) to the detection worker as security events too,
+   so owners see them on the security page and the detection study can count them
+   (docs/features/detection.md, "Refused requests"). The event, like the line, holds
+   only what the server decided: no value the client sent.
 
 What was refused is noted on the way out by whoever refused it: the CSRF check
 (app/auth/csrf.py) and the error handler (app/core/errors.py), which reads it from the
 exception (app/authz/check.py's Forbidden and NotFound, app/auth/reauth.py's errors). A
 403 or 404 that noted nothing gets the default kind for its status.
 
-Refusals are log lines, not audit entries: a burst of them (a script probing IDs) would
-fill the audit log's chain with noise (docs/architecture/authorization.md).
+Refusals are log lines and security events, not audit entries: a burst of them (a script
+probing IDs) would fill the audit log's chain with noise
+(docs/architecture/authorization.md).
 """
 
 import logging
 import uuid
+from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from fastapi.routing import RouteContext, iter_route_contexts
 from starlette.routing import BaseRoute
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.modules.security.layer import IDENTITY_KEY, client_address, find_route
+from app.db.base import utcnow
+from app.modules.security.layer import (
+    IDENTITY_KEY,
+    Refusal,
+    RequestCopy,
+    client_address,
+    find_route,
+)
 
 # The refusal log lines' own logger, so they can be found (and later read by detection)
 # without matching message text.
@@ -61,6 +75,11 @@ REFUSAL_KINDS = (
     REAUTH_FAILED,
     REAUTH_LOCKED,
 )
+
+# The refusals also recorded as security events (the security page, the detection
+# study): all but REAUTH_REQUIRED, the ordinary first step of every sensitive action.
+# app/modules/security/models.py lists them as REFUSAL_EVENT_KINDS.
+RECORDED_KINDS = frozenset(REFUSAL_KINDS) - {REAUTH_REQUIRED}
 
 # The kind for a refusal that noted none, by status. A 404 counts only on a real route:
 # another company's record and one that does not exist answer the same, on purpose
@@ -141,12 +160,22 @@ class RequestContextMiddleware:
 
     `routes` is the application's route list (app.router.routes), flattened on the first
     request (when every router has been included), to name the route of a refusal the
-    CSRF check answered before any route was chosen.
+    CSRF check answered before any route was chosen. `submit` hands a refusal's copy to
+    the detection worker without waiting (app/modules/security/worker.py), which records
+    it as a security event with the same queue, rate cap, and company rules as every
+    other event (DE6, DE9, DE11).
     """
 
-    def __init__(self, app: ASGIApp, *, routes: list[BaseRoute]) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        routes: list[BaseRoute],
+        submit: Callable[[RequestCopy], None] | None = None,
+    ) -> None:
         self.app = app
         self._routes = routes
+        self.submit = submit
         self._flat: list[RouteContext] | None = None
 
     @property
@@ -164,6 +193,7 @@ class RequestContextMiddleware:
         state = scope.setdefault("state", {})
         request_id = state.setdefault("request_id", uuid.uuid4().hex)
         context = RequestContext(request_id, client_address(scope), state)
+        occurred_at = utcnow()
         # 2. For every line written while the request runs.
         token = _current.set(context)
         status: int | None = None
@@ -181,17 +211,34 @@ class RequestContextMiddleware:
             #    must never turn an answer into an error.
             try:
                 if status in _DEFAULT_KIND:
-                    self._log_refusal(scope, context, status)
+                    self._refused(scope, context, status, occurred_at)
             except Exception:
                 refusals.error("A refusal could not be logged")
             _current.reset(token)
 
-    def _log_refusal(self, scope: Scope, context: RequestContext, status: int) -> None:
+    def _refused(
+        self, scope: Scope, context: RequestContext, status: int, occurred_at: datetime
+    ) -> None:
+        """The refusal's log line and, for the kinds in RECORDED_KINDS, its event."""
         route, _ = find_route(self.routes, scope)
         template = getattr(route, "path", None)
         if status == 404 and template is None:
             return  # no such route: nothing was refused (see _DEFAULT_KIND)
         kind = context.refusal or _DEFAULT_KIND[status]
+        if self.submit is not None and kind in RECORDED_KINDS:
+            # A copy with no values: the event holds only what the server decided.
+            self.submit(
+                RequestCopy(
+                    values=[],
+                    method=scope["method"],
+                    route=template,
+                    client_address=context.client_address,
+                    request_id=context.request_id,
+                    occurred_at=occurred_at,
+                    identity=context.state.get(IDENTITY_KEY),
+                    refusal=Refusal(kind, context.permission),
+                )
+            )
         line: dict[str, Any] = {
             "event": kind,
             "status": status,

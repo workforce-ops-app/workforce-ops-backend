@@ -124,8 +124,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # The request context goes around everything, detection included (#92,
     # app/core/request_context.py): it gives each request the ID detection also uses, puts
     # who sent it and from where on every log line, and writes one line for each refusal,
-    # including the CSRF check's.
-    app.add_middleware(RequestContextMiddleware, routes=app.router.routes)
+    # including the CSRF check's, with a security event for most of them.
+    app.add_middleware(
+        RequestContextMiddleware, routes=app.router.routes, submit=app.state.detection.submit
+    )
     for router in discover_routers():
         app.include_router(router)
     if settings.is_development:
