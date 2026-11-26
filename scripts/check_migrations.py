@@ -378,6 +378,7 @@ def _race_problems(url: str) -> list[str]:
             + _lapse_race_problems(engine)
             + _time_off_review_race_problems(engine)
             + _time_off_assign_race_problems(engine)
+            + _offer_race_problems(engine)
             + _role_view_lock_problems(engine)
             + _assignment_race_problems(engine)
             + _approval_race_problems(engine)
@@ -2979,6 +2980,180 @@ def _time_off_assign_race_problems(engine: Engine) -> list[str]:
             problems.append(
                 f"round {number} ({outcomes}) ended with the time off {status!r}"
                 f" and the shift {'still the worker' if given else 'not the worker'}'s"
+            )
+            break
+    return problems
+
+
+def _offer_race_problems(engine: Engine) -> list[str]:
+    """A coworker's answers on the same shift at the same moment, in two threads; return
+    what failed (review of #193).
+
+    answer() and withdraw() (app/modules/time_off/offers.py) take the request's lock and
+    then read the coworker's earlier answer with a locking read (_own_offer). With an
+    ordinary read, the second of two answers would answer from its transaction's first
+    snapshot, taken before the lock, so it would not see the first one's row: it would
+    add a second row, which the unique key refuses (a 500). Several rounds of each:
+
+    1. Two answers at once, with no answer yet: both go through, one row is left, and
+       it holds one of the two answers.
+    2. An answer and taking it back at once, with an answer already there: both go
+       through (or the taking back finds nothing, 404, if it came second to nothing),
+       and at most one row is left.
+    """
+    import threading
+    from datetime import timedelta
+
+    from fastapi import HTTPException
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    import app.modules.time_off.approval  # noqa: F401  (registers the "time_off" handler)
+    import app.modules.time_off.scope  # noqa: F401  (where a time-off request belongs)
+    from app.audit import Actor
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.db.base import utcnow
+    from app.modules.org.models import Company, Department, User
+    from app.modules.schedules.models import Shift
+    from app.modules.time_off import offers
+    from app.modules.time_off import service as time_off
+    from app.modules.time_off.models import CoverageOffer
+    from app.modules.time_off.schemas import OfferBody, TimeOffCreate
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    with Session(engine) as platform:
+        company = Company(name="offer race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    # ana asks for time off with offers; cara, in the same department, answers.
+    with session() as db:
+        office = Department(name="Office")
+        db.add(office)
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        people = {
+            name: User(
+                email=f"{name}@offer-race.example.com",
+                display_name=name,
+                department_id=office.id,
+                # Set up (any value: random text is never a valid Argon2id hash, so
+                # nobody can sign in as these probe people).
+                password_hash=secrets.token_hex(16),
+            )
+            for name in ("ana", "cara")
+        }
+        db.add_all(people.values())
+        db.flush()
+        for person in people.values():
+            assign_role(
+                db,
+                Actor.system(),
+                user_id=person.id,
+                role=roles["employee"],
+                scope_type="department",
+                scope_id=office.id,
+            )
+        db.commit()
+        ids = {name: person.id for name, person in people.items()}
+        office_id = office.id
+
+    def person(db: Session, name: str) -> User:
+        found = db.get(User, ids[name])
+        if found is None:  # made above, in this company
+            raise RuntimeError("an offer race probe person is missing")
+        return found
+
+    def a_request(number: int) -> tuple[uuid.UUID, uuid.UUID]:
+        """ana's shift on day `number`, and her request for that day off, with offers."""
+        start = utcnow().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=number)
+        with session() as db:
+            shift = Shift(
+                department_id=office_id,
+                employee_id=ids["ana"],
+                starts_at=start + timedelta(hours=9),
+                ends_at=start + timedelta(hours=17),
+                timezone="UTC",
+                status="scheduled",
+            )
+            db.add(shift)
+            db.commit()
+            shift_id = shift.id
+        with session() as db:
+            body = TimeOffCreate(first_day=start.date(), last_day=start.date(), offer_coverage=True)
+            request = time_off.ask(db, person(db, "ana"), body)
+            return request.id, shift_id
+
+    def at_once(*steps: Callable[[Session, User], object]) -> list[str]:
+        """Run each step as cara, in its own thread and session, at the same moment."""
+        start = threading.Barrier(len(steps))
+        outcomes = ["not run"] * len(steps)
+
+        def run(index: int) -> None:
+            with session() as db:
+                cara = person(db, "cara")
+                start.wait()
+                try:
+                    steps[index](db, cara)
+                    outcomes[index] = "ok"
+                except HTTPException as refused:
+                    outcomes[index] = str(refused.status_code)
+                except Exception as error:  # a duplicate row or a deadlock shows up here
+                    outcomes[index] = f"error: {error!r}"[:300]
+
+        threads = [threading.Thread(target=run, args=(i,)) for i in range(len(steps))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        return outcomes
+
+    def rows(request_id: uuid.UUID) -> list[str]:
+        with session() as db:
+            return list(
+                db.scalars(
+                    select(CoverageOffer.answer).where(
+                        CoverageOffer.time_off_request_id == request_id,
+                        CoverageOffer.offered_by == ids["cara"],
+                    )
+                )
+            )
+
+    cover, decline = OfferBody(answer="cover"), OfferBody(answer="decline")
+
+    # 1. Two answers at once, none there yet.
+    for number in range(20, 25):
+        request_id, shift_id = a_request(number)
+        outcomes = at_once(
+            lambda db, cara, r=request_id, s=shift_id: offers.answer(db, cara, r, s, cover),
+            lambda db, cara, r=request_id, s=shift_id: offers.answer(db, cara, r, s, decline),
+        )
+        left = rows(request_id)
+        if outcomes != ["ok", "ok"] or len(left) != 1:
+            problems.append(f"two answers at once, round {number}: {outcomes}, rows {left}")
+            break
+
+    # 2. An answer and taking it back at once, an answer already there.
+    for number in range(30, 35):
+        request_id, shift_id = a_request(number)
+        with session() as db:
+            offers.answer(db, person(db, "cara"), request_id, shift_id, cover)
+        outcomes = at_once(
+            lambda db, cara, r=request_id, s=shift_id: offers.answer(db, cara, r, s, decline),
+            lambda db, cara, r=request_id, s=shift_id: offers.withdraw(db, cara, r, s),
+        )
+        left = rows(request_id)
+        if outcomes[0] != "ok" or outcomes[1] not in ("ok", "404") or len(left) > 1:
+            problems.append(
+                f"an answer and taking it back, round {number}: {outcomes}, rows {left}"
             )
             break
     return problems

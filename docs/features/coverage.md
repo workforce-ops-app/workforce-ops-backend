@@ -72,7 +72,7 @@ stateDiagram-v2
 - Someone who could be assigned that shift: active, set up, and the shift's department is their home department or they are on an active team in it (the same rule as assigning, [schedules](schedules.md#states-and-rules)).
 - For **cover**: no overlapping shift of their own and no approved time off at that time.
 - For **swap**: the shift they give must be their own, scheduled, not started, **in the same department**, and **outside the employee's time off**; the employee must be able to work it (no overlap with the employee's other shifts, no approved time off then); and after the exchange neither person has two overlapping shifts (the two traded shifts are left out of that check). A coworker may offer a swap even when the requested shift overlaps the very shift they give.
-- One answer per coworker per shift; a new answer replaces the old one. "Ignore" means no answer.
+- One answer per coworker per shift; a new answer replaces the old one. "Ignore" means no answer. Two answers (or an answer and taking it back) from the same coworker at the same moment take turns on the request's lock, and each reads the earlier answer with a locking read, so the second replaces the first instead of adding a second row (review of #193; tried on MySQL in `scripts/check_migrations.py`).
 
 **Who sees what** (threat I10)
 - A coworker sees only what they need to decide whether they can cover or swap: the employee, the days, the affected shifts, and **only their own answers**, never the others'. **Never the reason** for the time off (it may be medical or otherwise personal; review of #188): the field is left out of every coworker answer (the offerable list and `GET /{id}` seen as a coworker), not sent empty for the screen to hide.
@@ -165,7 +165,7 @@ Someone from another department gets no card (not eligible).
 - Nothing on the schedule changes before approval; choices sent with a non-settling approval do not apply; choosing without `schedule.edit` over the changed shifts is 403 and changes nothing.
 - A reviewer cannot choose their own offer (a reviewer who offered is refused that choice, E12).
 - The re-check refuses a chosen offer whose coworker was deactivated, got an overlapping shift or time off, or whose swap shift was reassigned, and nothing changes.
-- A collecting request is on nobody's waiting list and cannot be decided (403); after its deadline the first read sends it up.
+- A collecting request is on nobody's waiting list and cannot be decided (403); after its deadline the first read sends it up. A list sends up the ones past their deadline before it filters by status, so the employee's own list filtered on "collecting" never shows one that should have gone up (review of #193).
 - A department minimum below the company's is refused (422); someone who is not one of the department's managers (nor company-wide) gets 403; with two managers, one alone cannot change it; one denial stops it.
 
 ### Slices

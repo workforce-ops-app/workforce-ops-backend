@@ -189,6 +189,27 @@ def test_the_deadline_sends_it_up_on_the_next_read(people: ShiftSetup) -> None:
     assert people.browser("ana").post(f"{URL}/{request_id}/send-up").status_code == 409
 
 
+def test_the_employees_own_list_sends_it_up_before_filtering(people: ShiftSetup) -> None:
+    # Review of #193: the employee's own list, filtered on "collecting", is the first read
+    # after the deadline. It must not list the request as collecting: it goes up first,
+    # so the filter sees "pending" (and the list filtered on "pending" has it).
+    request_id, _ = setup_request(people)
+    with people.db() as db:
+        db.execute(
+            update(TimeOffRequest)
+            .where(TimeOffRequest.id == uuid.UUID(request_id))
+            .values(offers_close_at=utcnow() - timedelta(minutes=1))
+        )
+        db.commit()
+    ana = people.browser("ana")
+    collecting = ana.get(URL, params={"mine": "true", "status": "collecting"})
+    assert collecting.status_code == 200, collecting.text
+    assert request_id not in [item["id"] for item in collecting.json()["items"]]
+    assert stored_status(people, request_id) == "pending"
+    pending = ana.get(URL, params={"mine": "true", "status": "pending"})
+    assert request_id in [item["id"] for item in pending.json()["items"]]
+
+
 def test_a_collecting_request_can_be_cancelled(people: ShiftSetup) -> None:
     request_id, _ = setup_request(people)
     response = people.browser("ana").post(f"{URL}/{request_id}/cancel")
