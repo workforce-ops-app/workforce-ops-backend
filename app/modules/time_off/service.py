@@ -582,8 +582,9 @@ def decide_request(
     """Approve or deny a request the user reviews.
 
     Locks, in this order: the company's reporting lines (who is above whom stays still
-    while the reviewers are worked out), the employee (as every schedule change does
-    before touching their shifts), the request, and its approval record. Only then are
+    while the reviewers are worked out), the people (the employee, and the coworkers of
+    any chosen offers, sorted by ID, as every schedule change does before touching their
+    shifts), the request, and its approval record. Only then are
     the reviewers worked out, on fresh reads, and the decision recorded.
     """
     authorize(db, user, "time_off.review")
@@ -591,7 +592,18 @@ def decide_request(
     if found is None:
         raise NotFound()
     lock_reporting_lines(db)
-    repository.person(db, found.employee_id, lock=True)
+    # The people, all together and sorted by ID: the employee and, when approving with
+    # offers, every coworker whose offer is chosen. That is the order of every schedule
+    # change (schedules/service.py, _lock_for_change), so an approval and a reassignment
+    # between the same two people never take their locks in opposite orders, which
+    # would deadlock (#209). Locking the employee first and the coworkers later did.
+    # An offer's coworker (offered_by) never changes, so it can be read before the locks;
+    # choose() reads each offer again, fresh, after them.
+    people = {found.employee_id}
+    if choices and decision == "approve":
+        people |= offers.offered_by(db, [choice.offer_id for choice in choices])
+    for person_id in sorted(people):
+        repository.person(db, person_id, lock=True)
     request = db.get(TimeOffRequest, request_id, populate_existing=True, with_for_update=True)
     approval = db.get(
         ApprovalRequest, found.approval_request_id, populate_existing=True, with_for_update=True
