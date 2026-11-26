@@ -266,6 +266,31 @@ def _request_shift(db: Session, request: TimeOffRequest, shift_id: uuid.UUID) ->
     raise NotFound()
 
 
+def _own_offer(
+    db: Session, request: TimeOffRequest, shift_id: uuid.UUID, user: User
+) -> CoverageOffer | None:
+    """The user's answer for one shift of the request, read fresh and locked.
+
+    The caller holds the request's lock, so two answers from the same person take turns.
+    The read after it must be a locking read (review of #193): under MySQL's REPEATABLE
+    READ an ordinary read answers from the transaction's first snapshot, taken before the
+    lock (the checks in _locked_request read the offers already), so the second of two
+    answers at the same moment would not see the first one's row and would add a
+    duplicate instead of changing it. FOR UPDATE reads what is committed now, and locks
+    the row the answer is about to change or remove.
+    """
+    return db.scalars(
+        select(CoverageOffer)
+        .where(
+            CoverageOffer.time_off_request_id == request.id,
+            CoverageOffer.shift_id == shift_id,
+            CoverageOffer.offered_by == user.id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).one_or_none()
+
+
 def answer(
     db: Session, user: User, request_id: uuid.UUID, shift_id: uuid.UUID, body: OfferBody
 ) -> CoverageOffer:
@@ -289,13 +314,7 @@ def answer(
         raise Conflict(problem)
 
     # One answer per coworker per shift: change the earlier one, or add it.
-    offer = db.scalars(
-        select(CoverageOffer).where(
-            CoverageOffer.time_off_request_id == request.id,
-            CoverageOffer.shift_id == shift.id,
-            CoverageOffer.offered_by == user.id,
-        )
-    ).one_or_none()
+    offer = _own_offer(db, request, shift.id, user)
     if offer is None:
         offer = CoverageOffer(time_off_request_id=request.id, shift_id=shift.id, offered_by=user.id)
         db.add(offer)
@@ -321,13 +340,7 @@ def withdraw(db: Session, user: User, request_id: uuid.UUID, shift_id: uuid.UUID
     """Take back the user's answer for one shift, while the request is collecting."""
     authorize(db, user, "coverage.respond_self")
     request = _locked_request(db, user, request_id)
-    offer = db.scalars(
-        select(CoverageOffer).where(
-            CoverageOffer.time_off_request_id == request.id,
-            CoverageOffer.shift_id == shift_id,
-            CoverageOffer.offered_by == user.id,
-        )
-    ).one_or_none()
+    offer = _own_offer(db, request, shift_id, user)
     if offer is None:
         raise NotFound()
     db.delete(offer)
@@ -361,7 +374,14 @@ def choose(
     for choice in choices:
         if choice.shift_id not in shifts or choice.shift_id in chosen:
             raise Invalid("Choose at most one offer for each of this request's shifts.")
-        offer = db.get(CoverageOffer, choice.offer_id)  # another company's: None
+        # Read fresh and locked (another company's: None). An ordinary read would answer
+        # from this transaction's first snapshot, taken by the checks before the time-off
+        # locks: it could still show an answer the coworker has since changed or taken
+        # back, and the approval would move a shift on it (review of #193, the same
+        # stale read). Every change to an offer holds the request's lock first, which the
+        # caller holds now, so this lock waits for nobody. apply_choices() then uses
+        # this same fresh copy.
+        offer = db.get(CoverageOffer, choice.offer_id, populate_existing=True, with_for_update=True)
         if (
             offer is None
             or offer.time_off_request_id != request.id
