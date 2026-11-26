@@ -358,6 +358,15 @@ def withdraw(db: Session, user: User, request_id: uuid.UUID, shift_id: uuid.UUID
 # --- Choosing at approval --------------------------------------------------------------
 
 
+def offered_by(db: Session, offer_ids: list[uuid.UUID]) -> set[uuid.UUID]:
+    """The coworkers who made these offers (this company's only), to lock them with the
+    employee before a decision (service.decide_request, #209). An offer's coworker never
+    changes, so this read needs no lock; choose() reads the offers again, fresh."""
+    if not offer_ids:
+        return set()
+    return set(db.scalars(select(CoverageOffer.offered_by).where(CoverageOffer.id.in_(offer_ids))))
+
+
 def choose(
     db: Session, user: User, request: TimeOffRequest, choices: list[Choice]
 ) -> dict[str, str]:
@@ -398,9 +407,12 @@ def choose(
     if not chosen:
         return {}
 
-    # Step 2: the locks, in the order of every schedule change: the coworkers' rows in ID
-    # order, then every shift involved (all of the employee's shifts on those days, and
-    # the shifts given in swaps) in ID order, read fresh.
+    # Step 2: the locks, in the order of every schedule change: the people, then every
+    # shift involved (all of the employee's shifts on those days, and the shifts given in
+    # swaps) in ID order, read fresh. decide_request() already holds the coworkers' locks,
+    # taken with the employee's in one sorted pass (#209); taking them again here only
+    # reads them fresh. A coworker it did not lock would be one whose offer it could not
+    # see, which the checks above have refused already.
     for person_id in sorted({offer.offered_by for offer in chosen.values()}):
         people.person(db, person_id, lock=True)
     involved = set(shifts) | {o.swap_shift_id for o in chosen.values() if o.swap_shift_id}
@@ -415,12 +427,37 @@ def choose(
         )
     }
 
-    # Step 3: moving a shift is a schedule change: schedule.edit over each one it moves.
+    # Step 3: moving a shift is a schedule change: schedule.edit over each one it moves,
+    # both as it is now and as it will be (#209, the rule of #183's assignments): the
+    # reviewer must cover the employee's shift and the coworker who would take it, and,
+    # for a swap, the coworker's shift and the employee who would take that. Otherwise a
+    # manager who covers only the employee could hand a shift to someone outside their
+    # scope. All before anything is written, so a refusal (403) changes nothing.
     for shift_id, offer in chosen.items():
         authorize(db, user, "schedule.edit", locked[shift_id])
+        authorize(db, user, "schedule.edit", _as_assigned(locked[shift_id], offer.offered_by))
         if offer.swap_shift_id is not None and offer.swap_shift_id in locked:
-            authorize(db, user, "schedule.edit", locked[offer.swap_shift_id])
+            swap = locked[offer.swap_shift_id]
+            authorize(db, user, "schedule.edit", swap)
+            authorize(db, user, "schedule.edit", _as_assigned(swap, request.employee_id))
     return {str(shift_id): str(offer.id) for shift_id, offer in sorted(chosen.items())}
+
+
+def _as_assigned(shift: Shift, employee_id: uuid.UUID) -> Shift:
+    """The shift as it would be with this person on it, for the permission check only.
+
+    A new object, never added to the session: changing the real shift here would be
+    written to the database by the next query's flush, and choose() writes nothing."""
+    return Shift(
+        id=shift.id,
+        company_id=shift.company_id,
+        department_id=shift.department_id,
+        employee_id=employee_id,
+        starts_at=shift.starts_at,
+        ends_at=shift.ends_at,
+        timezone=shift.timezone,
+        status="scheduled",
+    )
 
 
 def _when(db: Session, shift: Shift, employee: User) -> str:
