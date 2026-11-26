@@ -87,6 +87,7 @@ stateDiagram-v2
 - A **department** may raise it further, never below the company's: `department_settings` holds one row per department and setting. The value used is the larger of the company's and the department's.
 - **The department's managers** are the active people holding `time_off.review` through an assignment for that department (not company-wide ones). One of them, or someone holding it company-wide (an owner or administrator), may change the department's value.
 - With **several managers**, the change is an approval request of kind `department_setting` that **every other one of the department's managers** must approve before it takes effect (one denial stops it; 7-day deadline, as role grants). With one manager (or none besides the person changing it), it takes effect at once. Audited as `settings.department_changed`.
+- A change takes the company's lock and then checks everything on fresh, locked reads: the department, its managers, the changer's own right, and a change already waiting. So two managers changing it at the same moment take turns (one opens the request, the other gets 409), and a manager who lost the role meanwhile is refused (403). Tried on MySQL in `scripts/check_migrations.py`.
 - The deadline of a request is fixed when it is asked (stored as `offers_close_at`), so a later change does not move it.
 
 **Deciding**

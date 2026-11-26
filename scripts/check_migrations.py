@@ -379,6 +379,7 @@ def _race_problems(url: str) -> list[str]:
             + _time_off_review_race_problems(engine)
             + _time_off_assign_race_problems(engine)
             + _offer_race_problems(engine)
+            + _department_setting_race_problems(engine)
             + _role_view_lock_problems(engine)
             + _assignment_race_problems(engine)
             + _approval_race_problems(engine)
@@ -3200,6 +3201,154 @@ def _offer_race_problems(engine: Engine) -> list[str]:
     if outcome != "422" or moved:
         where = "moved" if moved else "still ana's"
         problems.append(f"choosing an offer changed to decline meanwhile: {outcome}, shift {where}")
+    return problems
+
+
+def _department_setting_race_problems(engine: Engine) -> list[str]:
+    """A department's managers changing its setting while other requests change what the
+    change depends on; return what failed (#195, after the stale reads found in #193).
+
+    change() (app/modules/department_settings/service.py) takes the company's lock and
+    then reads everything it checks with locking reads: the department, its managers,
+    the changer's own right, and a change already waiting.
+
+    1. Two managers change the same setting at the same moment, in two threads, several
+       rounds (a new department each): they take turns, so one opens the request and the
+       other is refused (409, one already waiting). Exactly one request is left.
+    2. The changer's view fixed first, then their manager role taken away: the change is
+       refused (403), and nothing is opened.
+    """
+    import threading
+
+    from fastapi import HTTPException
+    from sqlalchemy import delete, select
+    from sqlalchemy.orm import Session
+
+    from app.approvals.models import ApprovalRequest
+    from app.audit import Actor
+    from app.authz.models import RoleAssignment
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.modules.department_settings import service as department_settings
+    from app.modules.org.models import Company, Department, User
+    from app.settings.service import TIME_OFF_OFFERS_CLOSE_DAYS
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    with Session(engine) as platform:
+        company = Company(name="department setting race probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request."""
+        db = Session(engine)
+        set_company(db, company_id)
+        return db
+
+    with session() as db:
+        roles = create_starting_roles(db, Actor.system())
+        db.commit()
+        manager_role = roles["manager"].id
+
+    def a_department(number: int) -> tuple[uuid.UUID, list[uuid.UUID]]:
+        """A new department with three managers; its ID and theirs."""
+        with session() as db:
+            department = Department(name=f"Department {number}")
+            db.add(department)
+            db.flush()
+            managers = [
+                User(
+                    email=f"manager{number}-{index}@setting-race.example.com",
+                    display_name=f"manager {number}-{index}",
+                    department_id=department.id,
+                    # Set up (random text is never a valid Argon2id hash: no sign-in).
+                    password_hash=secrets.token_hex(16),
+                )
+                for index in range(3)
+            ]
+            db.add_all(managers)
+            db.flush()
+            role = db.get(type(roles["manager"]), manager_role)
+            for person in managers:
+                assign_role(
+                    db,
+                    Actor.system(),
+                    user_id=person.id,
+                    role=role,
+                    scope_type="department",
+                    scope_id=department.id,
+                )
+            db.commit()
+            return department.id, [person.id for person in managers]
+
+    def person(db: Session, person_id: uuid.UUID) -> User:
+        found = db.get(User, person_id)
+        if found is None:  # made above, in this company
+            raise RuntimeError("a department setting race probe person is missing")
+        return found
+
+    def waiting(department_id: uuid.UUID) -> int:
+        with session() as db:
+            rows = db.scalars(
+                select(ApprovalRequest).where(
+                    ApprovalRequest.kind == department_settings.KIND,
+                    ApprovalRequest.status == "pending",
+                )
+            )
+            return sum(1 for row in rows if row.payload.get("department_id") == str(department_id))
+
+    def change(db: Session, changer: uuid.UUID, department_id: uuid.UUID, value: int) -> str:
+        try:
+            department_settings.change(
+                db, person(db, changer), department_id, TIME_OFF_OFFERS_CLOSE_DAYS, value
+            )
+            return "ok"
+        except HTTPException as refused:
+            return str(refused.status_code)
+        except Exception as error:  # a deadlock would show up here
+            return f"error: {error!r}"[:300]
+
+    def race_round(department_id: uuid.UUID, managers: list[uuid.UUID]) -> list[str]:
+        """The first two managers change the setting at the same moment."""
+        start = threading.Barrier(2)
+        outcomes = ["not run", "not run"]
+
+        def run(index: int) -> None:
+            with session() as db:
+                changer = managers[index]
+                person(db, changer)  # this request's first read, as its checks make
+                start.wait()
+                outcomes[index] = change(db, changer, department_id, 3 + index)
+
+        threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        return outcomes
+
+    # 1. Two managers change the same setting at the same moment.
+    for number in range(5):
+        department_id, managers = a_department(number)
+        outcomes = race_round(department_id, managers)
+        left = waiting(department_id)
+        if sorted(outcomes) != ["409", "ok"] or left != 1:
+            problems.append(f"two setting changes at once, round {number}: {outcomes}, {left} open")
+            break
+
+    # 2. The changer's manager role taken away while their view is fixed.
+    department_id, managers = a_department(10)
+    with session() as request_2:
+        request_2.scalars(select(RoleAssignment)).all()  # its view is now fixed
+        request_2.scalars(select(ApprovalRequest)).all()
+        with session() as request_1:
+            request_1.execute(delete(RoleAssignment).where(RoleAssignment.user_id == managers[0]))
+            request_1.commit()
+        outcome = change(request_2, managers[0], department_id, 3)
+        request_2.rollback()
+    if outcome != "403" or waiting(department_id) != 0:
+        problems.append(f"a setting change after losing the manager role: {outcome}")
     return problems
 
 
