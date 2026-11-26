@@ -232,7 +232,7 @@ def _is_json(scope: Scope) -> bool:
     return False
 
 
-def _find_route(
+def find_route(
     routes: list[RouteContext], scope: Scope
 ) -> tuple[RouteContext | None, dict[str, Any]]:
     """The route the router will choose, and its path values, matched the same way the
@@ -279,7 +279,7 @@ class DetectionMiddleware:
 
         # 1. Which route, and is it a credential route? Then pass it through untouched.
         try:
-            route, path_params = _find_route(self.routes, scope)
+            route, path_params = find_route(self.routes, scope)
         except Exception:
             # Without the message or stack: neither may carry what was sent.
             logger.error("Detection could not match the route")

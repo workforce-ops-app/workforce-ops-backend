@@ -21,6 +21,7 @@ from app.core.caching import NoStoreMiddleware
 from app.core.config import Settings, get_settings
 from app.core.errors import register_error_handlers
 from app.core.logging import configure_logging
+from app.core.request_context import RequestContextMiddleware
 from app.core.swagger import add_development_swagger
 from app.db.session import get_engine
 from app.modules.security.layer import DetectionMiddleware
@@ -120,6 +121,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(
         DetectionMiddleware, routes=app.router.routes, submit=app.state.detection.submit
     )
+    # The request context goes around everything, detection included (#92,
+    # app/core/request_context.py): it gives each request the ID detection also uses, puts
+    # who sent it and from where on every log line, and writes one line for each refusal,
+    # including the CSRF check's.
+    app.add_middleware(RequestContextMiddleware, routes=app.router.routes)
     for router in discover_routers():
         app.include_router(router)
     if settings.is_development:
