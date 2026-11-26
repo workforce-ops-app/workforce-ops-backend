@@ -99,7 +99,7 @@ stateDiagram-v2
 | `GET /time-off-requests/{id}` | owner of the request, or `time_off.view` | one request, with its affected shifts and decisions so far |
 | `POST /time-off-requests` `{first_day, last_day, reason}` | `time_off.request_self` | ask for time off |
 | `POST /time-off-requests/{id}/cancel` | `time_off.cancel_self` | cancel your own request |
-| `POST /time-off-requests/{id}/approve`, `POST /time-off-requests/{id}/deny` `{comment}` | `time_off.review`, above the employee | decide |
+| `POST /time-off-requests/{id}/approve` `{comment, choices}`, `POST /time-off-requests/{id}/deny` `{comment}` | `time_off.review`, above the employee | decide; `choices` picks coworkers' offers for a request asked with offers ([coverage](coverage.md#states-and-rules)) |
 
 Every answer names the employee (`employee_name`), and each decision its reviewer (`approver_name`), so the review screen needs no lookups the reviewer may not be allowed to make (#172). Names are read in one query per answer. Anyone who may see a request may see these names.
 
@@ -150,7 +150,7 @@ Each step (asking, each decision, cancelling) goes through this module's service
 
 ### Audit and security
 
-**Audit events:** `time_off.requested`, `time_off.approved`, `time_off.denied`, `time_off.escalated` (details: who it went to), `time_off.cancelled`, `time_off.not_reviewed` (actor `system`; the request is declined), and `shift.opened` for each shift opened by an approval (details: the request).
+**Audit events:** `time_off.requested`, `time_off.approved` (details: `chosen_offers`, the coworkers' offers chosen, empty when none), `time_off.denied`, `time_off.escalated` (details: who it went to), `time_off.cancelled`, `time_off.not_reviewed` (actor `system`; the request is declined), and `shift.opened` for each shift opened by an approval (details: the request).
 
 **Threats** ([threat model](../security/threat-model.md)): E5 (approving your own request), E3 (reviewing someone you are not above), I1 and I2 (seeing others' requests), T2 (setting the status directly), T5 (reason text).
 

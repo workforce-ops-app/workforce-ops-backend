@@ -3000,6 +3000,11 @@ def _offer_race_problems(engine: Engine) -> list[str]:
     2. An answer and taking it back at once, with an answer already there: both go
        through (or the taking back finds nothing, 404, if it came second to nothing),
        and at most one row is left.
+    3. The reviewer's view fixed first (an ordinary read of the offers, as its checks
+       make); then the coworker changes "cover" to "decline" and the request goes up;
+       then the reviewer approves choosing that offer. choose() reads the offer fresh
+       and locked (review of #193, in #194), so the choice is refused (422) and the
+       shift stays the employee's.
     """
     import threading
     from datetime import timedelta
@@ -3011,14 +3016,15 @@ def _offer_race_problems(engine: Engine) -> list[str]:
     import app.modules.time_off.approval  # noqa: F401  (registers the "time_off" handler)
     import app.modules.time_off.scope  # noqa: F401  (where a time-off request belongs)
     from app.audit import Actor
+    from app.authz.chain import add_reporting_line
     from app.authz.roles import assign_role, create_starting_roles
     from app.db.base import utcnow
     from app.modules.org.models import Company, Department, User
     from app.modules.schedules.models import Shift
     from app.modules.time_off import offers
     from app.modules.time_off import service as time_off
-    from app.modules.time_off.models import CoverageOffer
-    from app.modules.time_off.schemas import OfferBody, TimeOffCreate
+    from app.modules.time_off.models import CoverageOffer, TimeOffRequest
+    from app.modules.time_off.schemas import Choice, OfferBody, TimeOffCreate
     from app.tenancy.context import set_company
 
     problems: list[str] = []
@@ -3034,7 +3040,8 @@ def _offer_race_problems(engine: Engine) -> list[str]:
         set_company(db, company_id)
         return db
 
-    # ana asks for time off with offers; cara, in the same department, answers.
+    # ana asks for time off with offers; cara, in the same department, answers; chef,
+    # ana's manager, reviews.
     with session() as db:
         office = Department(name="Office")
         db.add(office)
@@ -3049,19 +3056,22 @@ def _offer_race_problems(engine: Engine) -> list[str]:
                 # nobody can sign in as these probe people).
                 password_hash=secrets.token_hex(16),
             )
-            for name in ("ana", "cara")
+            for name in ("ana", "cara", "chef")
         }
         db.add_all(people.values())
         db.flush()
-        for person in people.values():
+        for name, person in people.items():
             assign_role(
                 db,
                 Actor.system(),
                 user_id=person.id,
-                role=roles["employee"],
+                role=roles["manager" if name == "chef" else "employee"],
                 scope_type="department",
                 scope_id=office.id,
             )
+        add_reporting_line(
+            db, Actor.system(), manager_id=people["chef"].id, employee_id=people["ana"].id
+        )
         db.commit()
         ids = {name: person.id for name, person in people.items()}
         office_id = office.id
@@ -3156,6 +3166,40 @@ def _offer_race_problems(engine: Engine) -> list[str]:
                 f"an answer and taking it back, round {number}: {outcomes}, rows {left}"
             )
             break
+
+    # 3. A stale view of the offers when the reviewer chooses one.
+    request_id, shift_id = a_request(40)
+    with session() as db:
+        offers.answer(db, person(db, "cara"), request_id, shift_id, cover)
+    with session() as db:
+        offer_id = db.scalars(
+            select(CoverageOffer.id).where(CoverageOffer.time_off_request_id == request_id)
+        ).one()
+    with session() as reviewer:
+        # The reviewer's checks read the offers and the request: its view is now fixed.
+        reviewer.scalars(select(CoverageOffer)).all()
+        reviewer.scalars(select(TimeOffRequest)).all()
+        with session() as db:
+            offers.answer(db, person(db, "cara"), request_id, shift_id, decline)
+        with session() as db:
+            time_off.send_up(db, person(db, "ana"), request_id)
+        choice = Choice(shift_id=shift_id, offer_id=offer_id)
+        try:
+            time_off.decide_request(
+                reviewer, person(reviewer, "chef"), request_id, "approve", None, [choice]
+            )
+            outcome = "ok"
+        except HTTPException as refused:
+            outcome = str(refused.status_code)
+        except Exception as error:  # anything else is a failure too
+            outcome = f"error: {error!r}"[:300]
+        reviewer.rollback()
+    with session() as db:
+        shift = db.get(Shift, shift_id)
+        moved = shift is None or shift.employee_id != ids["ana"]
+    if outcome != "422" or moved:
+        where = "moved" if moved else "still ana's"
+        problems.append(f"choosing an offer changed to decline meanwhile: {outcome}, shift {where}")
     return problems
 
 

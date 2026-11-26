@@ -8,7 +8,7 @@ import uuid
 from datetime import date, datetime
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, StringConstraints, model_validator
+from pydantic import BaseModel, Field, StringConstraints, model_validator
 
 from app.modules.org.schemas import Strict
 
@@ -160,6 +160,20 @@ class DecisionBody(Strict):
     """An optional comment with an approval or denial."""
 
     comment: Reason | None = None
+
+
+class Choice(Strict):
+    """One coworker's offer chosen for one of the request's shifts (coverage.md)."""
+
+    shift_id: uuid.UUID
+    offer_id: uuid.UUID
+
+
+class ApproveBody(DecisionBody):
+    """An approval: an optional comment, and the offers chosen (none, or one per shift).
+    A request covers at most 30 days, so 100 choices is far more than any can need."""
+
+    choices: list[Choice] = Field(default_factory=list, max_length=100)
 
 
 class TimeOffList(BaseModel):

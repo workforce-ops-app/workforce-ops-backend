@@ -31,7 +31,9 @@ review.py.
 
 - Deciding: only a current reviewer (review.py), checked after taking the locks, so
   somebody who lost their role or their place meanwhile cannot decide. Never the
-  employee (AZ7). A comment may go with the decision (plain text, at most 500).
+  employee (AZ7). A comment may go with the decision (plain text, at most 500). An
+  approval may choose coworkers' offers (offers.py, choose); only the approval that
+  settles the request applies its choices.
 - Waiting for me: the requests the user may decide right now.
 
 Every change is audited (time_off.requested, time_off.sent_up, time_off.cancelled,
@@ -75,7 +77,7 @@ from app.modules.time_off import offers
 from app.modules.time_off.days import day_starts, zone_of
 from app.modules.time_off.models import HOLDING, OPEN, CoverageOffer, TimeOffRequest
 from app.modules.time_off.review import overlapping_shifts
-from app.modules.time_off.schemas import TimeOffCreate
+from app.modules.time_off.schemas import Choice, TimeOffCreate
 from app.settings.service import (
     TIME_OFF_OFFERS_CLOSE_DAYS,
     TIME_OFF_REQUIRED_APPROVALS,
@@ -521,6 +523,7 @@ def cancel(db: Session, user: User, request_id: uuid.UUID) -> TimeOffRequest:
         cancel_approval(db, user, approval)  # the approval record stops waiting too
 
     request.status, request.decided_at = "cancelled", utcnow()
+    offers.drop_offers(db, request)  # coverage.md, endings
     record(
         db,
         actor=Actor.user(user.id),
@@ -567,7 +570,12 @@ def waiting(db: Session, user: User, *, limit: int) -> list[TimeOffRequest]:
 
 
 def decide_request(
-    db: Session, user: User, request_id: uuid.UUID, decision: str, comment: str | None
+    db: Session,
+    user: User,
+    request_id: uuid.UUID,
+    decision: str,
+    comment: str | None,
+    choices: list[Choice] | None = None,
 ) -> TimeOffRequest:
     """Approve or deny a request the user reviews.
 
@@ -600,6 +608,13 @@ def decide_request(
     # for the locks cannot decide (review of #167).
     if not may_decide(db, user, approval, fresh=True):
         raise Forbidden()  # their own, or not (or no longer) one of its reviewers
+    if choices and decision == "approve":
+        # Checked and locked before anything is written (offers.py, choose); kept with
+        # the approval record, keyed by who chose. review.approve applies them only if
+        # this approval settles the request.
+        chosen = offers.choose(db, user, request, choices)
+        kept = {**approval.payload.get("choices", {}), str(user.id): chosen}
+        approval.payload = {**approval.payload, "choices": kept}
     if comment:
         # Kept with the approval record, keyed by who wrote it; never in the audit log.
         comments = {**approval.payload.get("comments", {}), str(user.id): comment}

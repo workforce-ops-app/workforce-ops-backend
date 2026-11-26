@@ -13,7 +13,8 @@ service.py.
                                                                200  answer for one shift
     DELETE /api/time-off-requests/{id}/offers/{shift_id}       204  take your answer back
     POST /api/time-off-requests/{id}/cancel                    200  cancel your own
-    POST /api/time-off-requests/{id}/approve  {comment}        200  approve as a reviewer
+    POST /api/time-off-requests/{id}/approve  {comment, choices}
+                                                               200  approve as a reviewer
     POST /api/time-off-requests/{id}/deny     {comment}        200  deny as a reviewer
 
 Errors: 401 not signed in, 403 not allowed, 404 not found (or another company's), 409
@@ -40,6 +41,7 @@ from app.modules.time_off import offers, service
 from app.modules.time_off.models import CoverageOffer, TimeOffRequest
 from app.modules.time_off.schemas import (
     AffectedShift,
+    ApproveBody,
     CoworkerDetail,
     Decision,
     DecisionBody,
@@ -301,10 +303,11 @@ def cancel(request_id: uuid.UUID, current: SignedInPerson, db: Database) -> Time
 
 @router.post("/{request_id}/approve")
 def approve(
-    request_id: uuid.UUID, current: SignedInPerson, db: Database, body: DecisionBody | None = None
+    request_id: uuid.UUID, current: SignedInPerson, db: Database, body: ApproveBody | None = None
 ) -> TimeOffOut:
     comment = body.comment if body else None
-    request = service.decide_request(db, current.user, request_id, "approve", comment)
+    choices = body.choices if body else []
+    request = service.decide_request(db, current.user, request_id, "approve", comment, choices)
     return _one(db, request)
 
 
