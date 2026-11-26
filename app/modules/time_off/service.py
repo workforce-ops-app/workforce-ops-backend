@@ -264,9 +264,10 @@ def list_requests(
         query = query.where(TimeOffRequest.last_day >= first)
     if last is not None:
         query = query.where(TimeOffRequest.first_day <= last)
-    # 1. Lapse the overdue requests among these first (every one, not only the newest), so
-    #    their stored status is "denied" before the status filter below looks at it.
-    _lapse_overdue(db, query)
+    # 1. Bring these up to date first (every one, not only the newest): collecting
+    #    requests past their send-up deadline go up, and overdue ones lapse, so their
+    #    stored status is right before the status filter below looks at it.
+    _bring_up_to_date(db, query)
     # 2. Then filter by status in the database, BEFORE the limit: limiting first and
     #    filtering after could answer an empty list (the newest rows all another status)
     #    while older requests with this status exist.
@@ -279,31 +280,52 @@ def list_requests(
     )
 
 
-def _lapse_overdue(db: Session, query: Select[TimeOffRequest]) -> None:
-    """Lapse every request the query matches that is still open past its deadline.
+def _bring_up_to_date(db: Session, query: Select[TimeOffRequest]) -> None:
+    """Bring every request the query matches up to date before a list filters it: send up
+    the collecting ones past their send-up deadline, and lapse the open ones past their
+    approval deadline (refresh()).
 
-    The open approval records past their deadline are looked up first, by ID (the company
-    filter limits them to this company), and then the query's open requests among them.
-    Usually there are none, or a few: each request lapses only once.
+    Both are looked up in the database, so only the few that need it are refreshed:
+    - collecting requests whose offers_close_at has passed (review of #193: without this,
+      a list filtered on "collecting" kept showing requests that should have gone up);
+    - open requests whose approval record is past its deadline, found by the approval
+      records' IDs first (the company filter limits them to this company).
+    Usually there are none, or a few: each goes up, or lapses, only once.
     """
+    now = utcnow()
+    due = list(
+        db.scalars(
+            query.where(
+                TimeOffRequest.status == "collecting",
+                TimeOffRequest.offers_close_at <= now,
+            )
+        )
+    )
     overdue = list(
         db.scalars(
             select(ApprovalRequest.id).where(
                 ApprovalRequest.kind == "time_off",
                 ApprovalRequest.status == "pending",
-                ApprovalRequest.review_by <= utcnow(),
+                ApprovalRequest.review_by <= now,
             )
         )
     )
-    if not overdue:
-        return
-    rows = db.scalars(
-        query.where(
-            TimeOffRequest.status.in_(("pending", "escalated")),
-            TimeOffRequest.approval_request_id.in_(overdue),
+    lapsing = (
+        list(
+            db.scalars(
+                query.where(
+                    TimeOffRequest.status.in_(("pending", "escalated")),
+                    TimeOffRequest.approval_request_id.in_(overdue),
+                )
+            )
         )
+        if overdue
+        else []
     )
-    refresh(db, list(rows))
+    # A request sent up here may be past its approval deadline too: refresh() sends it up
+    # first and then lapses it, in the same pass.
+    if due or lapsing:
+        refresh(db, due + lapsing)
 
 
 @dataclass
