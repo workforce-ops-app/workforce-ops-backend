@@ -4,14 +4,22 @@ service.py.
     GET  /api/time-off-requests?mine=true                      200  your own requests
     GET  /api/time-off-requests?status=&employee_id=&from=&to= 200  requests in your scope
     GET  /api/time-off-requests/waiting                        200  waiting for my review
-    GET  /api/time-off-requests/{id}                           200  one, with affected shifts
-    POST /api/time-off-requests  {first_day, last_day, reason} 201  ask for time off
+    GET  /api/time-off-requests/offerable                      200  coworkers' requests to answer
+    GET  /api/time-off-requests/{id}                           200  one, with shifts and offers
+    POST /api/time-off-requests  {first_day, last_day, reason, offer_coverage}
+                                                               201  ask for time off
+    POST /api/time-off-requests/{id}/send-up                   200  send your own up to managers
+    PUT  /api/time-off-requests/{id}/offers/{shift_id}  {answer, swap_shift_id}
+                                                               200  answer for one shift
+    DELETE /api/time-off-requests/{id}/offers/{shift_id}       204  take your answer back
     POST /api/time-off-requests/{id}/cancel                    200  cancel your own
     POST /api/time-off-requests/{id}/approve  {comment}        200  approve as a reviewer
     POST /api/time-off-requests/{id}/deny     {comment}        200  deny as a reviewer
 
 Errors: 401 not signed in, 403 not allowed, 404 not found (or another company's), 409
-overlapping days, not cancellable now, or already decided, 422 invalid input. Every
+overlapping days, not cancellable now, already decided, too late to ask with offers, offers
+closed, or an offer the rules refuse (the message says why; coverage.md), 422 invalid
+input. Every
 change also needs the CSRF token.
 """
 
@@ -19,7 +27,7 @@ import uuid
 from datetime import date
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Response
 from sqlalchemy import select
 
 # Registers what time-off approval records do, and where a request belongs.
@@ -27,12 +35,18 @@ import app.modules.time_off.approval  # noqa: F401
 import app.modules.time_off.scope  # noqa: F401
 from app.auth.dependencies import Database, SignedInPerson
 from app.modules.org.models import User
-from app.modules.time_off import service
-from app.modules.time_off.models import TimeOffRequest
+from app.modules.schedules.models import Shift
+from app.modules.time_off import offers, service
+from app.modules.time_off.models import CoverageOffer, TimeOffRequest
 from app.modules.time_off.schemas import (
     AffectedShift,
+    CoworkerDetail,
     Decision,
     DecisionBody,
+    Offerable,
+    OfferableList,
+    OfferBody,
+    OfferOut,
     Person,
     Progress,
     Step,
@@ -40,6 +54,7 @@ from app.modules.time_off.schemas import (
     TimeOffDetail,
     TimeOffList,
     TimeOffOut,
+    TimeOffSummary,
 )
 
 router = APIRouter(prefix="/api/time-off-requests", tags=["time off"])
@@ -97,8 +112,41 @@ def _out(
         not_reviewed=not_reviewed,
         created_at=item.created_at,
         decided_at=item.decided_at,
+        offers_close_at=item.offers_close_at,
+        sent_up_at=item.sent_up_at,
         progress=_progress(progress, names),
     )
+
+
+def _shift(item: Shift) -> AffectedShift:
+    return AffectedShift(
+        id=item.id, department_id=item.department_id, starts_at=item.starts_at, ends_at=item.ends_at
+    )
+
+
+def _offers(db: Database, found: list[CoverageOffer]) -> list[OfferOut]:
+    """Offers in the answer shape, with the coworkers' names and any swap shift, in two
+    queries for the whole list."""
+    names = _names(db, {offer.offered_by for offer in found})
+    swap_ids = {offer.swap_shift_id for offer in found if offer.swap_shift_id}
+    swaps = (
+        {s.id: s for s in db.scalars(select(Shift).where(Shift.id.in_(swap_ids)))}
+        if swap_ids
+        else {}
+    )
+    return [
+        OfferOut(
+            id=offer.id,
+            shift_id=offer.shift_id,
+            offered_by=offer.offered_by,
+            offered_by_name=names.get(offer.offered_by, "Unknown"),
+            answer=offer.answer,
+            swap_shift=_shift(swaps[offer.swap_shift_id]) if offer.swap_shift_id in swaps else None,
+            status=offer.status,
+            updated_at=offer.updated_at,
+        )
+        for offer in found
+    ]
 
 
 def _detail(db: Database, detail: service.Detail) -> TimeOffDetail:
@@ -111,12 +159,7 @@ def _detail(db: Database, detail: service.Detail) -> TimeOffDetail:
     )
     return TimeOffDetail(
         **_out(item, flags[item.id], names, found.get(item.id)).model_dump(),
-        affected_shifts=[
-            AffectedShift(
-                id=s.id, department_id=s.department_id, starts_at=s.starts_at, ends_at=s.ends_at
-            )
-            for s in detail.affected_shifts
-        ],
+        affected_shifts=[_shift(s) for s in detail.affected_shifts],
         decisions=[
             Decision(
                 approver_id=d.approver_id,
@@ -127,6 +170,25 @@ def _detail(db: Database, detail: service.Detail) -> TimeOffDetail:
             )
             for d in detail.decisions
         ],
+        offers=_offers(db, detail.offers),
+    )
+
+
+def _for_coworker(answer: TimeOffOut) -> TimeOffSummary:
+    """A request in the coworker's shape: the same fields, without the reason (I10)."""
+    return TimeOffSummary(**answer.model_dump(exclude={"reason"}))
+
+
+def _detail_for(db: Database, detail: service.Detail) -> TimeOffDetail | CoworkerDetail:
+    """The detail as this user may see it. A coworker gets their own shape (threat I10,
+    review of #188): no reason, no reviewers' decisions, and nobody still to decide."""
+    answer = _detail(db, detail)
+    if not detail.as_coworker:
+        return answer
+    return CoworkerDetail(
+        **answer.model_dump(exclude={"reason", "decisions", "progress"}),
+        decisions=[],  # the service sends none to a coworker; never any here either
+        progress=None,
     )
 
 
@@ -147,7 +209,8 @@ def list_requests(
     current: SignedInPerson,
     db: Database,
     mine: bool = False,
-    status: Literal["pending", "escalated", "approved", "denied", "cancelled"] | None = None,
+    status: Literal["collecting", "pending", "escalated", "approved", "denied", "cancelled"]
+    | None = None,
     employee_id: uuid.UUID | None = None,
     first: Annotated[date | None, Query(alias="from")] = None,
     last: Annotated[date | None, Query(alias="to")] = None,
@@ -174,15 +237,60 @@ def waiting(
     return _list(db, rows)
 
 
+@router.get("/offerable")
+def offerable(current: SignedInPerson, db: Database) -> OfferableList:
+    """Coworkers' collecting requests with a shift the user could take (coverage.md)."""
+    found = offers.offerable(db, current.user)
+    names = _names(db, {item.request.employee_id for item in found})
+    return OfferableList(
+        items=[
+            Offerable(
+                request=_for_coworker(_out(item.request, False, names)),
+                shifts=[_shift(s) for s in item.shifts],
+                answers=_offers(db, item.answers),
+            )
+            for item in found
+        ]
+    )
+
+
 @router.get("/{request_id}")
-def view_request(request_id: uuid.UUID, current: SignedInPerson, db: Database) -> TimeOffDetail:
-    return _detail(db, service.view_request(db, current.user, request_id))
+def view_request(
+    request_id: uuid.UUID, current: SignedInPerson, db: Database
+) -> TimeOffDetail | CoworkerDetail:
+    return _detail_for(db, service.view_request(db, current.user, request_id))
 
 
 @router.post("", status_code=201)
 def ask(body: TimeOffCreate, current: SignedInPerson, db: Database) -> TimeOffDetail:
     request = service.ask(db, current.user, body)
     return _detail(db, service.view_request(db, current.user, request.id))
+
+
+@router.post("/{request_id}/send-up")
+def send_up(request_id: uuid.UUID, current: SignedInPerson, db: Database) -> TimeOffOut:
+    request = service.send_up(db, current.user, request_id)
+    return _one(db, request)
+
+
+@router.put("/{request_id}/offers/{shift_id}")
+def answer(
+    request_id: uuid.UUID,
+    shift_id: uuid.UUID,
+    body: OfferBody,
+    current: SignedInPerson,
+    db: Database,
+) -> OfferOut:
+    offer = offers.answer(db, current.user, request_id, shift_id, body)
+    return _offers(db, [offer])[0]
+
+
+@router.delete("/{request_id}/offers/{shift_id}", status_code=204)
+def withdraw(
+    request_id: uuid.UUID, shift_id: uuid.UUID, current: SignedInPerson, db: Database
+) -> Response:
+    offers.withdraw(db, current.user, request_id, shift_id)
+    return Response(status_code=204)
 
 
 @router.post("/{request_id}/cancel")

@@ -39,6 +39,8 @@ def test_the_first_settings_and_their_platform_rules() -> None:
         "auth.password_min_length": (MIN_LENGTH, MAX_MIN_LENGTH, "higher"),
         # time-off.md: 1 by default; more approvals are stricter.
         "time_off.required_approvals": (1, 5, "higher"),
+        # coverage.md: offers close the day before by default; more days are stricter.
+        "time_off.offers_close_days": (1, 14, "higher"),
     }
     assert (MIN_LENGTH, MAX_MIN_LENGTH) == (15, 64)
 

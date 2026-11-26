@@ -65,18 +65,20 @@ stateDiagram-v2
 **Asking with offers**
 - Only possible while the send-up deadline is still ahead (409 "It is too late to ask coworkers for these days; send the request without offers."). The deadline is the start of the day that is *minimum* days before the first day, in the employee's workplace zone: **midnight at the beginning of that day, not the end of it**. With the default minimum of 1, time off starting on a Friday stops collecting offers at 00:00 on Thursday, so the last moment to offer is late on Wednesday.
 - A request with no shifts on its days can still be asked with the box ticked; nobody can offer anything, and it goes up as usual.
+- The deadline is noticed the next time anyone reads or acts on the request (no background job, as for lapsing in [time off](time-off.md#backend)); the request then goes up as the system, with `sent_up_at` set to the deadline. If nobody looks before the first day begins, it is declined as not reviewed, as any request is.
 
 **Who can offer, per shift** (checked when they offer and again at approval; 409 with the reason otherwise)
 - Not the employee themselves.
 - Someone who could be assigned that shift: active, set up, and the shift's department is their home department or they are on an active team in it (the same rule as assigning, [schedules](schedules.md#states-and-rules)).
 - For **cover**: no overlapping shift of their own and no approved time off at that time.
 - For **swap**: the shift they give must be their own, scheduled, not started, **in the same department**, and **outside the employee's time off**; the employee must be able to work it (no overlap with the employee's other shifts, no approved time off then); and after the exchange neither person has two overlapping shifts (the two traded shifts are left out of that check). A coworker may offer a swap even when the requested shift overlaps the very shift they give.
-- One answer per coworker per shift; a new answer replaces the old one. "Ignore" means no answer.
+- One answer per coworker per shift; a new answer replaces the old one. "Ignore" means no answer. Two answers (or an answer and taking it back) from the same coworker at the same moment take turns on the request's lock, and each reads the earlier answer with a locking read, so the second replaces the first instead of adding a second row (review of #193; tried on MySQL in `scripts/check_migrations.py`).
 
 **Who sees what** (threat I10)
-- A coworker sees only what they need to decide whether they can cover or swap: the employee, the days, the affected shifts, and **only their own answers**, never the others'. **Never the reason** for the time off (it may be medical or otherwise personal; review of #188), nor the reviewers' decisions and comments. The field is left out of every coworker answer (the offerable list and the request seen as a coworker), not sent empty for the screen to hide.
-- The employee and the reviewers see the reason and **every offer**, by name.
-- Anyone else, and everyone in another company, gets 404.
+- A coworker sees only what they need to decide whether they can cover or swap: the employee, the days, the affected shifts, and **only their own answers**, never the others'. **Never the reason** for the time off (it may be medical or otherwise personal; review of #188): the field is left out of every coworker answer (the offerable list and `GET /{id}` seen as a coworker), not sent empty for the screen to hide.
+- The employee and the managers see the reason and **every offer**, by name: anyone whose `time_off.view` covers the employee, and the request's reviewer (while collecting a request has no reviewer yet, so "the reviewers" means the people who will review it).
+- A coworker may see a request they could work a shift of while it is collecting, and afterwards any request they answered. They never see the reviewers' decisions or who is still to decide.
+- On the offer endpoints, someone who could not work any of its shifts (and never answered) gets 404. On `GET /{id}`, anyone else in the company gets 403, as for any time-off request; everyone in another company gets 404. (Built in CV1: the design first said 404 for all of them; 403 keeps `GET /{id}` the same as for every other request.)
 
 **The send-up minimum**
 - The number of days before the first day at which a collecting request goes up by itself.
@@ -133,7 +135,7 @@ Unique `(company_id, time_off_request_id, shift_id, offered_by)`: one answer per
 | `POST /time-off-requests/{id}/send-up` | the employee | collecting → waiting for review |
 | `GET /time-off-requests/offerable` | `coverage.respond_self` | the collecting requests (not your own) with a shift you could take, each with those shifts and your answers |
 | `PUT /time-off-requests/{id}/offers/{shift_id}` `{answer, swap_shift_id?}` | `coverage.respond_self` | answer for one shift (replaces your earlier answer) |
-| `DELETE /time-off-requests/{id}/offers/{shift_id}` | the coworker | take back your answer |
+| `DELETE /time-off-requests/{id}/offers/{shift_id}` | the coworker (`coverage.respond_self`) | take back your answer while collecting (204); the row is removed, and `coverage.withdrawn` keeps the record |
 | `GET /time-off-requests/{id}` | as today | also `offers`: every offer for the employee and the reviewers; only your own for a coworker |
 | `POST /time-off-requests/{id}/approve` `{comment?, choices?: [{shift_id, offer_id}]}` | as today | approve; the choices apply if this approval settles it |
 | `GET /departments/{id}/settings`, `PUT /departments/{id}/settings/offers_close_days` `{value}` | a manager of the department, or `time_off.review` company-wide | read; change (202 when other managers must confirm) |
@@ -151,7 +153,7 @@ Someone from another department gets no card (not eligible).
 
 ### Audit and security
 
-**Audit events:** `time_off.requested` (details: `offer_coverage`), `coverage.offered` (details: shift, answer, any swap shift; a changed answer writes another), `coverage.withdrawn`, `time_off.sent_up` (details: `by_employee` or `deadline`; the deadline one has actor `system`), `time_off.approved` (details: the chosen offers), `shift.assigned` per reassigned shift (details: request and offer), `shift.opened` as today, `settings.department_changed`, and the approval events for `department_setting`.
+**Audit events:** `time_off.requested` (details: `offer_coverage`), `coverage.offered` (details: shift, answer, any swap shift; a changed answer writes another), `coverage.withdrawn`, `time_off.sent_up` (details: `by` is `employee` or `deadline`; the deadline one has actor `system` and happens at the deadline itself), `time_off.approved` (details: the chosen offers), `shift.assigned` per reassigned shift (details: request and offer), `shift.opened` as today, `settings.department_changed`, and the approval events for `department_setting`.
 
 **Threats** ([threat model](../security/threat-model.md)): E12 (moving shifts without approval, or a reviewer choosing their own offer), T8 (offering a shift you could not take, or one that is not yours), I10 (seeing other coworkers' answers), E5 (approving your own request), E3 (reviewing someone you are not above), I1 and T3 (other companies), T2 (setting status or choices directly), T5 (reasons and comments).
 
@@ -163,7 +165,7 @@ Someone from another department gets no card (not eligible).
 - Nothing on the schedule changes before approval; choices sent with a non-settling approval do not apply; choosing without `schedule.edit` over the changed shifts is 403 and changes nothing.
 - A reviewer cannot choose their own offer (a reviewer who offered is refused that choice, E12).
 - The re-check refuses a chosen offer whose coworker was deactivated, got an overlapping shift or time off, or whose swap shift was reassigned, and nothing changes.
-- A collecting request is on nobody's waiting list and cannot be decided (403); after its deadline the first read sends it up.
+- A collecting request is on nobody's waiting list and cannot be decided (403); after its deadline the first read sends it up. A list sends up the ones past their deadline before it filters by status, so the employee's own list filtered on "collecting" never shows one that should have gone up (review of #193).
 - A department minimum below the company's is refused (422); someone who is not one of the department's managers (nor company-wide) gets 403; with two managers, one alone cannot change it; one denial stops it.
 
 ### Slices

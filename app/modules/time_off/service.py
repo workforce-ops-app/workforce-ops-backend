@@ -15,8 +15,16 @@ review.py.
   setting time_off.required_approvals (C1). Still undecided at that moment, the request
   is declined as not reviewed, noticed the next time anyone reads or acts on it (the
   shared rule in app/approvals/service.py).
-- Cancelling: a pending or escalated request at any time; an approved one only before its
-  first day. Cancelling an approved request does not give the shifts back.
+- Asking with offers (offer_coverage, docs/features/coverage.md): the request starts
+  "collecting", so coworkers may offer to cover or swap its shifts (offers.py). It goes
+  up to the managers when the employee sends it up, or by itself at its send-up deadline:
+  the start of the day time_off.offers_close_days before the first day, in the workplace
+  zone, fixed when asked (offers_close_at). Asking with offers after that is 409. The
+  deadline is noticed the next time anyone reads or acts on the request, and audited as
+  the system. While collecting, the request has no reviewers (review.py), so nobody can
+  decide it and it is on nobody's waiting list.
+- Cancelling: a collecting, pending, or escalated request at any time; an approved one
+  only before its first day. Cancelling an approved request does not give the shifts back.
 - Seeing requests: your own always; anyone else's with time_off.view covering the employee
   (the scope filter for lists, authorize() for one). Another company's answer 404.
 - The reason is kept as typed (at most 500 characters) and shown only as plain text.
@@ -26,7 +34,8 @@ review.py.
   employee (AZ7). A comment may go with the decision (plain text, at most 500).
 - Waiting for me: the requests the user may decide right now.
 
-Every change is audited (time_off.requested, time_off.cancelled, time_off.approved,
+Every change is audited (time_off.requested, time_off.sent_up, time_off.cancelled,
+time_off.approved,
 time_off.denied, time_off.escalated, shift.opened) and commits once.
 
 Locks, always in this order (review of #167): the company's lock, the employee, the
@@ -37,7 +46,7 @@ hold one lock while waiting for another that the other holds.
 
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
@@ -62,11 +71,16 @@ from app.modules.org import repository
 from app.modules.org.models import User
 from app.modules.org.service import Conflict, Invalid, NotFound
 from app.modules.schedules.models import Shift
+from app.modules.time_off import offers
 from app.modules.time_off.days import day_starts, zone_of
-from app.modules.time_off.models import HOLDING, TimeOffRequest
+from app.modules.time_off.models import HOLDING, OPEN, CoverageOffer, TimeOffRequest
 from app.modules.time_off.review import overlapping_shifts
 from app.modules.time_off.schemas import TimeOffCreate
-from app.settings.service import TIME_OFF_REQUIRED_APPROVALS, setting_value
+from app.settings.service import (
+    TIME_OFF_OFFERS_CLOSE_DAYS,
+    TIME_OFF_REQUIRED_APPROVALS,
+    setting_value,
+)
 
 MAX_DAYS = 30
 
@@ -74,9 +88,39 @@ MAX_DAYS = 30
 # --- Keeping requests up to date -------------------------------------------------------
 
 
+TOO_LATE = "It is too late to ask coworkers for these days; send the request without offers."
+
+
+def _send_up(db: Session, request: TimeOffRequest, *, actor: Actor, at: datetime) -> None:
+    """A collecting request goes up to the managers: offers close, reviewers start."""
+    request.status, request.sent_up_at = "pending", at
+    record(
+        db,
+        actor=actor,
+        action="time_off.sent_up",
+        target_type="time_off_request",
+        target_id=request.id,
+        details={"by": "employee" if actor.type == "user" else "deadline"},
+    )
+
+
+def send_up_if_due(db: Session, request: TimeOffRequest) -> bool:
+    """Send a collecting request up if its deadline has passed; audited as the system, at
+    the deadline (not when someone happened to look). The caller holds the request's lock
+    and commits. Returns whether it went up now."""
+    due = request.offers_close_at
+    if request.status != "collecting" or due is None or due > utcnow():
+        return False
+    _send_up(db, request, actor=Actor.system(), at=due)
+    return True
+
+
 def refresh(db: Session, rows: list[TimeOffRequest]) -> None:
-    """Decline the requests whose first day has begun undecided, as not reviewed, and save
-    that at once (the approval layer's lapse; its hook updates the request itself).
+    """Bring requests up to date and save that at once: collecting requests past their
+    send-up deadline go up (locked in the usual order: the company's lock, the employee,
+    then the request),
+    and requests whose first day has begun undecided are declined as not reviewed (the
+    approval layer's lapse; its hook updates the request itself).
 
     Afterwards the transaction always shows what was committed, whoever lapsed a request:
     - this request lapsed one: committing saves it, and the next read starts afresh;
@@ -87,8 +131,16 @@ def refresh(db: Session, rows: list[TimeOffRequest]) -> None:
       read take a new snapshot, which includes the other request's lapse (review of #166).
     """
     changed = stale = False
+    now = utcnow()
     for row in rows:
-        if row.status in ("pending", "escalated"):
+        if row.status == "collecting" and row.offers_close_at and row.offers_close_at <= now:
+            # The time-off lock order (the top of this file): the company's lock first.
+            lock_reporting_lines(db)
+            repository.person(db, row.employee_id, lock=True)
+            fresh = db.get(TimeOffRequest, row.id, populate_existing=True, with_for_update=True)
+            if fresh is not None and send_up_if_due(db, fresh):
+                changed = True
+        if row.status in OPEN:
             approval = db.get(ApprovalRequest, row.approval_request_id)
             if approval is not None and lapse(db, approval):
                 changed = True
@@ -209,9 +261,10 @@ def list_requests(
         query = query.where(TimeOffRequest.last_day >= first)
     if last is not None:
         query = query.where(TimeOffRequest.first_day <= last)
-    # 1. Lapse the overdue requests among these first (every one, not only the newest), so
-    #    their stored status is "denied" before the status filter below looks at it.
-    _lapse_overdue(db, query)
+    # 1. Bring these up to date first (every one, not only the newest): collecting
+    #    requests past their send-up deadline go up, and overdue ones lapse, so their
+    #    stored status is right before the status filter below looks at it.
+    _bring_up_to_date(db, query)
     # 2. Then filter by status in the database, BEFORE the limit: limiting first and
     #    filtering after could answer an empty list (the newest rows all another status)
     #    while older requests with this status exist.
@@ -224,31 +277,52 @@ def list_requests(
     )
 
 
-def _lapse_overdue(db: Session, query: Select[TimeOffRequest]) -> None:
-    """Lapse every request the query matches that is still open past its deadline.
+def _bring_up_to_date(db: Session, query: Select[TimeOffRequest]) -> None:
+    """Bring every request the query matches up to date before a list filters it: send up
+    the collecting ones past their send-up deadline, and lapse the open ones past their
+    approval deadline (refresh()).
 
-    The open approval records past their deadline are looked up first, by ID (the company
-    filter limits them to this company), and then the query's open requests among them.
-    Usually there are none, or a few: each request lapses only once.
+    Both are looked up in the database, so only the few that need it are refreshed:
+    - collecting requests whose offers_close_at has passed (review of #193: without this,
+      a list filtered on "collecting" kept showing requests that should have gone up);
+    - open requests whose approval record is past its deadline, found by the approval
+      records' IDs first (the company filter limits them to this company).
+    Usually there are none, or a few: each goes up, or lapses, only once.
     """
+    now = utcnow()
+    due = list(
+        db.scalars(
+            query.where(
+                TimeOffRequest.status == "collecting",
+                TimeOffRequest.offers_close_at <= now,
+            )
+        )
+    )
     overdue = list(
         db.scalars(
             select(ApprovalRequest.id).where(
                 ApprovalRequest.kind == "time_off",
                 ApprovalRequest.status == "pending",
-                ApprovalRequest.review_by <= utcnow(),
+                ApprovalRequest.review_by <= now,
             )
         )
     )
-    if not overdue:
-        return
-    rows = db.scalars(
-        query.where(
-            TimeOffRequest.status.in_(("pending", "escalated")),
-            TimeOffRequest.approval_request_id.in_(overdue),
+    lapsing = (
+        list(
+            db.scalars(
+                query.where(
+                    TimeOffRequest.status.in_(("pending", "escalated")),
+                    TimeOffRequest.approval_request_id.in_(overdue),
+                )
+            )
         )
+        if overdue
+        else []
     )
-    refresh(db, list(rows))
+    # A request sent up here may be past its approval deadline too: refresh() sends it up
+    # first and then lapses it, in the same pass.
+    if due or lapsing:
+        refresh(db, due + lapsing)
 
 
 @dataclass
@@ -256,14 +330,21 @@ class Detail:
     request: TimeOffRequest
     affected_shifts: list[Shift]
     decisions: list[ApprovalDecision]
+    # The coworkers' offers this user may see: all of them for the employee and the
+    # managers, only their own for a coworker (coverage.md, threat I10).
+    offers: list[CoverageOffer]
+    # Seen as a coworker: the answer leaves out the reviewers' decisions.
+    as_coworker: bool = False
 
 
 def view_request(db: Session, user: User, request_id: uuid.UUID) -> Detail:
-    """One request with its affected shifts and decisions: your own, or one your
-    time_off.view covers (403); another company's or an unknown one is 404."""
+    """One request with its affected shifts, decisions, and offers: your own, one your
+    time_off.view covers, one you review, or (as a coworker) one you could answer or did
+    answer (403 otherwise); another company's or an unknown one is 404."""
     request = db.get(TimeOffRequest, request_id)
     if request is None:
         raise NotFound()
+    as_coworker = False
     if request.employee_id != user.id:
         try:
             authorize(db, user, "time_off.view", request)
@@ -272,7 +353,10 @@ def view_request(db: Session, user: User, request_id: uuid.UUID) -> Detail:
             # over the employee (a shared manager reached through escalation).
             approval = db.get(ApprovalRequest, request.approval_request_id)
             if approval is None or not may_decide(db, user, approval):
-                raise
+                # Last, a coworker asked to cover or swap (coverage.md).
+                if not offers.sees_as_coworker(db, user, request):
+                    raise
+                as_coworker = True
     refresh(db, [request])
     decisions = list(
         db.scalars(
@@ -282,7 +366,10 @@ def view_request(db: Session, user: User, request_id: uuid.UUID) -> Detail:
         )
     )
     shifts = sorted(overlapping_shifts(db, request), key=lambda shift: shift.starts_at)
-    return Detail(request, shifts, decisions)
+    if as_coworker:
+        # Only their own answers, and none of the reviewers' decisions (threat I10).
+        return Detail(request, shifts, [], offers.own_offers(db, user, request), True)
+    return Detail(request, shifts, decisions, offers.offers_on(db, request))
 
 
 # --- Asking ----------------------------------------------------------------------------
@@ -330,6 +417,15 @@ def ask(db: Session, user: User, body: TimeOffCreate) -> TimeOffRequest:
     if any(row.status in HOLDING for row in holding):
         raise Conflict("You already asked for some of these days.")
 
+    # Asked with offers: coworkers may answer until the send-up deadline, the start of
+    # the day that many days before the first day. Already past it: too late to ask them.
+    offers_close_at = None
+    if body.offer_coverage:
+        days = setting_value(db, TIME_OFF_OFFERS_CLOSE_DAYS)
+        offers_close_at = day_starts(zone, body.first_day - timedelta(days=days))
+        if offers_close_at <= utcnow():
+            raise Conflict(TOO_LATE)
+
     approval = open_request(
         db,
         kind="time_off",
@@ -345,8 +441,9 @@ def ask(db: Session, user: User, body: TimeOffCreate) -> TimeOffRequest:
         first_day=body.first_day,
         last_day=body.last_day,
         reason=body.reason or None,
-        status="pending",
+        status="collecting" if body.offer_coverage else "pending",
         approval_request_id=approval.id,
+        offers_close_at=offers_close_at,
     )
     db.add(request)
     db.flush()
@@ -358,8 +455,38 @@ def ask(db: Session, user: User, body: TimeOffCreate) -> TimeOffRequest:
         target_type="time_off_request",
         target_id=request.id,
         # The days, never the reason: the log is kept for good, the reason is personal.
-        details={"first_day": body.first_day.isoformat(), "last_day": body.last_day.isoformat()},
+        details={
+            "first_day": body.first_day.isoformat(),
+            "last_day": body.last_day.isoformat(),
+            "offer_coverage": body.offer_coverage,
+        },
     )
+    db.commit()
+    return request
+
+
+# --- Sending up ------------------------------------------------------------------------
+
+
+def send_up(db: Session, user: User, request_id: uuid.UUID) -> TimeOffRequest:
+    """The employee sends their collecting request up to the managers (offers close)."""
+    authorize(db, user, "time_off.request_self")
+    found = db.get(TimeOffRequest, request_id)
+    if found is None or found.employee_id != user.id:
+        raise NotFound()  # someone else's request is not yours to send
+    # Same order as asking: the company's lock, the person, then the request (fresh and
+    # locked; review of #167).
+    lock_reporting_lines(db)
+    repository.person(db, user.id, lock=True)
+    request = db.get(TimeOffRequest, request_id, populate_existing=True, with_for_update=True)
+    if request is None:
+        raise NotFound()
+    if send_up_if_due(db, request):
+        db.commit()
+        raise Conflict("Its deadline passed, so this request already went to your managers.")
+    if request.status != "collecting":
+        raise Conflict("This request is not waiting for coworkers' offers.")
+    _send_up(db, request, actor=Actor.user(user.id), at=utcnow())
     db.commit()
     return request
 
@@ -419,7 +546,8 @@ def waiting(db: Session, user: User, *, limit: int) -> list[TimeOffRequest]:
         db.scalars(
             select(TimeOffRequest)
             .where(
-                TimeOffRequest.status.in_(("pending", "escalated")),
+                # Collecting ones too: any past their send-up deadline go up just below.
+                TimeOffRequest.status.in_(OPEN),
                 TimeOffRequest.employee_id != user.id,
             )
             .order_by(TimeOffRequest.first_day, TimeOffRequest.id)
@@ -428,6 +556,8 @@ def waiting(db: Session, user: User, *, limit: int) -> list[TimeOffRequest]:
     refresh(db, rows)
     found = []
     for row in rows:
+        if row.status == "collecting":
+            continue  # still with the coworkers: nobody reviews it yet
         approval = db.get(ApprovalRequest, row.approval_request_id)
         if approval is not None and waits_for(db, user, approval):
             found.append(row)
@@ -461,6 +591,8 @@ def decide_request(
     if lapse(db, approval):
         db.commit()
         raise Conflict(NOT_REVIEWED)
+    if request.status == "collecting":
+        raise Forbidden()  # still with the coworkers: it has no reviewers yet
     if request.status not in ("pending", "escalated"):
         raise Conflict("This request is no longer waiting for a decision.")
     # Fresh: the reviewer's grants, their place, the chain, the owners, and the employee

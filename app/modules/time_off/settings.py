@@ -15,4 +15,14 @@ SETTINGS = [
         stricter=Stricter.HIGHER,
         description="How many direct managers must approve a time-off request",
     ),
+    # How many days before the first day a request asked with offers goes up to the
+    # managers by itself (coverage.md, the send-up minimum). More is stricter: reviewers
+    # get longer. The software default is the day before.
+    SettingDef(
+        "offers_close_days",
+        default=1,
+        limit=14,
+        stricter=Stricter.HIGHER,
+        description="Days before time off starts that coworkers' offers close",
+    ),
 ]

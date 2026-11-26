@@ -114,9 +114,11 @@ Every answer names the employee (`employee_name`), and each decision its reviewe
 | `employee_id` | `BINARY(16)` | required; company-aware foreign key to `users` |
 | `first_day`, `last_day` | `DATE` | required; `CHECK (last_day >= first_day)`; in the employee's workplace zone |
 | `reason` | `VARCHAR(500)` | optional; shown as plain text |
-| `status` | `VARCHAR(12)` | `pending`, `escalated`, `approved`, `denied`, or `cancelled`; a request declined because nobody reviewed it is `denied`, and its approval record has `not_reviewed` set |
+| `status` | `VARCHAR(12)` | `collecting` (asked with offers, still with the coworkers: [coverage](coverage.md)), `pending`, `escalated`, `approved`, `denied`, or `cancelled`; a request declined because nobody reviewed it is `denied`, and its approval record has `not_reviewed` set |
 | `approval_request_id` | `BINARY(16)` | required; company-aware foreign key to `approval_requests` (kind `time_off`) |
 | `decided_at` | `DATETIME(6)` | null until approved, denied, or cancelled |
+| `offers_close_at` | `DATETIME(6)` | null when asked without offers; when a collecting request goes up by itself ([coverage](coverage.md)) |
+| `sent_up_at` | `DATETIME(6)` | null while collecting or when asked without offers; when it went up |
 
 | From | To | How many | Enforced by | Meaning |
 |---|---|---|---|---|
