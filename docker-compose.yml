@@ -20,6 +20,8 @@ services:
       MYSQL_DATABASE: workforce_ops
       MYSQL_APP_PASSWORD: ${MYSQL_APP_PASSWORD:?set MYSQL_APP_PASSWORD in .env}
       MYSQL_MIGRATIONS_PASSWORD: ${MYSQL_MIGRATIONS_PASSWORD:?set MYSQL_MIGRATIONS_PASSWORD in .env}
+      # The backup user (#117), created on the first start only if a password is set.
+      MYSQL_BACKUP_PASSWORD: ${MYSQL_BACKUP_PASSWORD:-}
     ports:
       - "127.0.0.1:${DB_PORT:-3307}:3306"
     volumes:
@@ -97,8 +99,34 @@ services:
     networks:
       - database
 
+  # Backups (#117, docs/operations/backup-and-restore.md): ships the binary log every 5
+  # minutes and takes a full backup every night, encrypted to BACKUP_CERT. Runs only
+  # when asked for: docker compose --profile backup up -d backup. It holds the backup
+  # user's password (read only) and the public certificate, never the private key.
+  backup:
+    build: ./docker/backup
+    image: workforce-ops-backup:local
+    profiles: ["backup"]
+    restart: unless-stopped
+    environment:
+      MYSQL_HOST: db
+      MYSQL_DATABASE: workforce_ops
+      # Optional here so the other services start without it; backup.sh stops without it.
+      MYSQL_BACKUP_PASSWORD: ${MYSQL_BACKUP_PASSWORD:-}
+    volumes:
+      # The backups, in a volume only this service mounts (not the database's or the
+      # API's). On a server, copy it off the machine to write-once storage (the runbook).
+      - backups:/backups
+      # The folder with backup-cert.pem, read-only.
+      - ${BACKUP_CERT_DIR:-./backup-cert}:/run/backup:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - database
+
 networks:
-  # Only the API (and the migrate tool) can reach MySQL.
+  # Only the API, the migrate tool, and the backup tool can reach MySQL.
   database:
   # Shared with the frontend's nginx, which forwards /api here; MySQL is not on it.
   workforce-ops:
@@ -112,3 +140,4 @@ networks:
 
 volumes:
   db-data:
+  backups:
