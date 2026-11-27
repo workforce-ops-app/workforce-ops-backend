@@ -31,6 +31,7 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.auth.sessions import COOKIE_NAME, hash_cookie
+from app.core.request_context import CSRF_REFUSED, note_refusal
 
 # The methods that may change something; every other method only reads.
 CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -86,6 +87,8 @@ class CsrfMiddleware:
 
         # Request(scope) reads the headers and cookies; the body is left for the endpoint.
         if not self.allowed(Request(scope)):
+            # For the request's refusal log line (#92, app/core/request_context.py).
+            note_refusal(CSRF_REFUSED)
             response = JSONResponse(
                 status_code=403,
                 content={

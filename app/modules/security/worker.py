@@ -46,13 +46,31 @@ MAX_RETRY = 1_000  # unsaved events kept to write again
 
 
 def events_for(copy: RequestCopy) -> list[Event]:
-    """The events for one request copy: one per pattern matched per value."""
+    """The events for one request copy: one per pattern matched per value, or, for a
+    refused request's own copy, one for the refusal (#92)."""
     identity = copy.identity
     # Who the rate cap counts it against (DE6): the session, or the address.
     if identity is not None:
         source = f"session:{identity.session_id}"
     else:
         source = f"address:{copy.client_address or 'unknown'}"
+    if copy.refusal is not None:
+        # No pattern and no excerpt: nothing the client sent. The field column names the
+        # permission authorize() refused, when it was a permission check.
+        return [
+            Event(
+                kind=copy.refusal.kind,
+                source=source,
+                occurred_at=copy.occurred_at,
+                field=copy.refusal.permission,
+                method=copy.method,
+                route=copy.route,
+                client_address=copy.client_address,
+                request_id=copy.request_id,
+                company_id=identity.company_id if identity else None,
+                user_id=identity.user_id if identity else None,
+            )
+        ]
     return [
         Event(
             kind=f"detection.{finding.kind}",
