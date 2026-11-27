@@ -52,9 +52,7 @@ Company separation comes first and is a different mechanism ([tenancy](tenancy.m
 | `audit.verify` | company | run verification of the company's audit chain |
 | `security.view` | company | see the company's security events on the security page (built, DT5: [detection](../features/detection.md#backend)) |
 | `announcement.create` | record | post, edit, and archive announcements for an audience in scope; see who has read them ([announcements](../features/announcements.md)) |
-| `coverage.request_self` | self | ask coworkers to cover or swap one of your own shifts; cancel your request ([coverage](../features/coverage.md)) |
-| `coverage.respond_self` | self | answer a coverage request you were asked about: accept, swap, or decline |
-| `coverage.review` | person | approve or deny the coverage requests of people you are above; approving also needs `schedule.edit` on every shift that changes ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)) |
+| `coverage.respond_self` | self | on a coworker's time-off request asked with offers, offer to cover or swap one of their shifts, or decline ([coverage](../features/coverage.md)); asking is part of time off (`time_off.request_self`) and choosing offers part of reviewing it (`time_off.review`, plus `schedule.edit` on every shift a chosen offer changes) |
 | `company.transfer_ownership` | company | propose adding or removing an owner (Owner role only; other owners must agree) |
 
 Changing your own password and signing yourself out need no permission; every signed-in user can do both.
@@ -81,14 +79,13 @@ Every new company gets four roles ([0024](https://github.com/workforce-ops-app/.
 | `audit.view`, `audit.verify` | yes | yes | | |
 | `security.view` | yes | yes | | |
 | `announcement.create` | yes | yes | yes | |
-| `coverage.request_self`, `coverage.respond_self` | yes | yes | yes | yes |
-| `coverage.review` | yes | yes | yes | |
+| `coverage.respond_self` | yes | yes | yes | yes |
 | `company.transfer_ownership` | yes | | | |
 
 - **Typical scopes:** Owner and Administrator are assigned for the whole company; a Manager for their department or team; everyone gets the Employee role scoped to their **home department**, which is what lets employees see their department's schedule. An administrator can remove `schedule.view` from the Employee role to turn that off.
 - **Owner** is locked: its permissions cannot be changed, and it is always assigned for the whole company. An active, company-wide Owner assignment grants **every** registered permission, including ones a module adds after the company's roles were created, and for the whole company even when another of the owner's roles grants the same permission more narrowly; the Owner role's `role_permissions` rows are only a record of that. A company has at least one owner and may have several true co-owners; leaders who are not co-owners (such as a board of directors) get their own role below the owner.
 - Later features add to these roles; for example employees do not get `announcement.create` by default.
-- **Companies that already exist** get a new starting-role permission from the migration that adds the feature, not only new companies: the starting roles of a company are filled with the permissions known when it was created, so the migration adds the new grant to every existing company's matching starting roles (only where it is missing; company-made roles are left alone). `0014_announcements` does this for `announcement.create` (Owner, Administrator, Manager) and `0015_coverage_offers` for `coverage.respond_self`. `scripts/check_migrations.py` upgrades a company made before 0014 and checks a manager can post afterwards.
+- **Companies that already exist** get a new starting-role permission from the migration that adds the feature, not only new companies: the starting roles of a company are filled with the permissions known when it was created, so the migration adds the new grant to every existing company's matching starting roles (only where it is missing; company-made roles are left alone). `0014_announcements` does this for `announcement.create` (Owner, Administrator, Manager) and `0016_coverage_offers` for `coverage.respond_self`. `scripts/check_migrations.py` upgrades a company made before 0014 and checks a manager can post afterwards.
 
 ## How a check works
 
@@ -189,6 +186,8 @@ In the code (`app/authz/chain.py`) the last line reads the `reporting_lines` mod
 | `POST /api/reporting-lines/{id}/end` | as for adding | end a line; it stays as history; 409 if it has already ended |
 
 Both take the company's lock before anything else (and before the audit entry), then run the whole check again on fresh reads (`authorize(..., fresh=True)` for each person: `reporting_line.manage` still held, the person still in its scope, the actor still above them), and adding checks again that neither person was deactivated meanwhile, because under MySQL's REPEATABLE READ an ordinary read after the wait would still answer from before it (review of #164); ending reads the line itself fresh and locked, so two requests never end it twice (a race in `scripts/check_migrations.py`).
+
+**The company's lock** is `lock_reporting_lines()` in `app/authz/chain.py`: a `SELECT ... FOR UPDATE` on the company's row in `company_locks` ([data model](data-model.md#company_locks)), held until the request commits. Reporting-line, role, owner, approval-request, and time-off changes take it before anything else, so one company's changes to who is above whom, and the decisions that depend on it, take turns; other companies never wait. It is a row of its own, not the company's row in `companies`, because every audit entry refers to that row by a foreign key and MySQL takes a shared lock on it for each such insert: with the lock there, a request holding a person's row and writing its audit entry and a request holding the company's lock and waiting for that person deadlocked (#198).
 
 **People with no line above them** can be managed only by the Owner. Their requests go straight to the Owner ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)).
 

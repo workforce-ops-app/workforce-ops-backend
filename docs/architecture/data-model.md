@@ -205,6 +205,18 @@ Every table also has `created_at` and `updated_at` (`DATETIME(6)`, UTC); they ar
 
 Not itself company-owned, but protected by the company filter (`CompanyRecord`): a session working for a company sees and changes only its own row. Only platform code (a session with no company: company sign-up and the seed script) creates or archives companies ([organization](../features/organization.md#company-sign-up)).
 
+### company_locks
+
+**What it is:** the company's lock, one row per company (#198). `lock_reporting_lines()` in `app/authz/chain.py` locks it with `SELECT ... FOR UPDATE`, so changes to reporting lines, roles, owners, and the approvals and time-off decisions that depend on who is above whom take turns within a company.
+
+| Column | Type | Rules |
+|---|---|---|
+| `company_id` | `BINARY(16)` | primary key; foreign key to `companies.id` |
+
+**Why not the company's own row:** every audit entry, and most other rows, refer to `companies.id` by a foreign key, and MySQL takes a shared lock on the referred row for each such insert. With the lock on the companies row, a request that held a person's row and was writing its audit entry waited for the company's lock, while the holder of the company's lock waited for that person: a deadlock, which MySQL ends with error 1213 (a 500). Nothing refers to a `company_locks` row, so ordinary writes never wait for it. `scripts/check_migrations.py` runs both pairs that used to deadlock (deactivating someone while they are made an owner, and giving someone a shift while their time off is decided) in several rounds.
+
+Created with its company, in the same save (`_add_company_lock` in `app/modules/org/models.py`); migration `0015` added one for every company that existed. Never changed or removed. The application user has SELECT, INSERT, and UPDATE on it (UPDATE because MySQL allows `FOR UPDATE` only with it).
+
 ### departments
 
 **What it is:** a part of a company, such as Kitchen or Front of House. Every employee has one home department.
@@ -337,7 +349,7 @@ A `CHECK (manager_id <> employee_id)` constraint stops anyone reporting to thems
 
 Built (slice Z2): the table, the constraints, and adding a line with the first two rules and the audit entry (`add_reporting_line()` in `app/authz/chain.py`). Ending a line, and the rule against changing your own lines, come with the endpoints in Z5.
 
-**Two changes at the same moment.** Two requests could each pass the checks and together add a duplicate or a loop ("A reports to B" and "B reports to A" each look fine alone). So every change first locks the company's row (`lock_reporting_lines()`), and changes in one company take turns; other companies are not blocked. The checks then use locking reads, because under MySQL's default isolation (REPEATABLE READ) an ordinary read sees the database as it was at the transaction's first read, which can be before the other request committed. Ending a line (Z5) must take the same lock. `scripts/check_migrations.py` tries these races on a fresh MySQL 8.4 in CI, since the tests run on SQLite, which has no row locks.
+**Two changes at the same moment.** Two requests could each pass the checks and together add a duplicate or a loop ("A reports to B" and "B reports to A" each look fine alone). So every change first takes the company's lock (`lock_reporting_lines()`, a `SELECT ... FOR UPDATE` on the company's row in [company_locks](#company_locks)), and changes in one company take turns; other companies are not blocked. The checks then use locking reads, because under MySQL's default isolation (REPEATABLE READ) an ordinary read sees the database as it was at the transaction's first read, which can be before the other request committed. Ending a line (Z5) must take the same lock. `scripts/check_migrations.py` tries these races on a fresh MySQL 8.4 in CI, since the tests run on SQLite, which has no row locks.
 
 Loops and "not your own lines" cannot be checked by a single-row constraint, so they are enforced in the service and covered by security tests. What reporting lines allow (being above someone decides *whom* you may act on; permissions decide *what*), and who may add or end them (someone above both people, with `reporting_line.manage`), are set out in [0024](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0024-authorization-model.md).
 
@@ -448,7 +460,7 @@ Primary key: `(company_id, module, setting_key)`. A missing row means "use the d
 |---|---|---|---|---|
 | `auth.password_min_length` | `app/settings/registry.py` | 15 | 15 to 64 (longer is stricter) | every password a person sets (`check_password(min_length=password_min_length(db))`): changing one's own password (`PUT /api/me/password`) and the demo seed |
 | `time_off.required_approvals` | `app/modules/time_off/settings.py` | 1 | 1 to 5 (more is stricter) | time-off approval ([time off](../features/time-off.md)), when it is built |
-| `coverage.answers_close_hours` | `app/modules/coverage/settings.py` | 12 | 12 to 72 (more is stricter: reviewers get longer) | when coworkers' answering closes, and how late a coverage request can be made ([coverage](../features/coverage.md)), when it is built |
+| `time_off.offers_close_days` | `app/modules/time_off/settings.py` | 1 | 1 to 14 (more is stricter: reviewers get longer) | how many days before the first day a request asked with offers goes up by itself, and so how late one can be asked with offers ([coverage](../features/coverage.md)); a department may raise it (CV3) |
 
 "From the default to the limit" means a company that chose 20 may later go back to 16, but never below 15. Two changes of the same setting at the same moment take turns on an existing row; the very first change of a setting by two requests at once would make one of them fail on the primary key, which matters only once the settings endpoint exists.
 

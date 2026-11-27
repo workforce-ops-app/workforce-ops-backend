@@ -49,6 +49,8 @@ In the core tier, requests and their status are shown on the pages; notification
 ---
 ## Details
 
+**Offering shift swaps and coverage** (agreed 2026-11-20): the request form has an optional **Offer Shift Swap / Coverage** box. Ticked, the request first **collects offers** from coworkers (status `collecting`) and goes to the managers when the employee sends it up or at the send-up deadline; the manager then chooses none or one offer per shift when approving. The whole flow, its states, and its rules are on [shift swaps and coverage](coverage.md).
+
 ### States and rules
 
 ```mermaid
@@ -76,6 +78,7 @@ stateDiagram-v2
 - **No self-review:** nobody reviews their own request; a manager's request goes to their own managers.
 - **Reviewers are checked at the moment they decide** (still above the employee, still holding `time_off.review`).
 - **On approval:** every shift of the employee that overlaps the approved days becomes **open** (`employee_id` cleared, status `open`), with an audit entry linking it to the request.
+- **While approved,** nobody can give the employee a shift on those days again (409; [schedules](schedules.md#states-and-rules)).
 - **Cancelling an approved request** does not give the shifts back automatically; the manager reassigns them.
 - **Not reviewed in time:** a request still undecided (pending or escalated) when its **first day begins** (midnight in the employee's workplace zone) is **declined**. It counts as declined for everything, and the audit log records that nobody reviewed it; the employee sees "Declined: not reviewed in time". Role grants, owner changes, and account changes use a 7-day deadline instead ([0032](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0032-delegation-limits.md)).
 - **Next tier:**
@@ -96,9 +99,11 @@ stateDiagram-v2
 | `GET /time-off-requests/{id}` | owner of the request, or `time_off.view` | one request, with its affected shifts and decisions so far |
 | `POST /time-off-requests` `{first_day, last_day, reason}` | `time_off.request_self` | ask for time off |
 | `POST /time-off-requests/{id}/cancel` | `time_off.cancel_self` | cancel your own request |
-| `POST /time-off-requests/{id}/approve`, `POST /time-off-requests/{id}/deny` `{comment}` | `time_off.review`, above the employee | decide |
+| `POST /time-off-requests/{id}/approve` `{comment, choices}`, `POST /time-off-requests/{id}/deny` `{comment}` | `time_off.review`, above the employee | decide; `choices` picks coworkers' offers for a request asked with offers ([coverage](coverage.md#states-and-rules)) |
 
 Every answer names the employee (`employee_name`), and each decision its reviewer (`approver_name`), so the review screen needs no lookups the reviewer may not be allowed to make (#172). Names are read in one query per answer. Anyone who may see a request may see these names.
+
+**Progress of an open request:** while a request is pending or escalated, every answer about it also carries `progress`: `decided` (each reviewer who has decided so far, with `approver_name` and `decision`, oldest first) and `waiting_for` (the reviewers who still have to, by `display_name`, worked out as for a decision, without anyone who already decided or is deactivated). Once the request is settled, `progress` is `null`. A request needing several reviewers waits for all of them, so after one denial it is still pending; the screens use `progress` to say so ("You declined. Waiting for Felix Grant.") instead of reading as untouched. Found in review (2026-11-20). The employee already saw these decisions on the request itself; comments stay on the request page only.
 
 **Table: `time_off_requests`** (feature table; the shared approval tables are on the [data model](../architecture/data-model.md#approval_requests) page)
 
@@ -109,9 +114,11 @@ Every answer names the employee (`employee_name`), and each decision its reviewe
 | `employee_id` | `BINARY(16)` | required; company-aware foreign key to `users` |
 | `first_day`, `last_day` | `DATE` | required; `CHECK (last_day >= first_day)`; in the employee's workplace zone |
 | `reason` | `VARCHAR(500)` | optional; shown as plain text |
-| `status` | `VARCHAR(12)` | `pending`, `escalated`, `approved`, `denied`, or `cancelled`; a request declined because nobody reviewed it is `denied`, and its approval record has `not_reviewed` set |
+| `status` | `VARCHAR(12)` | `collecting` (asked with offers, still with the coworkers: [coverage](coverage.md)), `pending`, `escalated`, `approved`, `denied`, or `cancelled`; a request declined because nobody reviewed it is `denied`, and its approval record has `not_reviewed` set |
 | `approval_request_id` | `BINARY(16)` | required; company-aware foreign key to `approval_requests` (kind `time_off`) |
 | `decided_at` | `DATETIME(6)` | null until approved, denied, or cancelled |
+| `offers_close_at` | `DATETIME(6)` | null when asked without offers; when a collecting request goes up by itself ([coverage](coverage.md)) |
+| `sent_up_at` | `DATETIME(6)` | null while collecting or when asked without offers; when it went up |
 
 | From | To | How many | Enforced by | Meaning |
 |---|---|---|---|---|
@@ -143,7 +150,7 @@ Each step (asking, each decision, cancelling) goes through this module's service
 
 ### Audit and security
 
-**Audit events:** `time_off.requested`, `time_off.approved`, `time_off.denied`, `time_off.escalated` (details: who it went to), `time_off.cancelled`, `time_off.not_reviewed` (actor `system`; the request is declined), and `shift.opened` for each shift opened by an approval (details: the request).
+**Audit events:** `time_off.requested`, `time_off.approved` (details: `chosen_offers`, the coworkers' offers chosen, empty when none), `time_off.denied`, `time_off.escalated` (details: who it went to), `time_off.cancelled`, `time_off.not_reviewed` (actor `system`; the request is declined), and `shift.opened` for each shift opened by an approval (details: the request).
 
 **Threats** ([threat model](../security/threat-model.md)): E5 (approving your own request), E3 (reviewing someone you are not above), I1 and I2 (seeing others' requests), T2 (setting the status directly), T5 (reason text).
 

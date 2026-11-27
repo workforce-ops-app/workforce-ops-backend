@@ -1,20 +1,22 @@
 # Shift swaps and coverage
 
-- **Status:** design (final demo, [0038](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0038-final-demo-scope.md))
-- **Related:** design workforce-ops-app/workforce-ops-backend#111; backend workforce-ops-app/workforce-ops-backend#121; screens workforce-ops-app/workforce-ops-frontend#66; tracker workforce-ops-app/.github#85; routing [0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md); design: [schedules](schedules.md), [time off](time-off.md), [authorization](../architecture/authorization.md)
+- **Status:** design, rewritten 2026-11-20 after review: coverage now starts from a time-off request (agreed by both teammates; replaces the shift-by-shift design of #153) (final demo, [0038](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0038-final-demo-scope.md))
+- **Related:** design workforce-ops-app/workforce-ops-backend#111; backend workforce-ops-app/workforce-ops-backend#121; screens workforce-ops-app/workforce-ops-frontend#66; tracker workforce-ops-app/.github#85; routing [0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md); design: [time off](time-off.md), [schedules](schedules.md), [authorization](../architecture/authorization.md)
 
 ## In short
-An employee who cannot work one of their shifts asks their coworkers for help. Each coworker asked answers **accept** (they take the shift), **swap** (they take it and give one of their own shifts in exchange), or **decline**. When everyone has answered, or the answering time is up, the list of answers goes to the employee's managers, who choose one answer, open the shift for someone else, or say no. Nothing on the schedule changes until a manager approves, and everything is checked again at that moment.
+
+An employee asking for time off can tick **Offer Shift Swap / Coverage**. Their coworkers in the department then see the request and, for each of the employee's shifts on those days, may **offer to cover** it, **offer to swap** it for one of their own shifts, **decline**, or just ignore it. The employee sends the request to their managers whenever they like; if they have not by a deadline (by default midnight at the start of the day before the time off starts), it goes up by itself as it is. The manager sees the time off with every offer and, for each shift, chooses **none or one** offer and approves, or declines the whole request. Nothing on the schedule changes until the time off is approved, and every chosen offer is checked again at that moment.
+
+Without the tick, a time-off request works exactly as before ([time off](time-off.md)).
 
 ## Who can use it
 
-| Role | Can | Permission | Scope |
+| Who | Can | Permissions | Scope |
 |---|---|---|---|
-| Everyone | ask for coverage of their own shift; cancel their request; answer requests they are asked about | `coverage.request_self`, `coverage.respond_self` | own shifts and own answers |
-| Manager | choose an answer, open the shift, or deny, for the requests of people they are above | `coverage.review` (and `schedule.edit` for every shift that changes) | their scope; also needs a position above the employee |
-| Owner, Administrator | the same, company-wide | `coverage.review`, `schedule.edit` | company; still needs a position above (the Owner is above everyone) |
-
-These are the starting roles' defaults ([authorization](../architecture/authorization.md#starting-roles)); companies can change what their roles grant.
+| Employee asking for time off | tick the box; see every offer on their own request; send it up early; cancel it | `time_off.request_self`, `time_off.cancel_self` | own requests |
+| Coworker | see the requests they could help with; offer to cover, offer to swap, or decline, per shift; change or take back their own answer until the request goes up | `coverage.respond_self` | only requests with a shift they could be assigned |
+| Reviewer (the time-off reviewers) | see the time off with every offer; choose none or one offer per shift and approve, or decline | `time_off.review` (above the employee), and `schedule.edit` covering every shift a chosen offer changes, both as it is and as it will be | as for time off |
+| Manager of the department | raise the department's send-up minimum (more days before, never fewer than the company's); with several managers, all must confirm | `time_off.review` through a grant for that department, or company-wide (see "The send-up minimum") | their department |
 
 ## How it works
 
@@ -22,237 +24,166 @@ These are the starting roles' defaults ([authorization](../architecture/authoriz
 sequenceDiagram
     participant E as Employee
     participant A as API
-    participant C as Coworkers asked
-    participant M as Managers (reviewers)
-    E->>A: POST /api/coverage-requests {shift, coworkers to ask}
-    A->>A: checks: own upcoming shift, coworkers can work it
-    C->>A: answer: accept / swap (with one of their shifts) / decline
-    alt everyone answered, the employee sends it early, or answering time is up
-        A-->>M: the request and its answers wait for review
+    participant C as Coworkers
+    participant M as Manager
+    E->>A: POST /api/time-off-requests {days, offer_coverage: true}
+    A-->>C: listed on their home screen (no notifications in the final)
+    C->>A: per shift: cover / swap (with one of their shifts) / decline
+    alt the employee sends it up, or the send-up deadline passes
+        A-->>M: waiting for review, with every offer
     end
-    M->>A: approve {coworker} or {open the shift}, or deny
-    A->>A: check everything again; change the shifts; audit
-    A-->>E: outcome shown on their page
+    M->>A: approve {choices: one offer or none per shift}, or deny
+    A-->>E: approved: chosen offers applied, other shifts open; or declined
 ```
 
-1. On one of their upcoming shifts, the employee chooses **Ask for coverage**, adds an optional note ("family wedding"), and picks the coworkers to ask. The screen lists everyone who could work that shift, all ticked by default.
-2. Each coworker asked sees the request on their home screen and answers **accept**, **swap** (picking one of their own upcoming shifts to give in exchange), or **decline**. They may change their answer while answering is open.
-3. Answering ends when **everyone asked has answered**, when the employee **sends it early**, or **12 hours before the shift** (a company setting), whichever comes first. The request then waits on the reviewers' page, with every answer.
-4. A reviewer (one of the employee's direct managers, found through the reporting chain as for time off) does one of three things:
-   - **chooses an answer:** the coworker takes the shift, and for a swap the employee takes the coworker's offered shift;
-   - **opens the shift:** the employee no longer works it and it becomes an open shift for the manager to fill (useful when nobody could help);
-   - **denies:** nothing changes, and the employee still works the shift.
-5. Everyone involved sees the outcome on their pages. A request nobody decides before the shift starts **expires**, and the employee still works the shift.
+1. **Asking.** On My time off, the employee picks the days and may tick **Offer Shift Swap / Coverage**. The request starts as **collecting offers** (status `collecting`) instead of waiting for review. Not ticked: it waits for review at once, as today.
+2. **Offering.** Every coworker who could take at least one of the employee's shifts on those days sees the request on their home screen and its own page. For each such shift they answer **cover** (they take it), **swap** (they take it and give the employee one of their own shifts in exchange), or **decline**; or they ignore it. They may change or take back their answer while the request is collecting.
+3. **Sending up.** The employee may send the request up at any time (**Send to my manager**). If they have not by the **send-up deadline**, it goes up by itself, as it is, the first time anyone reads or acts on it after the deadline (no background job, as for lapsing). From then on it is **waiting for review**, the offers are locked, and it follows the time-off rules (reviewers, escalation, declined if not reviewed).
+4. **Deciding.** The reviewer sees the time off, the affected shifts, and every offer per shift. They choose **none or one** offer for each shift and approve, or decline the whole request.
+   - Approved with an offer chosen for a shift: **cover**: the coworker takes the shift; **swap**: the coworker takes the shift and the employee takes the coworker's offered shift.
+   - Approved with no offer for a shift: the shift becomes **open**, as for any approved time off.
+   - Declined: nothing changes; every offer is dropped.
+5. **Cancelled** (by the employee, at any time before a decision, or an approved one before its first day): every offer is dropped; the schedule changes only as for time off.
 
-There are no notifications in the final demo (stretch, 0038): people see requests waiting for them on their home screen and the coverage page.
-
----
 ## Details
 
 ### States and rules
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Asking: requested
-    Asking --> InReview: everyone answered, sent early, or answering time up
-    Asking --> Cancelled: employee cancels, or the shift changes
-    InReview --> Approved: a reviewer chooses an answer or opens the shift
-    InReview --> Denied: a reviewer denies
-    InReview --> Cancelled: employee cancels, or the shift changes
-    InReview --> Expired: not decided before the shift starts
+    [*] --> Collecting: requested with offers
+    [*] --> Pending: requested without offers
+    Collecting --> Pending: employee sends it up, or the send-up deadline passes
+    Collecting --> Cancelled: employee cancels
+    Pending --> Approved: as for time off (chosen offers applied)
+    Pending --> Denied: as for time off (offers dropped)
+    Pending --> Escalated: as for time off
+    Escalated --> Approved: shared manager approves
+    Escalated --> Denied: shared manager denies
 ```
 
-The table stores one status, `open`, while a request is asking or in review; which of the two it is follows from the times (see `review_opens_at` under Backend), so no job has to move it along and the outcome never depends on when a job last ran.
+**Asking with offers**
+- Only possible while the send-up deadline is still ahead (409 "It is too late to ask coworkers for these days; send the request without offers."). The deadline is the start of the day that is *minimum* days before the first day, in the employee's workplace zone: **midnight at the beginning of that day, not the end of it**. With the default minimum of 1, time off starting on a Friday stops collecting offers at 00:00 on Thursday, so the last moment to offer is late on Wednesday.
+- A request with no shifts on its days can still be asked with the box ticked; nobody can offer anything, and it goes up as usual.
+- The deadline is noticed the next time anyone reads or acts on the request (no background job, as for lapsing in [time off](time-off.md#backend)); the request then goes up as the system, with `sent_up_at` set to the deadline. If nobody looks before the first day begins, it is declined as not reviewed, as any request is.
 
-**Asking**
-- Only for **your own scheduled shift** (status `scheduled`, you are its person) that has not started. Not for open, cancelled, or ended shifts (409).
-- **Notice:** a request can be made only until answering would close, that is, earlier than `coverage.answers_close_hours` before the shift starts (409 after). So the reviewers always have at least that long to decide.
-- **One open request per shift** (409 for a second one).
-- **Limits per person** (threat D7): at most **10** open requests at a time, and at most **20** new requests in any 24 hours, cancelled ones included, so cancelling and asking again does not get around the first limit (409 for either). Both counts are taken with the employee's `users` row locked (`SELECT ... FOR UPDATE`, the same first lock as every schedule change), so two requests sent at the same moment cannot both slip under a limit.
-- **The note** is optional, at most 500 characters, plain text (threat T5).
-- **Who can be asked:** the people who could be assigned the shift under the schedule rules ([schedules](schedules.md#states-and-rules)): active, password set, home department is the shift's department or on an active team in it; never the employee themselves. The employee picks from them; leaving the list out asks all of them. At least 1 and at most 100 people; anyone else in the list is refused (422, with the same answer for a person who does not exist and one who cannot work the shift, so the list reveals nothing about other departments).
-- Being asked does not depend on being free at that time: someone with an overlapping shift can still offer a **swap** with that very shift.
-- Nobody can be asked about a request in another company: every lookup goes through the company filter (404).
+**Who can offer, per shift** (checked when they offer and again at approval; 409 with the reason otherwise)
+- Not the employee themselves.
+- Someone who could be assigned that shift: active, set up, and the shift's department is their home department or they are on an active team in it (the same rule as assigning, [schedules](schedules.md#states-and-rules)).
+- For **cover**: no overlapping shift of their own and no approved time off at that time.
+- For **swap**: the shift they give must be their own, scheduled, not started, **in the same department**, and **outside the employee's time off**; the employee must be able to work it (no overlap with the employee's other shifts, no approved time off then); and after the exchange neither person has two overlapping shifts (the two traded shifts are left out of that check). A coworker may offer a swap even when the requested shift overlaps the very shift they give.
+- One answer per coworker per shift; a new answer replaces the old one. "Ignore" means no answer. Two answers (or an answer and taking it back) from the same coworker at the same moment take turns on the request's lock, and each reads the earlier answer with a locking read, so the second replaces the first instead of adding a second row (review of #193; tried on MySQL in `scripts/check_migrations.py`).
 
-**Answering**
-- Only the people asked may answer, only while answering is open (409 after), and each may change their answer until then. The answers:
-  - **accept:** the coworker would take the shift. Refused (409) if they already have a shift that overlaps it, or approved time off on that day (once time off exists).
-  - **swap:** the coworker names **one** of their own scheduled, upcoming shifts. It must not start before answering closes (the same notice as asking), the employee must be someone who could be assigned it, and after the exchange neither person may have two overlapping shifts (the two traded shifts are left out of that check). Otherwise 422 or 409.
-  - **decline.**
-- An answer is a promise to be checked, not a change: the schedule does not move until a reviewer approves.
-- **When the last person asked answers**, answering ends at once and the request goes to review.
-- The employee may **send it early** (`POST .../send`) with whatever answers have come in.
+**Who sees what** (threat I10)
+- A coworker sees only what they need to decide whether they can cover or swap: the employee, the days, the affected shifts, and **only their own answers**, never the others'. **Never the reason** for the time off (it may be medical or otherwise personal; review of #188): the field is left out of every coworker answer (the offerable list and `GET /{id}` seen as a coworker), not sent empty for the screen to hide.
+- The employee and the managers see the reason and **every offer**, by name: anyone whose `time_off.view` covers the employee, and the request's reviewer (while collecting a request has no reviewer yet, so "the reviewers" means the people who will review it).
+- A coworker may see a request they could work a shift of while it is collecting, and afterwards any request they answered. They never see the reviewers' decisions or who is still to decide.
+- On the offer endpoints, someone who could not work any of its shifts (and never answered) gets 404. On `GET /{id}`, anyone else in the company gets 403, as for any time-off request; everyone in another company gets 404. (Built in CV1: the design first said 404 for all of them; 403 keeps `GET /{id}` the same as for every other request.)
 
-**Reviewing**
-- **Who reviews:** the employee's direct managers who hold `coverage.review`; when none can (or the employee has no manager), the request moves up the reporting chain one level at a time, ending at the Owner, exactly as for time off. Anyone higher in the chain may also step in ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)). Reviewers are checked again at the moment they decide.
-- **One decision settles it.** A reviewer chooses one answer, so two approvals could pick different coworkers; the required number of approvals is therefore fixed at **1** for coverage and there is no disagreement step. The first decision settles the request; a second reviewer then gets 409. (0029's company setting for required approvals stays with time off; a coverage version is stretch.)
-- **What a reviewer needs:** `coverage.review` over the employee (a person permission: scope covers them, and the reviewer is above them), **and** `schedule.edit` covering every shift the decision changes: the requested shift, and for a swap the offered shift too. A reviewer who lacks either gets 403; someone higher up can decide instead.
-- **No self-dealing:** nobody reviews their own request, and nobody approves an answer they gave themselves (a manager who was asked as a coworker cannot choose their own answer; another reviewer can).
-- **Decisions are only possible in review**, never while asking, and never once the shift has started (409).
-- **The re-check at approval** ([0029](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0029-request-approval-routing.md)): in one transaction, with the people's rows and then the shifts locked in the same order as every schedule change ([schedules](schedules.md#states-and-rules)), the API checks again that the requested shift is still the employee's and has not started; for the chosen answer, that the coworker is still active and could still be assigned it, and is not double-booked or on time off; for a swap, that the offered shift is still the coworker's, scheduled, not started, and that the employee can still work it without overlaps. If anything fails, nothing changes and the answer is 409, with which part no longer holds, so the reviewer can choose another answer.
-- **On approval**, `approve()` takes these steps in this order, all in the one transaction of the re-check:
-  1. lock the rows and run the re-check (above);
-  2. mark this request `approved` and record the decision on its approval record. This clears `open_shift_id`, so the request is no longer open when its own shift changes in the next step, and the schedules hook that ends a changed shift's open request (below) leaves it alone;
-  3. change the shifts, through the schedules service's usual steps:
-     - an **accept**: the shift is assigned to the coworker;
-     - a **swap**: the shift is assigned to the coworker, and the offered shift to the employee. If the coworker had an open request of their own for the offered shift, the hook ends that one (`cancelled`, reason `shift_changed`), as for any shift change;
-     - **open the shift**: the shift becomes open (person cleared), as when a manager removes someone ([schedules](schedules.md));
-  4. write the audit entries: `coverage.approved`, each shift change's usual `shift.assigned` or `shift.opened` entry (with this request's ID in its details), and `coverage.cancelled` for any other request the swap ended.
+**The send-up minimum**
+- The number of days before the first day at which a collecting request goes up by itself.
+- **Software default 1** (the day before the time off starts).
+- A **company setting**, `time_off.offers_close_days`, may raise it (1 to 14; more is stricter: reviewers get longer), declared with the time-off settings.
+- A **department** may raise it further, never below the company's: `department_settings` holds one row per department and setting. The value used is the larger of the company's and the department's.
+- **The department's managers** are the active people holding `time_off.review` through an assignment for that department (not company-wide ones). One of them, or someone holding it company-wide (an owner or administrator), may change the department's value.
+- With **several managers**, the change is an approval request of kind `department_setting` that **every other one of the department's managers** must approve before it takes effect (one denial stops it; 7-day deadline, as role grants). With one manager (or none besides the person changing it), it takes effect at once. Audited as `settings.department_changed`.
+- The deadline of a request is fixed when it is asked (stored as `offers_close_at`), so a later change does not move it.
 
-  If any step fails, the whole transaction is rolled back: no request, approval record, shift, or audit entry changes.
-- **Denying** takes an optional comment (at most 500 characters, plain text) and changes no shift.
+**Deciding**
+- Who reviews, how decisions add up, escalation, and lapsing are exactly as for time off. **The reviewer whose approval settles the request chooses the offers** (the choices sent with that approval apply); the others only approve or decline the time off.
+- Choices are `{shift_id: offer_id}` for any of the request's shifts; a shift left out gets none. Sent as a list, `choices: [{shift_id, offer_id}]`, at most one per shift. A choice that is not a cover or swap offer made on this request for that shift (another request's, a declined answer, an unknown or another company's ID) is 422; an offer no longer open is 409. Every approval's choices are kept with the approval record (`payload.choices`, by reviewer), but only the settling one's are applied (built in CV2).
+- Choosing an offer needs `schedule.edit` covering every shift it changes (the requested shift and, for a swap, the offered one), both as it is now and as it will be: with the coworker on the requested shift, and with the employee on the swap's shift (#209, the rule assignments follow). A manager who covers the employee but not the coworker cannot hand the shift over. Otherwise 403 and nothing changes. Approving without choices needs only what time off needs.
+- **The re-check at approval** runs in the same transaction, after the time-off locks (lines, the employee, the request, its approval) and then the coworkers' rows and every shift involved, in ID order (the order of every schedule change): each chosen offer must still pass every rule above. If one fails, nothing changes, the answer is 409 naming the shift and the reason, and the reviewer can choose another offer or none. The chosen offers are read fresh and locked too, right after the time-off locks: an ordinary read could still show an answer the coworker has since changed or taken back, and the approval would move a shift on it (review of #193; tried on MySQL in `scripts/check_migrations.py`).
+- **The people's locks** come first, all together and sorted by ID: the employee and every coworker of the chosen offers, the same order as every schedule change, so an approval and a reassignment between the same people take turns instead of deadlocking (#209; tried on MySQL in `scripts/check_migrations.py`).
+- Applying: chosen covers and swaps reassign their shifts (`shift.assigned`, details: the request and the offer); every other shift of the employee on those days becomes open (`shift.opened`), as today.
 
-**Ending without a decision**
-- **Cancelled by the employee:** any time before a decision (`POST .../cancel`).
-- **Cancelled because the shift changed:** when a manager reassigns, opens, cancels, or changes the times of a shift with an open request, the schedules service ends that request (status `cancelled`, reason `shift_changed`) in the same transaction, so a request never outlives the shift it was about. Answers that offered a shift which has since changed are not ended; they simply fail the re-check if chosen.
-- **Expired:** a request still open when its shift starts is ended as `expired` (actor `system`). At least once an hour a background job records this; the API refuses decisions after the start either way.
-- Each of these also ends the request's shared approval record, in the same transaction (see **Approval record** under Backend).
-
-**Not checked here**
-- Weekly hour limits and rest time between shifts are stretch (workforce-ops-app/workforce-ops-backend#99, 0038); coverage checks only what every schedule change checks.
-
-**Company setting**
-
-| Setting | Declared in | Default | Companies may choose | Used by |
-|---|---|---|---|---|
-| `coverage.answers_close_hours` | `app/modules/coverage/settings.py` | 12 | 12 to 72 (more is stricter: reviewers get longer) | when answering closes, and how late a request can be made |
+**Endings**
+- Declined, cancelled, or declined as not reviewed: the offers stay as a record but are marked `dropped`; approved: `chosen` or `not_chosen`.
+- A coworker's offered shift that changes meanwhile simply fails the re-check if chosen.
 
 ### Backend
 
-**Endpoints** (under `/api`, [0026](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0026-api-conventions.md)):
+**Table: `time_off_requests`** gains:
 
-| Method and path | Permission | Does |
+| Column | Type | Notes |
 |---|---|---|
-| `GET /coverage-requests/eligible?shift_id=` | `coverage.request_self`, own shift | the coworkers who can be asked about this shift (for the form) |
-| `POST /coverage-requests` `{shift_id, note?, ask?: [user_id]}` | `coverage.request_self`, own shift | ask (201); leaving `ask` out asks everyone eligible |
-| `GET /coverage-requests?mine=true&cursor=&limit=` | `coverage.request_self` | your own requests, newest first, each with every answer |
-| `GET /coverage-requests/asked?cursor=&limit=` | `coverage.respond_self` | requests you were asked about, unanswered first, each with your own answer only |
-| `GET /coverage-requests/waiting?cursor=&limit=` | signed in | requests in review that still need your decision, soonest shift first |
-| `GET /coverage-requests/{id}` | the employee, someone asked, or a reviewer | one request; what it includes depends on who asks (below) |
-| `POST /coverage-requests/{id}/answer` `{answer, offered_shift_id?}` | `coverage.respond_self`, asked | answer or change your answer (`accept`, `swap`, `decline`) |
-| `POST /coverage-requests/{id}/send` | the employee | end answering early and send it to review |
-| `POST /coverage-requests/{id}/cancel` | `coverage.request_self`, the employee | cancel |
-| `POST /coverage-requests/{id}/approve` `{coworker_id}` or `{open_shift: true}` | `coverage.review` over the employee, `schedule.edit` on every shift that changes | approve (exactly one of the two fields) |
-| `POST /coverage-requests/{id}/deny` `{comment?}` | `coverage.review` over the employee | deny |
+| `offers_close_at` | `DATETIME(6)` | null: asked without offers. When a collecting request goes up by itself |
+| `sent_up_at` | `DATETIME(6)` | null while collecting (or asked without offers): when it went up, by the employee or by the deadline |
 
-**What each person sees** (threat I10): the **employee** sees their request with every person asked and their answer; a **coworker asked** sees the request (the shift, the employee, the note) and only their own answer, never the others'; a **reviewer** sees everything, including each offered shift. Anyone else gets 404, as if the request did not exist, and so does everyone in another company.
+and the status `collecting` (the `CHECK` lists it). The approval record is opened when the request is asked, as today; while the request is `collecting`, its reviewers are nobody (the time-off handler returns an empty set), so no one can decide it and it is on nobody's waiting list.
 
-A request in an answer: `id`, `shift` (as in the shift list), `requester` (`{id, display_name}`), `note`, `stage` (`asking`, `in_review`, or the final status: `approved`, `denied`, `cancelled`, `expired`), `answers_close_at`, `review_opens_at`, `answers` (`[{coworker: {id, display_name}, answer, offered_shift, answered_at}]`, filtered as above), and once decided `outcome` (`covered`, `swapped`, `opened`, or null), `decided_by`, `decided_at`, `comment`.
+**Table: `coverage_offers`** (company-owned)
 
-**Errors:** 401 not signed in, 403 not allowed, 404 not found (another company's, or not yours to see), 409 not possible in the current state (answering closed, already decided, shift started, double booking, the re-check failed, too many open requests), 422 invalid input (an unknown or ineligible person to ask, a swap shift that cannot be traded, both or neither of `coworker_id` and `open_shift`, any field the request may not set).
-
-**Table: `coverage_requests`** (feature table)
-
-| Column | Type | Rules |
+| Column | Type | Notes |
 |---|---|---|
-| `id` | `BINARY(16)` | primary key |
-| `company_id` | `BINARY(16)` | required |
-| `shift_id` | `BINARY(16)` | required; company-aware foreign key to `shifts` |
-| `requester_id` | `BINARY(16)` | required; company-aware foreign key to `users`; the shift's person when asked |
-| `note` | `VARCHAR(500)` | optional; plain text |
-| `status` | `VARCHAR(12)` | `open`, `approved`, `denied`, `cancelled`, or `expired` |
-| `open_shift_id` | `BINARY(16)` | the shift's ID while `open`, null otherwise; **unique**, so the database itself refuses a second open request for one shift (a unique index allows any number of nulls) |
-| `created_at` | `DATETIME(6)` | required; when it was asked (counts toward the 20-in-24-hours limit) |
-| `answers_close_at` | `DATETIME(6)` | required; the shift's start minus `coverage.answers_close_hours`, fixed when asked |
-| `review_opens_at` | `DATETIME(6)` | required; starts equal to `answers_close_at`, and moves to the moment the last answer comes in or the employee sends it early. The request is in review when it is `open` and this moment has passed |
-| `approval_request_id` | `BINARY(16)` | company-aware foreign key to `approval_requests` (kind `coverage`, `required_approvals` 1, `review_by` the shift's start); unique; added by CV2 and required from then on (below) |
-| `outcome` | `VARCHAR(8)` | `covered`, `swapped`, or `opened` once approved; null otherwise |
-| `chosen_coworker_id` | `BINARY(16)` | the coworker whose answer was chosen; null unless `covered` or `swapped` |
-| `end_reason` | `VARCHAR(16)` | for `cancelled`: `requester` or `shift_changed` |
-| `decided_by` | `BINARY(16)` | the reviewer; null for cancelled and expired requests |
-| `decided_at` | `DATETIME(6)` | null while open |
-| `comment` | `VARCHAR(500)` | optional, a reviewer's comment on a denial; plain text |
+| `id`, `company_id`, `created_at`, `updated_at` | | conventions |
+| `time_off_request_id` | `BINARY(16)` | the request (same company, composite FK) |
+| `shift_id` | `BINARY(16)` | the employee's shift the answer is about |
+| `offered_by` | `BINARY(16)` | the coworker |
+| `answer` | `VARCHAR(8)` | `cover`, `swap`, or `decline` |
+| `swap_shift_id` | `BINARY(16)` | for `swap` only: the coworker's shift given in exchange (`CHECK`) |
+| `status` | `VARCHAR(10)` | `offered`, `chosen`, `not_chosen`, `dropped` |
 
-`CHECK` constraints keep it consistent: `open_shift_id` equals `shift_id` exactly when `status = 'open'`; `outcome` is set exactly when `approved`; `chosen_coworker_id` is set exactly for `covered` and `swapped`. Indexes on (`company_id`, `requester_id`, `created_at`) and (`company_id`, `review_opens_at`) serve the lists and the limits.
+Unique `(company_id, time_off_request_id, shift_id, offered_by)`: one answer per coworker per shift.
 
-**Table: `coverage_answers`** (feature table): one row per person asked.
+**Table: `department_settings`** (company-owned): `department_id`, `key`, `value` (JSON), unique `(company_id, department_id, key)`; only for settings a module declares as per-department (`offers_close_days` for now), and only stricter than the company's.
 
-| Column | Type | Rules |
+**Endpoints** (all under `/api`)
+
+| Method and path | Who | What |
 |---|---|---|
-| `company_id` | `BINARY(16)` | required |
-| `request_id` | `BINARY(16)` | part of the primary key; company-aware foreign key to `coverage_requests` |
-| `coworker_id` | `BINARY(16)` | part of the primary key; company-aware foreign key to `users` |
-| `answer` | `VARCHAR(8)` | `pending` (not answered yet), `accept`, `swap`, or `decline` |
-| `offered_shift_id` | `BINARY(16)` | required for `swap`, null otherwise (`CHECK`); company-aware foreign key to `shifts` |
-| `answered_at` | `DATETIME(6)` | null while `pending` |
+| `POST /time-off-requests` `{first_day, last_day, reason?, offer_coverage?}` | `time_off.request_self` | ask; `offer_coverage: true` starts it collecting (409 if too late) |
+| `POST /time-off-requests/{id}/send-up` | the employee | collecting → waiting for review |
+| `GET /time-off-requests/offerable` | `coverage.respond_self` | the collecting requests (not your own) with a shift you could take, each with those shifts and your answers |
+| `PUT /time-off-requests/{id}/offers/{shift_id}` `{answer, swap_shift_id?}` | `coverage.respond_self` | answer for one shift (replaces your earlier answer) |
+| `DELETE /time-off-requests/{id}/offers/{shift_id}` | the coworker (`coverage.respond_self`) | take back your answer while collecting (204); the row is removed, and `coverage.withdrawn` keeps the record |
+| `GET /time-off-requests/{id}` | as today | also `offers`: every offer for the employee and the reviewers; only your own for a coworker |
+| `POST /time-off-requests/{id}/approve` `{comment?, choices?: [{shift_id, offer_id}]}` | as today | approve; the choices apply if this approval settles it |
+| `GET /departments/{id}/settings`, `PUT /departments/{id}/settings/offers_close_days` `{value}` | a manager of the department, or `time_off.review` company-wide | read; change (202 when other managers must confirm) |
 
-| From | To | How many | Enforced by | Meaning |
-|---|---|---|---|---|
-| shifts | coverage_requests | one to many, at most one open | company-aware foreign key; unique `open_shift_id` | A shift can be asked about again after a request ends, but only one request is open at a time |
-| users | coverage_requests | one to many | company-aware foreign key | A person can ask about many of their shifts |
-| coverage_requests | coverage_answers | one to many | company-aware foreign key | The people asked, and their answers |
-| users | coverage_answers | one to many | company-aware foreign key, primary key (one per request) | A person answers a request at most once (and may change it) |
-| shifts | coverage_answers | one to many | company-aware foreign key | A shift offered in exchange |
-| coverage_requests | approval_requests | one to one | company-aware foreign key, unique | The shared approval record holding the decision |
+**Permissions:** `coverage.respond_self` (self), given to every starting role; existing companies get it on their starting roles in the migration. `coverage.request_self` and `coverage.review` from the first design are not used: asking is part of time off, and reviewing is `time_off.review`.
 
-**Approval record:** kind `coverage`; `subject_user_id` the employee; `required_approvals` 1; `review_by` the shift's start; the payload names the request. It is created with the request, in the same transaction, so it is `pending` while the request is asking and while it is in review (the reviewers' list still shows only requests whose `review_opens_at` has passed). The single decision is stored in `approval_decisions` like any other, which keeps the shared "pending approvals" record of 0029: the reviewer routing, the reviewers' page, and the audit of decisions work the same way for time off and coverage.
-
-Every change of a coverage request's status changes its approval record in the same transaction:
-
-| Coverage request | Approval record | When |
-|---|---|---|
-| `open` (asking or in review) | `pending` | created with the request |
-| `approved` | `approved`, with the reviewer's decision in `approval_decisions` | a reviewer chooses an answer or opens the shift |
-| `denied` | `denied`, with the reviewer's decision | a reviewer denies |
-| `cancelled` (reason `requester` or `shift_changed`) | `cancelled`, no decision | the employee cancels, or the shift changed |
-| `expired` | `denied` with `not_reviewed` set, no decision | the shift started before anyone decided |
-
-`expired` maps the same way as time off's "not reviewed in time", so on the shared record both features count an undecided request as a decline nobody reviewed. Coverage keeps `expired` as its own status only so the employee's page can say what happened ("Expired: nobody decided before the shift").
-
-**Requests made before CV2:** CV1 comes before the shared approval tables, so its requests have no approval record. CV1 cannot approve, deny, or expire a request, so those requests are only `open` or `cancelled`. CV2's migration creates an approval record for each of them (`pending` or `cancelled`, `decided_at` copied, no decisions) and then makes `approval_request_id` required. From CV2 on, asking creates both rows together.
-
-**Scope resolver:** a request belongs to its shift, so to the shift's department and (through the employee) their teams, the same as the shift itself.
-
-**Background job:** at least once an hour, open requests whose shift has started are ended as `expired` and their approval records declined as not reviewed (actor `system`, one transaction per request). Moving a request into review needs no job (see `review_opens_at`).
-
-**Where the code goes:** `app/modules/coverage/`: `models.py`, `schemas.py`, `repository.py`, `service.py` (the rules; `authorize()` before anything is revealed or changed), `scope.py`, `router.py`, `permissions.py` (`coverage.request_self`, `coverage.respond_self`, `coverage.review`), `settings.py`. The schedules service calls one function of the coverage service when a shift changes (ending its open request, if it still has one), in the same transaction. Because `approve()` marks its own request `approved` before it changes any shift, the hook never ends the request being approved. The approval itself reuses the shift-assignment steps of the schedules service, so every rule and lock order of a schedule change applies.
-
-**Explain in the presentation** (course topics: **transactions** and **SQL JOINs**): `approve()` in `service.py`, where the re-check, both shift changes, and the audit entries are one transaction that either all happens or not at all; and the query behind `GET /coverage-requests/eligible`, which joins people to their home department and team memberships.
+**Code:** `app/modules/time_off/` keeps the request and gains `offers.py` (who may offer, the answers, the lists) and the choices in `review.py`'s `approve`; the department setting goes to `app/settings/` (per-department values) with its approval kind in `app/modules/time_off/approval.py`'s neighbour `department_setting.py`.
 
 ### Demo data
 
-The seed script adds, in each demo company, through the same service the application uses:
-- a request still **asking**, with one accept, one swap offer, and one person who has not answered;
-- a request **in review** with a swap and a decline, ready for the demo's manager to approve;
-- one **approved** swap (both shifts traded), one **denied** request, and one **expired** request, for history;
-- a note containing text that would run if shown unsafely (for example `<img src=x onerror=alert(1)>`), so the demo shows it as plain text.
+In each company, two Kitchen requests asked with offers, through the services as the people involved:
+- one still **collecting**: one coworker offered to cover a shift, another offered a swap with one of their own shifts, and a third declined, so the demo shows the offers, sending it up, and choosing one;
+- one already **sent up**, with one cover offer, waiting for its reviewer.
+Someone from another department gets no card (not eligible).
 
 ### Audit and security
 
-**Audit events:** `coverage.requested` (details: the shift, how many asked), `coverage.answered` (details: the answer and any offered shift's ID; changing an answer writes another), `coverage.sent_for_review` (details: `all_answered` or `sent_early`; reaching the closing time writes nothing, since no one acted), `coverage.approved` (details: the outcome and the chosen coworker), `coverage.denied`, `coverage.cancelled` (details: `requester` or `shift_changed`), `coverage.expired` (actor `system`), plus `shift.assigned` or `shift.opened` for each shift an approval changes (details: the request). Notes and comments are not copied into the audit log.
+**Audit events:** `time_off.requested` (details: `offer_coverage`), `coverage.offered` (details: shift, answer, any swap shift; a changed answer writes another), `coverage.withdrawn`, `time_off.sent_up` (details: `by` is `employee` or `deadline`; the deadline one has actor `system` and happens at the deadline itself), `time_off.approved` (details: the chosen offers), `shift.assigned` per reassigned shift (details: request and offer), `shift.opened` as today, `settings.department_changed`, and the approval events for `department_setting`.
 
-**Threats** ([threat model](../security/threat-model.md)): E12 (moving shifts without a manager's approval, or approving an outcome that benefits yourself), T8 (taking or offering a shift you could not be assigned, or one that is not yours), I10 (seeing other people's requests or answers), D7 (flooding coworkers with requests), E5 (approving your own request), E3 (reviewing someone you are not above), I1 and T3 (other companies), T2 (setting the status, outcome, or requester directly), T5 (notes and comments).
+**Threats** ([threat model](../security/threat-model.md)): E12 (moving shifts without approval, or a reviewer choosing their own offer), T8 (offering a shift you could not take, or one that is not yours), I10 (seeing other coworkers' answers), E5 (approving your own request), E3 (reviewing someone you are not above), I1 and T3 (other companies), T2 (setting status or choices directly), T5 (reasons and comments).
 
 **Security tests:**
-- Every endpoint, as a user of the other demo company, answers 404; asking or offering another company's person or shift answers 422 (as an unknown one).
-- Nobody can ask about a shift that is not theirs (403), or that is open, cancelled, started, or past the notice (409).
-- Asking someone who cannot work the shift answers 422, the same as asking someone who does not exist.
-- A person not asked cannot answer (404); a swap offering someone else's shift, or a shift the employee could not work, is refused.
-- Answers and approvals change no shift until approved; nobody can set the status, outcome, or requester through the body (422).
-- Nobody approves or denies their own request, even holding `coverage.review` (E5); a reviewer cannot choose their own answer.
-- A manager not above the employee cannot decide (403); one above the employee but without `schedule.edit` on the offered shift cannot approve that swap (403).
-- The re-check refuses an approval when the coworker was deactivated, got an overlapping shift, or the offered shift was reassigned in the meantime, and nothing changes (no shift and no audit entry).
-- A coworker asked sees only their own answer; a person neither asked nor reviewing gets 404 for the request.
-- A second open request for one shift is refused, also when two arrive at the same moment (the unique `open_shift_id`; tried on MySQL in `scripts/check_migrations.py`); an 11th open request is refused, also when two arrive at the same moment with 9 open (exactly 10 end up open, on MySQL); a 21st request in 24 hours is refused even when the earlier ones were cancelled.
-- A manager changing the shift ends its open request; a request undecided at the shift's start can no longer be decided.
-- Approving a request ends it `approved`, never `cancelled` by its own shift change. Approving a swap whose offered shift has its own open request ends that request as `cancelled` (`shift_changed`) in the same transaction, with its own audit entry.
-- Each final status leaves the approval record as in the table under Backend (an expired request: `denied` with `not_reviewed`); a failed re-check changes neither record.
+- Every new endpoint, as a user of the other demo company: 404; naming another company's shift: 422.
+- A coworker who could not be assigned the shift, has an overlapping shift, or is on time off then cannot offer to cover (409); a swap with someone else's shift, a shift in another department, one inside the employee's time off, or one the employee could not work, is refused.
+- The employee cannot offer on their own request; nobody can offer after it went up (409).
+- A coworker sees only their own answers; a person who could not take any of its shifts gets 404.
+- Nothing on the schedule changes before approval; choices sent with a non-settling approval do not apply; choosing without `schedule.edit` over the changed shifts, as they are or as they would be, is 403 and changes nothing.
+- A reviewer cannot choose their own offer (a reviewer who offered is refused that choice, E12).
+- The re-check refuses a chosen offer whose coworker was deactivated, got an overlapping shift or time off, or whose swap shift was reassigned, and nothing changes.
+- A collecting request is on nobody's waiting list and cannot be decided (403); after its deadline the first read sends it up. A list sends up the ones past their deadline before it filters by status, so the employee's own list filtered on "collecting" never shows one that should have gone up (review of #193).
+- A department minimum below the company's is refused (422); someone who is not one of the department's managers (nor company-wide) gets 403; with two managers, one alone cannot change it; one denial stops it.
 
 ### Slices
 
-Filed under tracker workforce-ops-app/.github#85 once this design merges: the backend slices as sub-issues of #121, the screens under workforce-ops-app/workforce-ops-frontend#66. Each is one pull request.
-
 | ID | Repository | Slice | Depends on |
 |---|---|---|---|
-| CV1 | backend | `coverage_requests` and `coverage_answers` (one migration), the permissions with the starting roles, the setting, the scope resolver; asking (with the eligible list), answering, sending early, cancelling, and the employee's and coworker's lists; the limits per person; the schedules hook that ends a request when its shift changes | this design |
-| CV2 | backend | reviewing: `approval_request_id` (one migration, which also gives CV1's requests their approval records), keeping the approval record in step with each status, the reviewers' list, approve and deny with the re-check and the shift changes, expiry, and the MySQL race for one open request per shift | CV1; the shared approval tables and reviewer routing (time off TO1 and TO2, #63 and #64) |
-| CV3 | backend | coverage requests in the demo data | CV2 |
-| CV4 | frontend | asking from My shifts (with the eligible list), the employee's requests, and answering requests you are asked about | CV1 |
-| CV5 | frontend | the reviewers' page: the answers side by side, approve, open the shift, deny | CV2, CV4 |
+| CV1 | backend | asking with offers, the collecting state and sending up (by the employee and at the deadline), `coverage_offers` with offering, changing, and withdrawing, the lists, `coverage.respond_self` with the starting roles, the company setting (one migration) | this design |
+| CV2 | backend | choosing offers at approval: the choices, the re-check, applying covers and swaps, the offer endings | CV1 |
+| CV3 | backend | the department minimum: `department_settings`, the endpoints, the `department_setting` approval kind (one migration) | CV1 |
+| CV4 | backend | demo data | CV2 |
+| CV5 | frontend | the checkbox and "Send to my manager" on My time off, the offers list there; the coworkers' card on the home screen and the offer form | CV1 |
+| CV6 | frontend | the reviewer's card: offers per shift, choose none or one, approve or decline | CV2, CV5 |
+| CV7 | frontend | the department minimum on the structure screen (with the waiting confirmation) | CV3 |
 
 ### Known limitations
-- No notifications: people see requests waiting for them when they open the application (notifications are stretch, 0038).
-- One decision settles a request; a company cannot require two approvals for coverage (stretch).
-- A swap trades exactly two shifts between two people; no chains of three or more, and no offering several shifts at once.
+- No notifications: coworkers see requests on their home screen (stretch, 0038).
+- Coverage starts only from a time-off request; asking coworkers to take a single shift without time off is stretch.
+- A swap trades exactly two shifts between two people.
 - No weekly hour or rest-time limits (stretch, workforce-ops-app/workforce-ops-backend#99).
-- An open shift itself cannot be requested by employees ("I'd like to pick this up"); managers assign open shifts on the schedule.
+- A request sent up has its offers locked; a coworker who changes their mind afterwards tells the manager in person.
