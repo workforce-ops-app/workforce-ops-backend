@@ -32,7 +32,7 @@ Fixes are tracked as AU2 in workforce-ops-app/.github#56. A finding enters the [
 | **A4** Sign-in uses a password only; ASVS Level 2 expects a second factor. Two-factor sign-in is a stretch item, so the deviation must be recorded | V6.3.3 | medium: a stolen password is enough to sign in | workforce-ops-app/.github#71 |
 | **A5** No time frames for fixing vulnerable dependencies, and no software bill of materials | V15.1.1, V15.1.2 | low: dependency checks run, but nothing says how fast a finding must be fixed | workforce-ops-app/.github#72 |
 | Sign-in has no lockouts or rate limits yet | V6.3.1, V2.4.1, V15.2.2 | high: passwords can be guessed without limit, and sign-in can be flooded | #50 (planned, Final demo milestone) |
-| Oversized passwords reach the slow password hash | V6.3.1, V15.2.2 | medium: large requests cost the server time and memory | #85 |
+| Oversized passwords reach the slow password hash | V6.3.1, V15.2.2 | medium: large requests cost the server time and memory | #85 (fixed since: every password field refuses more than 1024 characters before Argon2id; [security controls](security-controls.md)) |
 | The application's database user can change the schema and edit the audit log | V13.2.2, V16.4.2 | medium: a break-in through the application gets full control of the database | #43 (planned, Final demo milestone) |
 | Nothing verifies the audit log yet; changes are detectable but not detected | V16.4.2 | medium: tampering would go unnoticed until someone checks | #58 (planned, Final demo milestone) |
 
@@ -181,7 +181,7 @@ Each Level 1 and Level 2 requirement of the chapters in scope. The requirement c
 | V6.2.10 | 2 | No forced password rotation | Pass | None ([authentication](../architecture/authentication.md)) |
 | V6.2.11 | 2 | Context-specific words are refused | Pass | `test_passwords_built_from_names_are_refused` |
 | V6.2.12 | 2 | New passwords are checked against breached passwords | Pass | The NCSC list is built from breach data; an offline list, not a live breach service |
-| V6.3.1 | 1 | Password guessing and credential stuffing are stopped | **Fail** | Not yet: lockouts and rate limits are designed but not built (#50); oversized passwords still reach Argon2id (#85) |
+| V6.3.1 | 1 | Password guessing and credential stuffing are stopped | **Fail** | Not yet: lockouts and rate limits are designed but not built (#50); oversized passwords reached Argon2id then (#85, fixed since) |
 | V6.3.2 | 1 | No default accounts | Pass | None; demo accounts exist only after the demo seed, which refuses production |
 | V6.3.3 | 2 | Multi-factor authentication (or a combination of factors) | **Fail** | Password only; two-factor sign-in is a stretch item ([0023](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0023-feature-tiers-and-audit-schedule.md)). A4: workforce-ops-app/.github#71 |
 | V6.3.4 | 2 | No undocumented sign-in pathways | Pass | Only sign-in may read across companies; `tests/security/test_sign_in.py::test_only_sign_in_uses_the_cross_company_read` |
