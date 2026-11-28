@@ -47,6 +47,9 @@ class SettingDef:
     stricter: Stricter
     description: str
     module: str = ""
+    # Whether a department may make it stricter still, for itself (department_settings,
+    # docs/features/coverage.md). The value in force there is the stricter of the two.
+    per_department: bool = False
 
     @property
     def name(self) -> str:
