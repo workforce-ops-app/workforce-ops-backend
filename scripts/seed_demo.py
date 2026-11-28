@@ -50,7 +50,11 @@ state, asked for, decided, and cancelled through the time-off service as the peo
 plan, so each passes the same checks as on the website (only a current reviewer decides)
 and approving one opens the shifts on its days. They wait for the shifts, and are added
 once. One is asked for tomorrow and never reviewed, so it reads as declined as not
-reviewed from tomorrow on: another reason to seed a few days before a demo.
+reviewed from tomorrow on: another reason to seed a few days before a demo. Then come two
+Kitchen requests asked with "Offer Shift Swap / Coverage" (DEMO_COVERAGE below,
+docs/features/coverage.md): one still collecting, with a cover, a swap, and a decline
+from coworkers, and one already sent up with a cover offer, so the demo shows offering,
+sending up, and choosing an offer.
 
 Announcements (AN3) come after the shifts: DEMO_ANNOUNCEMENTS below, posted, read, corrected,
 and archived through the announcements service as the people in the plan, so each passes
@@ -73,6 +77,7 @@ from __future__ import annotations
 
 import sys
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
@@ -106,10 +111,11 @@ from app.modules.schedules.schemas import ShiftCreate
 from app.modules.schedules.service import create_shift
 from app.modules.security.models import PlatformSecurityEvent, SecurityEvent
 from app.modules.security.writer import PER_MINUTE, Event, EventWriter
+from app.modules.time_off import offers as coverage
 from app.modules.time_off import service as time_off_service
 from app.modules.time_off.days import zone_of
 from app.modules.time_off.models import TimeOffRequest
-from app.modules.time_off.schemas import TimeOffCreate
+from app.modules.time_off.schemas import OfferBody, TimeOffCreate
 from app.settings.service import password_min_length
 from app.tenancy.context import set_company
 
@@ -438,6 +444,109 @@ DEMO_TIME_OFF = (
     # as not reviewed in time, which is why a demo database is seeded a few days ahead.
     TimeOffPlan(FRONT_B, starts_in=1, days=1, reason="Doctor's appointment"),
 )
+
+
+@dataclass(frozen=True)
+class CoveragePlan:
+    """One demo time-off request asked with offers (docs/features/coverage.md): who asks,
+    for which days, and how coworkers answer."""
+
+    employee: int  # place in the company's list of people (as in REPORTING_LINES)
+    starts_in: int  # days from today; at least 2, so offers are still open
+    days: int
+    reason: str | None
+    # (coworker, "cover" | "swap" | "decline"). The shift each answer is about, and for a
+    # swap the coworker's shift given in exchange, are the first that the application
+    # accepts (offers.offer_problem), since which shifts fall on those days depends on the
+    # weekday the script runs. An answer no shift allows is left out.
+    answers: tuple[tuple[int, str], ...] = ()
+    send_up: bool = False  # the employee sends it up to the managers afterwards
+
+
+# Both in the Kitchen, the same in both companies. Cara's request is still collecting:
+# Ben offers to cover, the Kitchen manager offers a swap, and the crew lead declines; her
+# reviewer (the crew lead) can choose Ben's cover once she sends it up. Ben's request
+# already went up with Cara's cover offer, waiting for his managers. Five and three days:
+# Cara works four days a week and Ben four, so the days always hold one of their shifts.
+# Neither overlaps their requests in DEMO_TIME_OFF.
+DEMO_COVERAGE = (
+    CoveragePlan(
+        KITCHEN_B,
+        starts_in=2,
+        days=5,
+        reason="Family trip",
+        answers=((KITCHEN_A, "cover"), (KITCHEN_MANAGER, "swap"), (CREW_LEAD, "decline")),
+    ),
+    CoveragePlan(
+        KITCHEN_A,
+        starts_in=11,
+        days=3,
+        reason="Camping trip",
+        answers=((KITCHEN_B, "cover"),),
+        send_up=True,
+    ),
+)
+
+
+def _first_allowed_answer(
+    session: Session, request: TimeOffRequest, coworker: User, answer: str
+) -> tuple[Shift, Shift | None] | None:
+    """The first of the request's shifts (and, for a swap, the first of the coworker's own
+    shifts to give) that the application would accept for this answer, or None."""
+    shifts = sorted(coverage.takeable(session, coworker, request), key=lambda s: s.starts_at)
+    gives: list[Shift | None] = [None]
+    if answer == "swap":
+        gives = list(
+            session.scalars(
+                select(Shift)
+                .where(Shift.employee_id == coworker.id, Shift.status == "scheduled")
+                .order_by(Shift.starts_at)
+            )
+        )
+    for shift in shifts:
+        for given in gives:
+            if coverage.offer_problem(session, request, shift, coworker, answer, given) is None:
+                return shift, given
+    return None
+
+
+def _seed_coverage(session: Session, person: Callable[[int], User], company: str) -> None:
+    """Ask, answer, and send up DEMO_COVERAGE through the services, as the people involved."""
+    for item in DEMO_COVERAGE:
+        employee = person(item.employee)
+        today = datetime.now(zone_of(session, employee)).date()
+        first = today + timedelta(days=item.starts_in)
+        body = TimeOffCreate(
+            first_day=first,
+            last_day=first + timedelta(days=item.days - 1),
+            reason=item.reason,
+            offer_coverage=True,
+        )
+        step = f"asking with offers for {body.first_day} to {body.last_day}"
+        try:
+            asked = time_off_service.ask(session, employee, body)
+            for coworker_index, answer in item.answers:
+                coworker = person(coworker_index)
+                found = _first_allowed_answer(session, asked, coworker, answer)
+                if found is None:
+                    continue  # no shift on these days allows it this week
+                shift, given = found
+                step = f"{answer} by {coworker.display_name}"
+                coverage.answer(
+                    session,
+                    coworker,
+                    asked.id,
+                    shift.id,
+                    OfferBody(answer=answer, swap_shift_id=given.id if given else None),
+                )
+            if item.send_up:
+                step = "sending it up"
+                time_off_service.send_up(session, employee, asked.id)
+        except HTTPException as refused:
+            raise SeedRefused(
+                f"{company}: time off with offers for {employee.display_name}, {step}: "
+                f"{refused.status_code} {refused.detail}"
+            ) from refused
 
 
 # --- Demo security events (DT6) -------------------------------------------------------
@@ -1069,7 +1178,10 @@ def seed_time_off(engine: Engine, plan: CompanyPlan) -> int:
                     f"{plan.name}: time off for {employee.display_name}, {step}: "
                     f"{refused.status_code} {refused.detail}"
                 ) from refused
-        return len(DEMO_TIME_OFF)
+        # Then the requests asked with offers, after the others (so the swap checks see
+        # Cara's approved days off), in the same transaction.
+        _seed_coverage(session, person, plan.name)
+        return len(DEMO_TIME_OFF) + len(DEMO_COVERAGE)
 
 
 def _planner(item: ShiftPlan) -> int:

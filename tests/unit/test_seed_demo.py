@@ -92,7 +92,7 @@ NO_EVENTS = "0 security events added"
 NEWS = f"{len(seed_demo.DEMO_ANNOUNCEMENTS)} announcements added"
 NO_NEWS = "0 announcements added"
 # The demo time-off requests (SD2), added once the company has its shifts.
-TIME_OFF = f"{len(seed_demo.DEMO_TIME_OFF)} time-off requests added"
+TIME_OFF = f"{len(seed_demo.DEMO_TIME_OFF) + len(seed_demo.DEMO_COVERAGE)} time-off requests added"
 TIME_OFF_WAITS = "time off waits for shifts"
 # The platform's line: its events of people not signed in, plus one drop count.
 PLATFORM_EVENTS = (
@@ -1082,9 +1082,11 @@ def test_each_company_gets_a_time_off_request_in_every_state(
         assert statuses == {
             # Denied (day 4), then waiting (day 10).
             name(seed_demo.FRONT_A): ["denied", "pending"],
-            # Moved up: the crew lead denied, the Kitchen manager approved.
-            name(seed_demo.KITCHEN_A): ["escalated"],
-            name(seed_demo.KITCHEN_B): ["approved"],
+            # Moved up: the crew lead denied, the Kitchen manager approved. Then (day 11)
+            # the one asked with offers, already sent up (DEMO_COVERAGE).
+            name(seed_demo.KITCHEN_A): ["escalated", "pending"],
+            # Asked with offers and still collecting (day 2), then approved (day 8).
+            name(seed_demo.KITCHEN_B): ["collecting", "approved"],
             # Tomorrow's, not reviewed yet, then the cancelled one (day 5).
             name(seed_demo.FRONT_B): ["pending", "cancelled"],
         }
@@ -1097,7 +1099,7 @@ def test_approving_the_demo_request_opens_the_shifts_on_its_days(
     for plan in seed_demo.DEMO_COMPANIES:
         company_id = company_ids(engine)[plan.name]
         cara = plan.people[seed_demo.KITCHEN_B].name
-        approved = requests_of(engine, company_id)[cara][0]
+        approved = next(r for r in requests_of(engine, company_id)[cara] if r.status == "approved")
         with Session(engine) as session:
             set_company(session, company_id)
             cara_id = session.scalars(select(User.id).where(User.display_name == cara)).one()
@@ -1172,7 +1174,7 @@ def test_each_time_off_step_is_audited_under_the_person_who_took_it(
 
     # Asked by each employee, approved by the crew lead, cancelled by Ella herself.
     assert sorted(steps["time_off.requested"]) == sorted(
-        person(item.employee) for item in seed_demo.DEMO_TIME_OFF
+        person(item.employee) for item in (*seed_demo.DEMO_TIME_OFF, *seed_demo.DEMO_COVERAGE)
     )
     assert steps["time_off.approved"] == [person(seed_demo.CREW_LEAD)]
     assert steps["time_off.cancelled"] == [person(seed_demo.FRONT_B)]
@@ -1192,7 +1194,9 @@ def test_time_off_waits_for_the_shifts_and_is_added_once(
     lines = seed_demo.seed(engine, DEMO_PASSWORD, real_clock)
     assert all("; 0 time-off requests added;" in line for line in lines[:2])
     for company_id in company_ids(engine).values():
-        assert count(engine, company_id, TimeOffRequest) == len(seed_demo.DEMO_TIME_OFF)
+        assert count(engine, company_id, TimeOffRequest) == len(seed_demo.DEMO_TIME_OFF) + len(
+            seed_demo.DEMO_COVERAGE
+        )
 
 
 def test_a_time_off_step_the_application_refuses_stops_the_seed_and_keeps_none(
@@ -1211,3 +1215,48 @@ def test_a_time_off_step_the_application_refuses_stops_the_seed_and_keeps_none(
         seed_demo.seed(engine, DEMO_PASSWORD, real_clock)
     for company_id in company_ids(engine).values():
         assert count(engine, company_id, TimeOffRequest) == 0
+
+
+def test_the_coverage_demo_has_offers_from_kitchen_coworkers_only(
+    engine: Engine, real_clock: datetime
+) -> None:
+    """DEMO_COVERAGE: Cara's request collects a cover, a swap, and a decline; Ben's went up
+    with a cover. Every offer is by a Kitchen coworker, through the offers service, and
+    nothing on the schedule moved (choosing happens at approval)."""
+    seed_demo.seed(engine, DEMO_PASSWORD, real_clock)
+    for plan in seed_demo.DEMO_COMPANIES:
+        company_id = company_ids(engine)[plan.name]
+        found = requests_of(engine, company_id)
+        cara = plan.people[seed_demo.KITCHEN_B].name
+        ben = plan.people[seed_demo.KITCHEN_A].name
+        collecting = next(r for r in found[cara] if r.status == "collecting")
+        sent_up = next(r for r in found[ben] if r.offers_close_at is not None)
+        assert sent_up.status == "pending" and sent_up.sent_up_at is not None
+        with Session(engine) as session:
+            set_company(session, company_id)
+            names = {u.id: u.display_name for u in session.scalars(select(User))}
+            homes = {u.id: u.department_id for u in session.scalars(select(User))}
+            kitchen = session.scalars(
+                select(Department.id).where(Department.name == "Kitchen")
+            ).one()
+            offers = list(session.scalars(select(CoverageOffer)))
+            moved = session.scalars(
+                select(AuditEvent).where(
+                    AuditEvent.action == "shift.assigned", AuditEvent.company_id == company_id
+                )
+            ).all()
+        answers = {
+            (names[o.offered_by], o.answer)
+            for o in offers
+            if o.time_off_request_id == collecting.id
+        }
+        # The decline always fits; the cover and swap fit every week the plan allows.
+        assert (plan.people[seed_demo.CREW_LEAD].name, "decline") in answers
+        assert (ben, "cover") in answers
+        assert (plan.people[seed_demo.KITCHEN_MANAGER].name, "swap") in answers
+        assert {
+            (names[o.offered_by], o.answer) for o in offers if o.time_off_request_id == sent_up.id
+        } == {(cara, "cover")}
+        assert all(homes[o.offered_by] == kitchen for o in offers)
+        assert all(o.status == "offered" for o in offers)
+        assert not [e for e in moved if (e.details or {}).get("offer_id")]
