@@ -48,3 +48,19 @@ def test_configure_logging_sets_level_and_json_output() -> None:
     root = logging.getLogger()
     assert root.level == logging.WARNING
     assert isinstance(root.handlers[0].formatter, JsonFormatter)
+
+
+def test_a_value_with_line_breaks_stays_inside_one_log_line() -> None:
+    """Threat R3 (#106): a value that carries a line break and a fake log entry after it,
+    such as a forged copy of the audit signatures, is a field: the JSON formatter escapes
+    it, so the log still has one line, and reading it back gives the value unchanged."""
+    forged = 'Ben\n{"level": "INFO", "message": "audit heads", "seq": 1}\r\n%s{0.__class__}'
+    record = make_record()
+    record.fields = {"display_name": forged}
+
+    line = JsonFormatter().format(record)
+
+    assert "\n" not in line and "\r" not in line
+    entry = json.loads(line)
+    assert entry["display_name"] == forged
+    assert entry["message"] == "shift created"  # the message is the code's, unchanged

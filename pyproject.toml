@@ -58,6 +58,7 @@ select = [
     "UP",      # pyupgrade: modern Python syntax
     "SIM",     # simpler equivalents
     "S",       # bandit: security problems (SQL built from strings, hardcoded secrets, ...)
+    "G",       # logging format: messages are fixed text, values go in extra fields (#106)
 ]
 
 [tool.ruff.lint.per-file-ignores]
