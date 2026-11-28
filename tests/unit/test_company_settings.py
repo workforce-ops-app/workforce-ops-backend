@@ -64,6 +64,9 @@ def test_an_unknown_setting_is_a_bug() -> None:
         (SettingDef("Bad-Name", 1, 2, Stricter.HIGHER, "", "m"), "lowercase"),
         (SettingDef("x", 1, 2, Stricter.HIGHER, "", "m" * 51), "up to 50"),
         (SettingDef("x" * 81, 1, 2, Stricter.HIGHER, "", "m"), "up to 80"),
+        # Past the range every request body is limited to (threat T6, #105).
+        (SettingDef("x", 1, 1001, Stricter.HIGHER, "", "m"), "outside 0 to 1000"),
+        (SettingDef("x", 0, -1, Stricter.LOWER, "", "m"), "outside 0 to 1000"),
     ],
 )
 def test_declarations_must_follow_the_rules(declaration: SettingDef, problem: str) -> None:
