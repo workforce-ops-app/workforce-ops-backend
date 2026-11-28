@@ -40,7 +40,7 @@ from sqlalchemy.orm import Session, aliased
 from app.audit import Actor, record
 from app.authz.models import ReportingLine
 from app.db.base import utcnow
-from app.modules.org.models import Company
+from app.modules.org.models import CompanyLock
 from app.tenancy.context import get_company
 
 
@@ -141,23 +141,33 @@ def people_below(db: Session, user_id: uuid.UUID) -> set[uuid.UUID]:
 def lock_reporting_lines(db: Session) -> None:
     """Make changes to this company's reporting lines take turns, until the caller commits.
 
-    Locks the company's own row (SELECT ... FOR UPDATE). Every function that adds or ends a
-    line calls this first, so a second change in the same company waits here until the
-    first one commits or rolls back. Without it, two requests at the same moment could
-    both pass the checks below and together add a duplicate or a loop: "A reports to B"
-    and "B reports to A" each look fine on their own. Other companies are not blocked.
+    Locks the company's row in company_locks (SELECT ... FOR UPDATE). Every function that
+    adds or ends a line calls this first, so a second change in the same company waits
+    here until the first one commits or rolls back. Without it, two requests at the same
+    moment could both pass the checks below and together add a duplicate or a loop: "A
+    reports to B" and "B reports to A" each look fine on their own. Other companies are
+    not blocked.
 
     Take this lock before writing any audit entry in the same transaction: the audit log
     locks its chain head too, and two transactions taking the two locks in opposite orders
     would wait for each other until MySQL gives up on one of them.
+
+    Why a row of its own, not the company's row in companies (#198): every audit entry
+    refers to the companies row by a foreign key, and MySQL takes a shared lock on that row
+    for each insert that refers to it. With the lock on the companies row, a request that
+    held a person's row and was writing its audit entry waited for the company's lock,
+    while the holder of the company's lock waited for that person: a deadlock, ended by
+    MySQL with an error (a 500). Nothing refers to the company_locks row, so writes never
+    wait for it; only other callers of this function do.
     """
     company_id = get_company(db)
     # A loop is a property of one company's whole chain, so there must be one company.
     if company_id is None:
         raise RuntimeError("reporting lines are changed in a session for their company")
     # The company filter lets this session see only its own company's row, so this can
-    # only ever lock that one row.
-    db.get(Company, company_id, with_for_update=True)
+    # only ever lock that one row. Every company has one (made with the company).
+    if db.get(CompanyLock, company_id, with_for_update=True) is None:
+        raise RuntimeError("the company has no lock row: run the migrations")
 
 
 def _current_line_exists(db: Session, manager_id: uuid.UUID, employee_id: uuid.UUID) -> bool:

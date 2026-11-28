@@ -38,6 +38,7 @@ from app.auth.limits import is_locked, register_failure, register_success
 from app.auth.models import UserSession
 from app.auth.passwords import check_password, hash_password, needs_rehash, verify_password
 from app.auth.sessions import Current, SignedIn, new_token
+from app.core.request_context import REAUTH_FAILED, REAUTH_LOCKED, REAUTH_REQUIRED
 from app.db.base import utcnow
 from app.db.types import new_id
 from app.modules.org.models import Company, User
@@ -58,6 +59,7 @@ class ReauthRequired(HTTPException):
     """
 
     problem_type = "reauth-required"
+    refusal_kind = REAUTH_REQUIRED  # the refusal log line's kind (#92)
 
     def __init__(self) -> None:
         super().__init__(status_code=403, detail="Enter your password again to do this.")
@@ -66,6 +68,8 @@ class ReauthRequired(HTTPException):
 class WrongPassword(HTTPException):
     """403: the password sent is not the person's password."""
 
+    refusal_kind = REAUTH_FAILED  # the refusal log line's kind (#92)
+
     def __init__(self) -> None:
         super().__init__(status_code=403, detail=WRONG_PASSWORD)
 
@@ -73,6 +77,8 @@ class WrongPassword(HTTPException):
 class Locked(HTTPException):
     """403: too many wrong passwords; the account is locked for now. The person is
     signed in, so saying so reveals nothing they do not know."""
+
+    refusal_kind = REAUTH_LOCKED  # the refusal log line's kind (#92)
 
     def __init__(self) -> None:
         super().__init__(

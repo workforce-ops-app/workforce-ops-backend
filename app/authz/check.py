@@ -57,21 +57,32 @@ from app.authz.scope import (
     person_scope,
     resolve,
 )
+from app.core.request_context import AUTHZ_DENIED, TENANCY_NOT_FOUND
 from app.modules.org.models import Department, Team, User
 
 
 class Forbidden(HTTPException):
-    """403: the user may not do this. One message, whatever the reason."""
+    """403: the user may not do this. One message, whatever the reason.
 
-    def __init__(self) -> None:
+    `permission` is the code authorize() refused, for the refusal log line only (#92,
+    app/core/request_context.py); it is never part of the answer."""
+
+    refusal_kind = AUTHZ_DENIED
+
+    def __init__(self, permission: str | None = None) -> None:
         super().__init__(status_code=403, detail="You do not have permission to do this.")
+        self.permission = permission
 
 
 class NotFound(HTTPException):
-    """404: the target is not in the user's company, so for them it does not exist."""
+    """404: the target is not in the user's company, so for them it does not exist. The
+    log line says so (tenancy.not_found); the answer never does."""
 
-    def __init__(self) -> None:
+    refusal_kind = TENANCY_NOT_FOUND
+
+    def __init__(self, permission: str | None = None) -> None:
         super().__init__(status_code=404, detail="Not found.")
+        self.permission = permission
 
 
 def _maybe_fresh[Q: GenerativeSelect](query: Q, fresh: bool) -> Q:
@@ -170,6 +181,72 @@ def effective_permissions(db: Session, user: User, *, fresh: bool = False) -> li
     return sorted({row[0] for row in rows})
 
 
+def department_permissions(db: Session, user: User) -> dict[uuid.UUID, set[str]]:
+    """For each active department where the user holds any role, the permissions they hold
+    there (the department picker and its screens; found in review: a Kitchen manager saw
+    every department in the picker, and the manager buttons followed her into them).
+
+    Where an assignment counts, the same rule as the role groups on the department view
+    (roles_of, docs/features/schedules.md):
+    - company-wide: every active department;
+    - a department: that one;
+    - a team: the team's department;
+    - one person: that person's home department.
+
+    A team or one-person grant does not cover the whole department (authorize() still
+    decides each record); listing it here only says the person has something to do
+    there, so the screen offers the matching tools and the API checks the rest.
+    """
+    if user.deactivated_at is not None:
+        return {}
+    # Step 1: the company's active departments (the company filter keeps it to this one).
+    active = set(db.scalars(select(Department.id).where(Department.archived_at.is_(None))))
+    # Step 2: the Owner holds everything, everywhere.
+    if is_owner(db, user):
+        everything = set(all_permissions())
+        return {department: set(everything) for department in active}
+    # Step 3: every active assignment with the permission codes its role grants, and where
+    # it applies. Archived roles, departments, and teams grant nothing (_active_assignments).
+    rows = db.execute(
+        select(
+            RolePermission.permission_code,
+            RoleAssignment.scope_type,
+            RoleAssignment.department_id,
+            Team.department_id,
+            RoleAssignment.employee_id,
+            Role.id,
+            Department.id,
+        )
+        .join(Role, Role.id == RolePermission.role_id)
+        .join(RoleAssignment, RoleAssignment.role_id == Role.id)
+        .outerjoin(Department, Department.id == RoleAssignment.department_id)
+        .outerjoin(Team, Team.id == RoleAssignment.team_id)
+        .where(*_active_assignments(user))
+    ).all()
+    # Step 4: a one-person assignment counts in that person's home department, so look
+    # those homes up in one query.
+    people = {row[4] for row in rows if row[1] == "employee" and row[4] is not None}
+    homes = dict(db.execute(select(User.id, User.department_id).where(User.id.in_(people))).all())
+    # Step 5: add each code to every department its assignment counts in.
+    found: dict[uuid.UUID, set[str]] = {}
+    for code, scope_type, department_id, team_department, employee_id, _, _ in rows:
+        places: set[uuid.UUID | None]
+        if scope_type == "company":
+            places = set(active)
+        elif scope_type == "department":
+            places = {department_id}
+        elif scope_type == "team":
+            places = {team_department}
+        elif scope_type == "employee" and employee_id is not None:
+            places = {homes.get(employee_id)}
+        else:
+            places = set()  # an unknown scope type grants nothing
+        for place in places:
+            if place is not None and place in active:
+                found.setdefault(place, set()).add(code)
+    return found
+
+
 def is_owner(db: Session, user: User, *, fresh: bool = False) -> bool:
     """Whether the user holds the (active) Owner role for the whole company.
     fresh=True reads it with a locking read (top of this file)."""
@@ -247,35 +324,35 @@ def authorize(
 
     # 1. Another company's target does not exist for this user.
     if target is not None and getattr(target, "company_id", user.company_id) != user.company_id:
-        raise NotFound()
+        raise NotFound(code)
 
     # 2 and 3. The assignments that grant it (none for deactivated people or archived roles).
     found = grants(db, user, code, fresh=fresh)
     if not found:
-        raise Forbidden()
+        raise Forbidden(code)
 
     # 4. By kind.
     if permission.kind is Kind.SELF:
         if target is not None and _owner_of(db, target) != user.id:
-            raise Forbidden()
+            raise Forbidden(code)
         return
 
     if permission.kind is Kind.COMPANY:
         if not any(grant.scope_type == "company" for grant in found):
-            raise Forbidden()
+            raise Forbidden(code)
         return
 
     if permission.kind is Kind.RECORD:
         if target is not None:
             scope = resolve(db, target)
             if not any(covers(grant, scope) for grant in found):
-                raise Forbidden()
+                raise Forbidden(code)
         return
 
     # Person: someone else, in scope, and the user is above them.
     if target is not None:
         if not isinstance(target, User) or target.id == user.id:
-            raise Forbidden()
+            raise Forbidden(code)
         if fresh:
             # The person as now committed: they may have moved department or team while
             # this request waited. The caller's copy is updated too (FOR SHARE).
@@ -284,9 +361,9 @@ def authorize(
         else:
             scope = resolve(db, target)
         if not any(covers(grant, scope) for grant in found):
-            raise Forbidden()
+            raise Forbidden(code)
         if not is_above(db, user, target, fresh=fresh):
-            raise Forbidden()
+            raise Forbidden(code)
 
 
 def covers_department(db: Session, user: User, code: str, department_id: uuid.UUID) -> bool:

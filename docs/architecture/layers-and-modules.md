@@ -11,7 +11,7 @@ Decisions: [0004 feature modules](https://github.com/workforce-ops-app/.github/b
 ```
 app/
 ├── main.py          create_app(): builds the app, registers error handlers, discovers modules
-├── core/            config.py (settings), logging.py (JSON logs), errors.py (problem details)
+├── core/            config.py (settings), logging.py (JSON logs), errors.py (problem details), request_context.py (request ID and refusal lines)
 ├── db/              session.py (engine, one session per request), base.py (base model), types.py (IDs)
 ├── auth/            sign-in, sessions, CSRF, password re-entry (Phase 2)
 ├── authz/           permissions, scopes, reporting chain, authorize() (Phase 2)

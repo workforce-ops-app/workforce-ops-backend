@@ -81,6 +81,14 @@ APP_RIGHTS: dict[str, frozenset[str]] = {
     # Time-off requests (app/modules/time_off/): added when asked, then changed in place as
     # they are decided, cancelled, or lapse (UPDATE). Never removed: they are history.
     "time_off_requests": frozenset({"SELECT", "INSERT", "UPDATE"}),
+    # The company's lock (#198, chain.lock_reporting_lines): added with the company (INSERT)
+    # and locked with SELECT ... FOR UPDATE, which MySQL allows only with UPDATE as well.
+    # Never changed or removed, so no DELETE.
+    "company_locks": frozenset({"SELECT", "INSERT", "UPDATE"}),
+    # Coworkers' offers on a request (docs/features/coverage.md): added when offered,
+    # changed in place when the answer changes or the request ends (UPDATE), and removed
+    # when a coworker takes their answer back (DELETE; the audit log keeps the record).
+    "coverage_offers": DATA,
     # Announcements (docs/features/announcements.md): posted (INSERT), corrected and
     # archived (UPDATE; also needed to lock a row with SELECT ... FOR UPDATE while it
     # changes). Archived, never deleted (decision 0020), so no DELETE.

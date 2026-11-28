@@ -17,7 +17,7 @@ from sqlalchemy import ColumnElement, and_, or_, select
 from sqlalchemy.orm import Session, aliased
 
 from app.authz.models import Role, RoleAssignment
-from app.modules.org.models import Company, Department, Team, User
+from app.modules.org.models import Company, Department, Team, TeamMember, User
 from app.modules.schedules.models import Shift
 
 
@@ -51,8 +51,11 @@ def has_overlap(
     starts_at: datetime,
     ends_at: datetime,
     ignore: uuid.UUID | None,
+    also_ignore: uuid.UUID | None = None,
 ) -> bool:
     """Whether the person already has a (not cancelled) shift overlapping this time.
+    `ignore` (and `also_ignore`) leave shifts out: the one being changed, or the two
+    shifts of a swap (coverage.md), which trade places and so never clash with each other.
 
     Two time ranges overlap when each starts before the other ends.
 
@@ -76,12 +79,96 @@ def has_overlap(
         Shift.starts_at < ends_at,
         Shift.ends_at > starts_at,
     ]
-    if ignore is not None:
-        conditions.append(Shift.id != ignore)
+    for left_out in (ignore, also_ignore):
+        if left_out is not None:
+            conditions.append(Shift.id != left_out)
     # read=True makes it FOR SHARE: other readers may share the lock, but nobody can
     # change these rows until this transaction ends.
     found = select(Shift.id).where(*conditions).limit(1).with_for_update(read=True)
     return db.scalar(found) is not None
+
+
+def assignable(db: Session, person: User | None, department_id: uuid.UUID) -> bool:
+    """Whether the person could be given a shift in this department (schedules.md, states
+    and rules): active, set up (not just "invited"), and the department is their home or
+    they are on an active team in it. An archived team keeps its member list for history
+    (organization.md), but being listed on it no longer makes anyone eligible.
+
+    Shared by assigning (service.py) and by coworkers' offers (app/modules/time_off/
+    offers.py), so the two can never disagree about who may work a shift.
+    """
+    if person is None or person.deactivated_at is not None or person.password_hash is None:
+        return False
+    if person.department_id == department_id:
+        return True
+    on_team = db.execute(
+        select(TeamMember.user_id, Team.id)
+        .join(Team, Team.id == TeamMember.team_id)
+        .where(
+            TeamMember.user_id == person.id,
+            Team.department_id == department_id,
+            Team.archived_at.is_(None),
+        )
+        .limit(1)
+    ).first()
+    return on_team is not None
+
+
+def on_time_off(db: Session, person: User, starts_at: datetime, ends_at: datetime) -> bool:
+    """Whether the person has APPROVED time off overlapping this time (schedules.md, states
+    and rules: nobody is assigned during their approved time off).
+
+    Time off is whole days in the person's workplace zone (time-off.md), so each approved
+    request is turned into the UTC moments where its first day begins and its last day
+    ends, the same way the approval works out which shifts to open
+    (app/modules/time_off/days.py). A shift overlaps it when each starts before the other
+    ends, as in has_overlap(). Only "approved" counts: a request still waiting, declined,
+    or cancelled blocks nothing.
+
+    Races: the caller holds the person's row lock (person(..., lock=True)), and approving
+    time off takes that same lock first (app/modules/time_off/service.py), so an approval
+    and an assignment take turns. As in has_overlap(), the read is FOR SHARE so that, after
+    waiting for the lock, it sees an approval committed meanwhile.
+    """
+    # Imported here, not at the top: the time-off module already imports this one
+    # (days.py uses workplace_zone), and a top-level import both ways would be circular.
+    from app.modules.time_off.models import TimeOffRequest
+
+    # Step 1: the person's workplace zone, and the shift's first and last calendar day in
+    # it. Only requests touching those days (one day either side, for safety at the edges)
+    # can overlap, which keeps the read to a few rows on the (company, employee, first_day)
+    # index.
+    home = db.get(Department, person.department_id)
+    if home is None:  # everyone has a home department of their own company
+        raise RuntimeError("the person's home department is missing")
+    zone = ZoneInfo(workplace_zone(db, home))
+    first = starts_at.replace(tzinfo=UTC).astimezone(zone).date() - timedelta(days=1)
+    last = ends_at.replace(tzinfo=UTC).astimezone(zone).date() + timedelta(days=1)
+    requests = db.scalars(
+        select(TimeOffRequest)
+        .where(
+            TimeOffRequest.employee_id == person.id,
+            TimeOffRequest.status == "approved",
+            TimeOffRequest.first_day <= last,
+            TimeOffRequest.last_day >= first,
+        )
+        .with_for_update(read=True)
+    )
+    # Step 2: compare exactly, with the days turned into UTC moments (stored without a zone,
+    # like the shift times).
+    for request in requests:
+        begins = _day_starts(zone, request.first_day)
+        ends = _day_starts(zone, request.last_day + timedelta(days=1))
+        if starts_at < ends and ends_at > begins:
+            return True
+    return False
+
+
+def _day_starts(zone: ZoneInfo, day: date) -> datetime:
+    """The UTC moment (without zone, as stored) where a day begins in a zone. The same rule
+    as day_starts() in app/modules/time_off/days.py, kept here so this module does not
+    import that one (it imports this one)."""
+    return datetime.combine(day, time(0), zone).astimezone(UTC).replace(tzinfo=None)
 
 
 def shift(db: Session, shift_id: uuid.UUID, *, lock: bool = False) -> Shift | None:
