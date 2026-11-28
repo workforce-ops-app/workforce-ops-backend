@@ -44,4 +44,6 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=6 \
 # Start the API: uvicorn (the web server) calls create_app() to build the FastAPI app.
 # 0.0.0.0 means "accept connections from outside the container", which Compose needs;
 # Compose itself only publishes the port on 127.0.0.1 of your computer.
-CMD ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+# First refuse to start if another API already answers as "api" on the shared network
+# (app/core/shared_network.py, #213), then hand the process over to uvicorn (exec).
+CMD ["sh", "-c", "python -m app.core.shared_network && exec uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000"]
