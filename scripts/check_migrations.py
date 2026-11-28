@@ -4278,6 +4278,11 @@ def _people_race_problems(engine: Engine) -> list[str]:
 _NO_RIGHT = {1044, 1142, 1143, 1227}
 
 
+# MySQL's error number for a value past a column's range in strict mode
+# ("Out of range value for column"). Any other error from the probe write proves nothing.
+_OUT_OF_RANGE = 1264
+
+
 def _strict_mode_problems(urls: list[str]) -> list[str]:
     """Whether MySQL refuses numbers past a column's range instead of clipping them (#105,
     threat T6).
@@ -4307,8 +4312,12 @@ def _strict_mode_problems(urls: list[str]) -> list[str]:
             connection.execute(text("CREATE TEMPORARY TABLE strict_probe (n SMALLINT)"))
             try:
                 connection.execute(text("INSERT INTO strict_probe (n) VALUES (40000)"))
-            except DBAPIError:
-                pass  # refused: strict mode works
+            except DBAPIError as error:
+                # Only "Out of range value" (1264) shows strict mode refused it; any other
+                # failure (a typo, a lost connection) proves nothing (review of #202).
+                code = error.orig.args[0] if error.orig is not None else None
+                if code != _OUT_OF_RANGE:
+                    problems.append(f"the 40000 write failed for another reason: {error.orig}")
             else:
                 stored = connection.execute(text("SELECT n FROM strict_probe")).scalar_one()
                 problems.append(f"40000 in a SMALLINT was not refused; {stored} was stored")
