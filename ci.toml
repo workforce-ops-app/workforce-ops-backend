@@ -77,3 +77,15 @@ timeout_minutes = 20
 # Report summary: "4 passed" from the tests run against the started containers.
 summary_patterns = ['(\d+) passed']
 summary_format = "{0} passed"
+
+# The image's compiled code keeps its memory-safety defenses (threat E10,
+# docs/security/native-hardening.md): builds the image as it ships and reads every
+# compiled file in it, so a dependency update that brings an unhardened binary fails
+# here. CI only: compiling the dependencies takes several minutes.
+[[operation]]
+name = "native-hardening"
+run = "docker build -t workforce-ops-backend:ci . && python scripts/check_native_hardening.py workforce-ops-backend:ci"
+requires = ["Dockerfile", "scripts/check_native_hardening.py"]
+local = false
+timeout_minutes = 40
+pass_summary = "all required defenses present"
