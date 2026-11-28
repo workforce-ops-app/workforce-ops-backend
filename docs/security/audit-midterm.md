@@ -26,13 +26,13 @@ Fixes are tracked as AU2 in workforce-ops-app/.github#56. A finding enters the [
 
 | Finding | Requirements | Severity | Fixed by |
 |---|---|---|---|
-| **A1** Refused requests are not logged: a 403, a cross-company 404, or a forged request leaves no trace, and application log lines do not say who sent a request or from where | V16.2.1, V16.3.2, V16.3.3 | medium: an attack in progress (probing IDs, forged requests) cannot be seen or investigated | #92 |
+| **A1** Refused requests are not logged: a 403, a cross-company 404, or a forged request leaves no trace, and application log lines do not say who sent a request or from where | V16.2.1, V16.3.2, V16.3.3 | medium: an attack in progress (probing IDs, forged requests) cannot be seen or investigated | #92 (fixed since: one log line per refusal, and every line names the request, person, and address; [security controls](security-controls.md)) |
 | **A2** Sensitive data has no protection levels, and the keys have no written lifecycle (creation, rotation, retirement) | V11.1.1, V14.1.1, V14.1.2, V14.2.4 | low: the protections exist, but nothing says which data needs which, or how a leaked key is replaced | #93 |
 | **A3** Limits on use are not defined: requests per person or overall, sessions per account, which functions are expensive, and query time limits | V2.1.3, V2.4.1, V7.1.2, V15.1.3 | low: a signed-in person can send unlimited requests and open unlimited sessions | #94 |
 | **A4** Sign-in uses a password only; ASVS Level 2 expects a second factor. Two-factor sign-in is a stretch item, so the deviation must be recorded | V6.3.3 | medium: a stolen password is enough to sign in | workforce-ops-app/.github#71 |
 | **A5** No time frames for fixing vulnerable dependencies, and no software bill of materials | V15.1.1, V15.1.2 | low: dependency checks run, but nothing says how fast a finding must be fixed | workforce-ops-app/.github#72 |
 | Sign-in has no lockouts or rate limits yet | V6.3.1, V2.4.1, V15.2.2 | high: passwords can be guessed without limit, and sign-in can be flooded | #50 (planned, Final demo milestone) |
-| Oversized passwords reach the slow password hash | V6.3.1, V15.2.2 | medium: large requests cost the server time and memory | #85 |
+| Oversized passwords reach the slow password hash | V6.3.1, V15.2.2 | medium: large requests cost the server time and memory | #85 (fixed since: every password field refuses more than 1024 characters before Argon2id; [security controls](security-controls.md)) |
 | The application's database user can change the schema and edit the audit log | V13.2.2, V16.4.2 | medium: a break-in through the application gets full control of the database | #43 (planned, Final demo milestone) |
 | Nothing verifies the audit log yet; changes are detectable but not detected | V16.4.2 | medium: tampering would go unnoticed until someone checks | #58 (planned, Final demo milestone) |
 
@@ -181,7 +181,7 @@ Each Level 1 and Level 2 requirement of the chapters in scope. The requirement c
 | V6.2.10 | 2 | No forced password rotation | Pass | None ([authentication](../architecture/authentication.md)) |
 | V6.2.11 | 2 | Context-specific words are refused | Pass | `test_passwords_built_from_names_are_refused` |
 | V6.2.12 | 2 | New passwords are checked against breached passwords | Pass | The NCSC list is built from breach data; an offline list, not a live breach service |
-| V6.3.1 | 1 | Password guessing and credential stuffing are stopped | **Fail** | Not yet: lockouts and rate limits are designed but not built (#50); oversized passwords still reach Argon2id (#85) |
+| V6.3.1 | 1 | Password guessing and credential stuffing are stopped | **Fail** | Not yet: lockouts and rate limits are designed but not built (#50); oversized passwords reached Argon2id then (#85, fixed since) |
 | V6.3.2 | 1 | No default accounts | Pass | None; demo accounts exist only after the demo seed, which refuses production |
 | V6.3.3 | 2 | Multi-factor authentication (or a combination of factors) | **Fail** | Password only; two-factor sign-in is a stretch item ([0023](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0023-feature-tiers-and-audit-schedule.md)). A4: workforce-ops-app/.github#71 |
 | V6.3.4 | 2 | No undocumented sign-in pathways | Pass | Only sign-in may read across companies; `tests/security/test_sign_in.py::test_only_sign_in_uses_the_cross_company_read` |
@@ -325,14 +325,14 @@ Each Level 1 and Level 2 requirement of the chapters in scope. The requirement c
 | ID | L | Requirement (summary) | Result | Where it is checked |
 |---|---|---|---|---|
 | V16.1.1 | 2 | Log inventory | Pass | Added by this audit: [security controls: logs](security-controls.md#logs) |
-| V16.2.1 | 2 | Log entries say when, where, who, and what | **Fail** | Audit entries do; application log lines carry no request ID, person, or source address. A1: #92 |
+| V16.2.1 | 2 | Log entries say when, where, who, and what | **Fail** | Audit entries do; application log lines carried no request ID, person, or source address. A1: #92 (fixed since) |
 | V16.2.2 | 2 | UTC timestamps | Pass | Log lines and audit entries use UTC |
 | V16.2.3 | 2 | Logs go only where the inventory says | Pass | Standard output and the audit tables |
 | V16.2.4 | 2 | Logs use a common format | Pass | One JSON object per line ([0035](https://github.com/workforce-ops-app/.github/blob/main/docs/decisions/0035-logging-unexpected-errors.md)) |
 | V16.2.5 | 2 | Sensitive data is not logged | Pass | `tests/security/test_sign_in.py::test_failed_sign_ins_never_log_the_password`, `tests/security/test_audit_log.py::test_no_entry_can_contain_a_password_token_or_hash` |
 | V16.3.1 | 2 | Sign-in attempts are logged | Pass | Success and failure are audited; an unknown email goes to the application log without the email |
-| V16.3.2 | 2 | Failed authorization is logged | **Fail** | A 403 or cross-company 404 is answered but not logged. A1: #92 |
-| V16.3.3 | 2 | Security events and bypass attempts are logged | **Fail** | Refused forged requests (CSRF, Origin) are not logged. A1: #92 |
+| V16.3.2 | 2 | Failed authorization is logged | **Fail** | A 403 or cross-company 404 was answered but not logged. A1: #92 (fixed since) |
+| V16.3.3 | 2 | Security events and bypass attempts are logged | **Fail** | Refused forged requests (CSRF, Origin) were not logged. A1: #92 (fixed since) |
 | V16.3.4 | 2 | Unexpected errors are logged | Pass | With an `error_id` (`app/core/errors.py`) |
 | V16.4.1 | 2 | Log injection is prevented | Pass | The JSON formatter escapes every value |
 | V16.4.2 | 2 | Logs are protected and cannot be modified | **Fail** | Changes to the audit log are detectable (signed chain; `tests/security/test_audit_log.py`), but the application's database user can still edit it (#43) and nothing verifies it yet (#58) |

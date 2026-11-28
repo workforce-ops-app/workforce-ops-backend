@@ -307,7 +307,7 @@ Schedule changes affecting 10 or more shifts show a confirmation with the count 
 | `approval.requested`, `approval.approved`, `approval.denied`, `approval.not_reviewed`, `approval.cancelled` | a same-level grant or owner change is requested, decided, or lapses (details: kind, who; `approval.approved` says `final: true` for the approval that made the change, `false` for one of several still waiting) |
 | `settings.changed` | a company setting changes (details: `setting`, `old`, `new`); written by `change_setting()` in `app/settings/service.py` |
 
-Refused requests (403) are not audit entries: they are recorded as security events for detection (next tier), with the permission and the kind of target, never the record's contents.
+Refused requests (403) are not audit entries: a burst of them (a script probing IDs) would fill the chain with noise. Each one writes one application log line instead (#92, the `app.refusals` logger in `app/core/request_context.py`): `authz.denied` with the permission `authorize()` refused, `tenancy.not_found` when it found another company's target, the method, the route template, the person, the company, the address, and the request ID, never the record's contents, the body, or a token. Most are also recorded as security events, for the security page and the detection study ([detection](../features/detection.md#refused-requests)).
 
 ## What the interface gets
 

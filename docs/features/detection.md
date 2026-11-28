@@ -115,6 +115,22 @@ How the layer applies these rules (`app/modules/security/layer.py`):
 
 The worker (`app/modules/security/worker.py`) runs in one thread started with the application. It takes one copy at a time, waking at least every 10 seconds. Events the writer could not save are written again with the next copy, at most 1,000 of them (the oldest beyond that are let go, and the loss is logged), so a long database outage cannot grow memory without bound. On a clean stop it handles what is still queued, tries the unsaved events once more (even when no copy is left to carry them), and writes every count it holds.
 
+### Refused requests
+
+Refused requests are security events too (#92), so an owner sees an ID probe or a forged request on the security page, and the detection study can count them. The request context (`app/core/request_context.py`, the outermost layer) writes one log line for every refusal and hands most of them to the worker as a copy with **no values** and the refusal attached. So the event goes through the same queue (DE11), rate cap (DE6), and company rule (DE9: a company row only with a checked session, otherwise a platform row) as every other event.
+
+| `kind` | When |
+|---|---|
+| `authz.denied` | 403 from a permission check; `field` names the permission when `authorize()` refused |
+| `tenancy.not_found` | 404 because `authorize()` found another company's target |
+| `request.not_found` | any other 404 on a real route: a missing record, or another company's that the company filter hid (the same answer on purpose, so both are recorded) |
+| `csrf.refused` | 403 from the CSRF check; no session was checked yet, so always a platform row |
+| `auth.reauth_failed`, `auth.reauth_locked` | 403 because the password entered again was wrong, or too many were |
+
+- **Not recorded:** `auth.reauth_required` (being asked for the password is the ordinary first step of every sensitive action; it is only logged), a path that matches no route, 401, and 422.
+- **Nothing the client sent:** a refusal's row has no pattern and no excerpt, only what the server decided (kind, permission, method, route template, address, request ID). So it is recorded even for a credential route (a forged sign-in is login CSRF); rule DE3 keeps the route's values out, and there are none.
+- **Two rows for one request** are possible: an attack string the detector matched and the refusal of the same request. Both carry the same `request_id`.
+
 ### Rate cap and queue
 
 Rows are only ever inserted, never changed, so the rate cap (DE6) keeps its counts in the worker's memory and writes the result once:
@@ -141,9 +157,9 @@ Events with a company and events without one are kept in **separate tables**, so
 | `id` | `BINARY(16)` | primary key (UUIDv7) |
 | `company_id` | `BINARY(16)` | required; the session's company (DE9) |
 | `user_id` | `BINARY(16)` | required; the person whose session sent the request; company-aware foreign key to `users` |
-| `kind` | `VARCHAR(50)` | `detection.<type>` (for example `detection.xss`), `detection.summary` (DE6), `audit.chain_broken` (an audit chain failed its check, [audit log](../architecture/audit-log.md#verification)); later `authz.denied` and `csrf.refused` (#92) |
+| `kind` | `VARCHAR(50)` | `detection.<type>` (for example `detection.xss`), `detection.summary` (DE6), `audit.chain_broken` (an audit chain failed its check, [audit log](../architecture/audit-log.md#verification)), and the refused requests (#92, [below](#refused-requests)) |
 | `pattern_id` | `VARCHAR(20)` | which pattern matched; null for non-detection kinds |
-| `field` | `VARCHAR(100)` | where the value was, for example `query.search` or `body.note` |
+| `field` | `VARCHAR(100)` | where the value was, for example `query.search` or `body.note`; for a refusal, the permission `authorize()` refused (null for any other check) |
 | `method`, `route` | `VARCHAR(10)`, `VARCHAR(200)` | the route template (`/api/shifts/{shift_id}`), not the raw path |
 | `client_address` | `VARCHAR(45)` | IPv4 or IPv6 (DE8) |
 | `request_id` | `VARCHAR(40)` | links to the application log line for the same request (#92) |
