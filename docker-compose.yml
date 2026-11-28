@@ -63,9 +63,11 @@ services:
       # The address browsers use: the frontend's nginx, which serves the pages and passes
       # /api on (decision 0003). Changes must come from it (the Origin check).
       APP_ORIGIN: ${APP_ORIGIN:-http://localhost:8080}
-      # The name nginx uses for this API: it refuses to start if another container on the
-      # shared network already answers to it (app/core/shared_network.py, #213).
+      # The name nginx uses for this API, and the shared network it is looked up on: it
+      # refuses to start if another container there already answers to it
+      # (app/core/shared_network.py, #213). Must match networks.workforce-ops.name below.
       SHARED_API_NAME: api
+      SHARED_NETWORK_NAME: ${SHARED_NETWORK:-workforce-ops}
       # Whose X-Forwarded-For header uvicorn believes: only the containers on the shared
       # network (the frontend's nginx), never the network's gateway, which is where
       # browsers on this computer come from. uvicorn then takes the right-most address
