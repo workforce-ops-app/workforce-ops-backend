@@ -124,6 +124,11 @@ def _locked(db: Session, user: User, request_id: uuid.UUID) -> ApprovalRequest:
         # here, the approval record would stop waiting while the time-off request stays
         # pending. Refused before any lock is taken (review of #167).
         raise Conflict(TIME_OFF_ELSEWHERE)
+    # The kind's locks that come before the company's (Handler.lock_first), then the
+    # company's lock, then the kind's people (Handler.lock_people, in _decide).
+    first = handler_for(found).lock_first
+    if first is not None:
+        first(db, found)
     lock_reporting_lines(db)
     request = db.get(ApprovalRequest, request_id, populate_existing=True, with_for_update=True)
     if request is None:  # requests are never deleted
@@ -140,6 +145,9 @@ def _decide(
     db: Session, user: User, request_id: uuid.UUID, decision: str, session: UserSession
 ) -> ApprovalRequest:
     request = _locked(db, user, request_id)  # never a time-off request (refused there)
+    people = handler_for(request).lock_people
+    if people is not None:
+        people(db, request, user)  # the decider and the reviewers, sorted (Handler)
     if not may_decide(db, user, request, fresh=True):
         raise Forbidden()  # involved (they asked, or it is about them), but not a reviewer
     if handler_for(request).sensitive(db, request):
