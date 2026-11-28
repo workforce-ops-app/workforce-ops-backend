@@ -53,6 +53,11 @@ from app.modules.org.models import User
 
 # The count resets after this long without a failure.
 RESET_AFTER = timedelta(hours=24)
+# The count is kept in a SMALLINT column (at most 32,767). Locks stop counting while they
+# last, so reaching that would take years of failures, but the count stops here anyway:
+# from the 15th on every failure locks for the maximum, so a higher count changes nothing
+# (threat T6).
+MAX_COUNTED = 1000
 # The longest lock there is (decision 0025: companies may never go past it).
 MAX_LOCK = timedelta(hours=1)
 
@@ -80,8 +85,8 @@ def register_failure(db: Session, user: User, now: datetime) -> None:
     count = user.failed_sign_ins or 0
     if count and user.updated_at is not None and now - user.updated_at >= RESET_AFTER:
         count = 0
-    # 2. This failure.
-    count += 1
+    # 2. This failure, counted up to MAX_COUNTED.
+    count = min(count + 1, MAX_COUNTED)
     user.failed_sign_ins = count
     # 3. Lock, if this is the 5th, the 10th, or the 15th or later.
     duration = lock_for(count)

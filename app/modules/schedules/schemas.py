@@ -60,6 +60,9 @@ class ShiftAssign(Strict):
 # that does not belong to the chosen action is refused with 422, like any unknown field.
 
 MAX_BATCH = 100  # shifts per request: a whole department's month fits, a runaway loop does not
+# The count a batch repeats to confirm it: a number of shifts, so never more than one
+# batch can hold (threat T6: every number a request carries has limits).
+ConfirmCount = Annotated[int | None, Field(ge=1, le=MAX_BATCH)]
 
 
 class ShiftTimes(Strict):
@@ -81,7 +84,7 @@ class BatchCreate(Strict):
     notes: str | None = Field(default=None, max_length=5000)
     event_name: str | None = Field(default=None, max_length=120)
     event_description: str | None = Field(default=None, max_length=5000)
-    confirm_count: int | None = None  # required at 10 or more shifts (service.py)
+    confirm_count: ConfirmCount = None  # required at 10 or more shifts (service.py)
 
 
 class BatchCancel(Strict):
@@ -89,7 +92,7 @@ class BatchCancel(Strict):
 
     action: Literal["cancel"]
     shift_ids: list[uuid.UUID] = Field(min_length=1, max_length=MAX_BATCH)
-    confirm_count: int | None = None
+    confirm_count: ConfirmCount = None
 
 
 class BatchAssign(Strict):
@@ -99,7 +102,7 @@ class BatchAssign(Strict):
     action: Literal["assign"]
     shift_ids: list[uuid.UUID] = Field(min_length=1, max_length=MAX_BATCH)
     employee_id: uuid.UUID | None
-    confirm_count: int | None = None
+    confirm_count: ConfirmCount = None
 
 
 ShiftBatch = Annotated[BatchCreate | BatchCancel | BatchAssign, Field(discriminator="action")]

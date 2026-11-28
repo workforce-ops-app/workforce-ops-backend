@@ -5,7 +5,14 @@ from datetime import timedelta
 
 import pytest
 
-from app.auth.limits import MAX_LOCK, RateLimit, TooManyRequests, lock_for
+from app.auth.limits import (
+    MAX_COUNTED,
+    MAX_LOCK,
+    RateLimit,
+    TooManyRequests,
+    lock_for,
+    register_failure,
+)
 
 
 @pytest.mark.parametrize(
@@ -25,6 +32,25 @@ from app.auth.limits import MAX_LOCK, RateLimit, TooManyRequests, lock_for
 )
 def test_the_lockout_schedule(failures: int, locked: timedelta | None) -> None:
     assert lock_for(failures) == locked
+
+
+def test_the_failure_count_stops_inside_its_smallint_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Threat T6: failed_sign_ins is a SMALLINT (at most 32,767). From the 15th failure on
+    every failure locks for the maximum, so counting past MAX_COUNTED changes nothing, and
+    stopping there keeps the column from ever overflowing."""
+    from datetime import UTC, datetime
+    from unittest.mock import MagicMock
+
+    from app.auth import limits
+
+    monkeypatch.setattr(limits, "record", lambda *args, **kwargs: None)  # no audit log here
+    assert MAX_COUNTED < 2**15
+    user = MagicMock(failed_sign_ins=MAX_COUNTED, updated_at=datetime.now(UTC))
+    register_failure(MagicMock(), user, datetime.now(UTC))
+    assert user.failed_sign_ins == MAX_COUNTED
+    assert user.locked_until is not None  # still locked, for the maximum
 
 
 def test_no_lock_is_ever_longer_than_an_hour() -> None:
