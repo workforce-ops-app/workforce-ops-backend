@@ -77,6 +77,37 @@ def test_every_failed_sign_in_does_the_same_work(
         assert calls == ["$argon2id"], case
 
 
+@pytest.mark.parametrize("size", [1025, 100_000])
+def test_an_oversized_password_is_refused_before_the_slow_check(
+    signin: SignInSetup, monkeypatch: pytest.MonkeyPatch, size: int
+) -> None:
+    # #85: a password longer than 1024 characters is refused (422) by the request's own
+    # rules, before Argon2id runs, so a huge one costs the server nothing to turn away.
+    # 1024 is far above the 128 a new password may have, so no real password is affected.
+    calls: list[str] = []
+    monkeypatch.setattr(sessions, "verify_password", lambda h, p: calls.append(h) or False)
+    for address in (email(signin, "a_ana"), "nobody@northwind.example"):
+        response = signin.new_client().post(
+            "/api/sessions", json={"email": address, "password": "x" * size}
+        )
+        assert response.status_code == 422
+        assert "x" * 50 not in response.text  # the password is never echoed back
+    assert calls == []
+
+
+def test_a_password_of_1024_characters_still_reaches_the_check(
+    signin: SignInSetup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The other side of the limit: 1024 is checked as usual (and is wrong here: 401).
+    calls: list[str] = []
+    monkeypatch.setattr(sessions, "verify_password", lambda h, p: calls.append(h) or False)
+    response = signin.new_client().post(
+        "/api/sessions", json={"email": email(signin, "a_ana"), "password": "x" * 1024}
+    )
+    assert response.status_code == 401
+    assert len(calls) == 1
+
+
 def test_every_failed_sign_in_takes_at_least_the_same_minimum_time(
     signin: SignInSetup, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -24,13 +24,22 @@ from datetime import datetime
 from sqlalchemy import ForeignKeyConstraint, Index, Integer, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.request_context import (
+    AUTHZ_DENIED,
+    CSRF_REFUSED,
+    NOT_FOUND,
+    REAUTH_FAILED,
+    REAUTH_LOCKED,
+    TENANCY_NOT_FOUND,
+)
 from app.db.base import UTC_DATETIME, Base
 from app.db.types import UUIDBinary, new_id
 from app.detection.patterns import KINDS
 from app.tenancy.filter import CompanyOwned
 
 # The kinds of rows (the `kind` column). detection.<type> for each attack type the
-# detector knows (app/detection/patterns.py); later authz.denied and csrf.refused (#92).
+# detector knows (app/detection/patterns.py); and the refused requests (#92,
+# REFUSAL_EVENT_KINDS below).
 SUMMARY = "detection.summary"  # how many events the rate cap held back (DE6)
 DROPPED = "detection.dropped"  # how many request copies a full queue dropped (DE11)
 # An audit chain failed its check (docs/architecture/audit-log.md, verification), written
@@ -38,12 +47,32 @@ DROPPED = "detection.dropped"  # how many request copies a full queue dropped (D
 # ran the check, in platform_security_events when the nightly check did.
 CHAIN_BROKEN = "audit.chain_broken"
 
+# Refused requests recorded as events (#92; app/core/request_context.py names them):
+# no permission (403), another company's target or a missing record on a real route
+# (404; the two look the same on purpose), a forged request, and a wrong or locked
+# password re-entry. Not auth.reauth_required: being asked for the password is the
+# ordinary first step of every sensitive action, not a sign of an attack.
+REFUSAL_EVENT_KINDS = (
+    AUTHZ_DENIED,
+    TENANCY_NOT_FOUND,
+    NOT_FOUND,
+    CSRF_REFUSED,
+    REAUTH_FAILED,
+    REAUTH_LOCKED,
+)
+
 # The kinds a company's security_events can hold, in the order the security page shows
-# them: one per attack type, then the rate cap's summary rows, then a broken audit chain.
+# them: one per attack type, then the refusals, then the rate cap's summary rows, then a
+# broken audit chain.
 # The list filter accepts only these, and the summary counts each of them. detection.
 # dropped is never here: drops belong to no company, so they are only in
 # platform_security_events.
-COMPANY_KINDS = (*(f"detection.{kind}" for kind in KINDS), SUMMARY, CHAIN_BROKEN)
+COMPANY_KINDS = (
+    *(f"detection.{kind}" for kind in KINDS),
+    *REFUSAL_EVENT_KINDS,
+    SUMMARY,
+    CHAIN_BROKEN,
+)
 
 
 class _EventColumns:
@@ -51,11 +80,15 @@ class _EventColumns:
 
     # UUIDv7, so IDs sort by time like everywhere else (decision 0019).
     id: Mapped[uuid.UUID] = mapped_column(UUIDBinary, primary_key=True, default=new_id)
-    # detection.<type>, detection.summary, or detection.dropped.
+    # detection.<type>, a refusal (REFUSAL_EVENT_KINDS), detection.summary,
+    # detection.dropped, or audit.chain_broken.
     kind: Mapped[str] = mapped_column(String(50))
-    # Which pattern matched, for example "SQLI-02"; null for summary and drop rows.
+    # Which pattern matched, for example "SQLI-02"; null for summary and drop rows, and
+    # for refusals.
     pattern_id: Mapped[str | None] = mapped_column(String(20))
-    # Where the value was, for example "body.note"; null for summary and drop rows.
+    # Where the value was, for example "body.note"; for a refusal, the permission
+    # authorize() refused (null when it was another check); null for summary and drop
+    # rows.
     field: Mapped[str | None] = mapped_column(String(100))
     # The route TEMPLATE (/api/shifts/{shift_id}), never the raw path, which may carry
     # attacker text of its own.

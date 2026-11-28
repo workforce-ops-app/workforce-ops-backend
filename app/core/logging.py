@@ -1,7 +1,9 @@
 """Structured logging: one JSON object per line (decision 0031).
 
 Log lines carry IDs, actions, and errors only, never personal details, passwords, tokens,
-or the contents of records.
+or the contents of records. A line written during a request also carries the request's ID,
+the address that sent it, and, once the session is checked, the person's and company's IDs
+(#92, app/core/request_context.py).
 """
 
 import json
@@ -17,6 +19,12 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
+        # Who sent the request this line was written for, and from where (#92): attached
+        # when the line was written (app/core/request_context.py, the record factory), so
+        # a line formatted later still names its own request.
+        context = getattr(record, "request_context", None)
+        if isinstance(context, dict):
+            entry.update(context)
         # Extra fields passed as logger.info("...", extra={"fields": {...}}).
         fields = getattr(record, "fields", None)
         if isinstance(fields, dict):

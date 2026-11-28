@@ -60,6 +60,17 @@ def test_a_setting_cannot_go_past_the_platform_limit(companies: AuditSetup, valu
         change_setting(db, PASSWORD_MIN_LENGTH, value, actor=Actor.system())
 
 
+@pytest.mark.parametrize("value", [15, 16, 63, 64])
+def test_every_minimum_from_15_to_64_is_accepted(companies: AuditSetup, value: int) -> None:
+    """The edges of the range (#84): 15 (the platform's own) and 64 (the highest a company
+    may ask for) are both allowed, and the saved value is the one used."""
+    with companies.session_for(companies.company_a) as db:
+        change_setting(db, PASSWORD_MIN_LENGTH, value, actor=Actor.system())
+        db.commit()
+    with companies.session_for(companies.company_a) as db:
+        assert setting_value(db, PASSWORD_MIN_LENGTH) == value
+
+
 @pytest.mark.parametrize("value", ["8", 8.5, True, None])
 def test_a_value_of_another_type_is_refused(companies: AuditSetup, value: object) -> None:
     with (

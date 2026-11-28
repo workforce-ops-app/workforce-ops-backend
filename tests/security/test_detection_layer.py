@@ -114,7 +114,9 @@ def test_an_attack_string_gets_the_same_answer(detect: Detect) -> None:
     detect.run()
     # The attacks were still seen and recorded.
     assert {row.field for row in detect.platform_rows()} == {"query.note"}
-    assert {row.field for row in detect.company_rows("a")} == {"body.name"}
+    # ana may not add departments: her request was also refused, and recorded (#92).
+    rows = detect.company_rows("a")
+    assert {row.field for row in rows if row.kind.startswith("detection.")} == {"body.name"}
 
 
 # --- DE3: secrets never enter detection --------------------------------------------------
@@ -162,9 +164,20 @@ def test_sign_in_is_never_inspected(detect: Detect, caplog: pytest.LogCaptureFix
     TestClient(detect.setup.client.app, base_url=BASE_URL).post(
         "/api/sessions", json={"email": real, "password": f"{XSS}P4"}
     )
-    assert detect.worker.queue.qsize() == 0  # nothing was even copied
+    # Nothing was copied, except that the forged one was refused (#92): its own copy holds
+    # no value, and its row is a platform row (no session was checked) with no excerpt.
+    assert detect.worker.queue.qsize() == 1
     detect.run()
-    assert detect.company_rows("a") == [] and detect.all_rows() == []
+    assert detect.company_rows("a") == []
+    [row] = detect.all_rows()
+    assert (row.kind, row.route, row.excerpt, row.field) == (
+        "csrf.refused",
+        "/api/sessions",
+        None,
+        None,
+    )
+    for marker in ("P1", "P2", "P3", "P4"):
+        assert marker not in detect.everything_stored()
     for marker in ("P1", "P2", "P3", "P4"):
         assert marker not in _app_log(caplog)
 
@@ -312,3 +325,33 @@ def test_one_session_cannot_fill_the_table(detect: Detect) -> None:
     detect.worker.run_once()  # the minute has ended: its summary row
     [summary] = [row for row in detect.company_rows("a") if row.kind == SUMMARY]
     assert summary.count == 5
+
+
+# --- Refused requests are events too (#92) -----------------------------------------------
+
+
+def test_a_refused_request_becomes_a_row_in_its_company(detect: Detect) -> None:
+    # ana may not read the security page (security.view): the refusal is a row in her
+    # company, naming her and the permission, with no excerpt and no pattern.
+    ana = detect.signed_in()
+    assert ana.get("/api/security-events").status_code == 403
+    detect.run()
+    [row] = detect.company_rows("a")
+    assert (row.kind, row.field, row.route) == (
+        "authz.denied",
+        "security.view",
+        "/api/security-events",
+    )
+    assert row.user_id == detect.setup.people["a_ana"]
+    assert (row.pattern_id, row.excerpt) == (None, None)
+    assert detect.platform_rows() == []
+
+
+def test_refusals_are_held_by_the_rate_cap(detect: Detect) -> None:
+    # A script probing one endpoint is counted, not stored row by row (DE6).
+    ana = detect.signed_in()
+    for _ in range(PER_MINUTE + 5):
+        ana.get("/api/security-events")
+    detect.run()
+    rows = detect.company_rows("a")
+    assert len([row for row in rows if row.kind == "authz.denied"]) == PER_MINUTE

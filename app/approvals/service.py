@@ -91,6 +91,14 @@ class Handler:
     ready(db, request, approvers): whether the approvals so far are enough. Without it,
         `required_approvals` approvals are enough; owner changes instead need every
         current reviewer, worked out again now, so an owner added meanwhile must agree too.
+    lock_first(db, request): take the locks that come before the company's lock, called
+        when a request is decided or cancelled (approval_requests/service.py, _locked),
+        just before it. Department settings lock the department there, the order
+        creating a person and archiving a department take (review of #195).
+    lock_people(db, request, decider): after the company's lock, lock every person the
+        decision reads, together and sorted by ID (the order of every schedule change),
+        before may_decide(fresh=True) reads the decider. Without it the decider is
+        locked first and the reviewers after, in the order the handler reads them.
     """
 
     reviewers: Reviewers
@@ -101,6 +109,8 @@ class Handler:
     outcome: Callable[[Session, ApprovalRequest], str | None] | None = None
     ready: Callable[[Session, ApprovalRequest, set[uuid.UUID]], bool] | None = None
     lock: Callable[[Session, ApprovalRequest], None] | None = None
+    lock_first: Callable[[Session, ApprovalRequest], None] | None = None
+    lock_people: Callable[[Session, ApprovalRequest, User], None] | None = None
 
 
 _handlers: dict[str, Handler] = {}
