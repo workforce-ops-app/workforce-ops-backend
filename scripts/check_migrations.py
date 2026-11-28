@@ -26,9 +26,10 @@
    reporting_line.manage, each person's place and active status), and an overdue
    request noticed by two requests lapses once, with both seeing it declined, and
    requests that lock a person and write audit never deadlock with requests holding
-   the company's lock (#198). SQLite has no row locks, so this too can only be tried
-   on MySQL. They run as the application user, so they also show its rights are enough
-   for the app's own writes and locking reads.
+   the company's lock (#198), and department setting changes and confirmations take
+   their locks in the one order schedule changes do (review of #195). SQLite has no row
+   locks, so this too can only be tried on MySQL. They run as the application user, so
+   they also show its rights are enough for the app's own writes and locking reads.
 6. A company that existed before a migration still works after it
    (_existing_company_problems): its starting roles get the permissions a migration adds
    (announcement.create in 0014).
@@ -36,6 +37,9 @@
    script Docker Compose uses (docker/mysql/init/01-users.sh) and granted by the
    migrations (app/db/grants.py), it cannot change the structure, cannot change or
    remove audit entries, and can read every table the app uses.
+
+7. The backup user's rights (_backup_user_problems, #117): created by the same script,
+   it can read every table and the binary log, and can change nothing.
 
 The database is a throwaway Docker container (removed afterwards), unless
 MIGRATION_CHECK_DATABASE_URL points at an empty database to use instead. That one URL
@@ -106,14 +110,15 @@ def _docker() -> str:
     return path
 
 
-def _start_mysql() -> tuple[str, str, str]:
-    """Start an empty MySQL container with the two users, as Docker Compose creates them.
+def _start_mysql() -> tuple[str, str, str, str]:
+    """Start an empty MySQL container with the three users, as Docker Compose creates them.
 
-    Returns the container's name, the migrations user's URL, and the application user's.
+    Returns the container's name and the URLs of the migrations, application, and backup
+    users.
     """
     name = f"workforce-ops-migration-check-{secrets.token_hex(4)}"
     # Throwaway passwords, never stored. Hex only, so they fit in a URL as they are.
-    root, app, migrations = (secrets.token_hex(16) for _ in range(3))
+    root, app, migrations, backup = (secrets.token_hex(16) for _ in range(4))
     port = _free_port()
     # Every argument is fixed or generated here; nothing comes from user input.
     subprocess.run(  # noqa: S603
@@ -125,6 +130,7 @@ def _start_mysql() -> tuple[str, str, str]:
             "--env", "MYSQL_DATABASE=migration_check",
             "--env", f"MYSQL_APP_PASSWORD={app}",
             "--env", f"MYSQL_MIGRATIONS_PASSWORD={migrations}",
+            "--env", f"MYSQL_BACKUP_PASSWORD={backup}",
             MYSQL_IMAGE,
         ],
         check=True,
@@ -135,6 +141,7 @@ def _start_mysql() -> tuple[str, str, str]:
         name,
         f"mysql+pymysql://workforce_migrations:{migrations}@{address}",
         f"mysql+pymysql://workforce_app:{app}@{address}",
+        f"mysql+pymysql://workforce_backup:{backup}@{address}",
     )
 
 
@@ -380,6 +387,7 @@ def _race_problems(url: str) -> list[str]:
             + _time_off_assign_race_problems(engine)
             + _offer_race_problems(engine)
             + _department_setting_race_problems(engine)
+            + _department_setting_lock_problems(engine)
             + _coverage_approval_lock_problems(engine)
             + _role_view_lock_problems(engine)
             + _assignment_race_problems(engine)
@@ -3353,6 +3361,254 @@ def _department_setting_race_problems(engine: Engine) -> list[str]:
     return problems
 
 
+def _department_setting_lock_problems(engine: Engine) -> list[str]:
+    """A department setting's change and confirmation take their locks in the one order
+    every other request does, and read the department fresh; return what failed (review
+    of #195).
+
+    The order (app/modules/department_settings/service.py, the top): the department, the
+    company's lock, then the people together and sorted by ID, as a schedule change locks
+    them (schedules/service.py, _lock_for_change). Before, a change locked the changer
+    first and the other managers later, and a confirmation locked the confirmer first and
+    the other managers later: with a shift reassigned between two of them at that moment,
+    each request held one person and waited for the other, and MySQL ended one with a
+    deadlock (1213), as in #209.
+
+    Each race is made certain rather than left to timing: a third transaction (the
+    blocker) holds a row the setting request needs next, so it stops exactly in the gap;
+    the reassignment starts while it waits; then the blocker lets go.
+
+    1. A manager changes the setting while the owner gives the other manager's shift to
+       them. The blocker holds the department. The changer's ID sorts after the other
+       manager's.
+    2. A manager confirms a change while the owner gives the other reviewer's shift to
+       them. The blocker holds the other reviewer's role assignment. The confirmer's ID
+       sorts after it.
+    3. A confirmation whose view was fixed before the department was archived: refused
+       (409), and the value is not written. An ordinary read in apply() answered from
+       the old snapshot, where the department was still active.
+    """
+    import threading
+    from datetime import timedelta
+    from typing import Any, cast
+
+    from fastapi import HTTPException
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    import app.modules.department_settings.approval  # noqa: F401  (registers the handler)
+    from app.approvals.models import ApprovalRequest
+    from app.audit import Actor
+    from app.authz.models import Role, RoleAssignment
+    from app.authz.roles import assign_role, create_starting_roles
+    from app.db.base import utcnow
+    from app.modules.approval_requests import service as approval_requests
+    from app.modules.department_settings import service as department_settings
+    from app.modules.org import service as org
+    from app.modules.org.models import Company, Department, User
+    from app.modules.schedules import service as schedules
+    from app.modules.schedules.models import Shift
+    from app.settings.service import TIME_OFF_OFFERS_CLOSE_DAYS, own_department_value
+    from app.tenancy.context import set_company
+
+    problems: list[str] = []
+    with Session(engine) as platform:
+        company = Company(name="department setting lock probe", timezone="UTC")
+        platform.add(company)
+        platform.commit()
+        company_id = company.id
+
+    def session() -> Session:
+        """A new session for the company: one per simulated request. Its lock wait limit
+        is set to MySQL's default, since a pooled connection may still carry the 1 second
+        another check set; these requests wait for the blocker for about 2 seconds."""
+        db = Session(engine)
+        set_company(db, company_id)
+        db.execute(text("SET SESSION innodb_lock_wait_timeout = 50"))
+        return db
+
+    # The office is everyone's home, so the departments with managers can be archived.
+    with session() as db:
+        office = Department(name="Office")
+        db.add(office)
+        db.flush()
+        roles = create_starting_roles(db, Actor.system())
+        owner = User(
+            email="owner@setting-lock.example.com",
+            display_name="owner",
+            department_id=office.id,
+            # Set up (random text is never a valid Argon2id hash: no sign-in).
+            password_hash=secrets.token_hex(16),
+        )
+        db.add(owner)
+        db.flush()
+        assign_role(db, Actor.system(), user_id=owner.id, role=roles["owner"], scope_type="company")
+        db.commit()
+        office_id, owner_id, manager_role = office.id, owner.id, roles["manager"].id
+
+    def a_department(name: str, count: int) -> tuple[uuid.UUID, list[uuid.UUID]]:
+        """A new department with `count` managers, made one after another, so their IDs
+        sort in the order made (IDs are time-ordered). Their home is the office."""
+        with session() as db:
+            department = Department(name=name)
+            db.add(department)
+            db.flush()
+            managers = []
+            for index in range(count):
+                manager = User(
+                    email=f"{name.lower()}-{index}@setting-lock.example.com",
+                    display_name=f"{name} manager {index}",
+                    department_id=office_id,
+                    password_hash=secrets.token_hex(16),
+                )
+                db.add(manager)
+                db.flush()
+                role = db.get(Role, manager_role)  # made above; this session's own copy
+                if role is None:
+                    raise RuntimeError("the department setting lock probe's role is missing")
+                assign_role(
+                    db,
+                    Actor.system(),
+                    user_id=manager.id,
+                    role=role,
+                    scope_type="department",
+                    scope_id=department.id,
+                )
+                managers.append(manager.id)
+            db.commit()
+            return department.id, managers
+
+    def person(db: Session, person_id: uuid.UUID) -> User:
+        found = db.get(User, person_id)
+        if found is None:  # made above, in this company
+            raise RuntimeError("a department setting lock probe person is missing")
+        return found
+
+    def a_shift(employee_id: uuid.UUID, day: int) -> uuid.UUID:
+        """A shift for the person `day` days from now, in the office (their home)."""
+        start = utcnow().replace(hour=9, minute=0, second=0, microsecond=0)
+        with session() as db:
+            shift = Shift(
+                department_id=office_id,
+                employee_id=employee_id,
+                starts_at=start + timedelta(days=day),
+                ends_at=start + timedelta(days=day, hours=8),
+                timezone="UTC",
+                status="scheduled",
+            )
+            db.add(shift)
+            db.commit()
+            return shift.id
+
+    def outcome(step: Callable[[], object]) -> str:
+        """What a simulated request ended with: ok, the refusal's status, or the error."""
+        try:
+            step()
+            return "ok"
+        except HTTPException as refused:
+            return str(refused.status_code)
+        except Exception as error:  # a deadlock would show up here
+            return f"error: {error!r}"[:300]
+
+    def race(
+        blocker: Session, setting_step: Callable[[], None], reassign_step: Callable[[], None]
+    ) -> list[str]:
+        """The setting request starts and stops at the blocker's row; the reassignment
+        starts while it waits; then the blocker lets go. Both must end without an error."""
+        outcomes = ["not run", "not run"]
+
+        def run(index: int, step: Callable[[], None]) -> None:
+            outcomes[index] = outcome(step)
+
+        first = threading.Thread(target=run, args=(0, setting_step))
+        second = threading.Thread(target=run, args=(1, reassign_step))
+        first.start()
+        time.sleep(1)  # the setting request is now waiting for the blocker
+        second.start()
+        time.sleep(1)  # and the reassignment has taken, or is waiting for, its locks
+        blocker.rollback()
+        for thread in (first, second):
+            thread.join(timeout=60)
+        return outcomes
+
+    def reassign(shift_id: uuid.UUID, to: uuid.UUID) -> Callable[[], None]:
+        """The owner gives the shift to someone else, as its own request."""
+
+        def step() -> None:
+            with session() as db:
+                schedules.assign_shift(db, person(db, owner_id), shift_id, to)
+
+        return step
+
+    def opened(asker: uuid.UUID, department_id: uuid.UUID) -> uuid.UUID:
+        """A change asked by `asker` in a department with other managers: its request."""
+        with session() as db:
+            changed = department_settings.change(
+                db, person(db, asker), department_id, TIME_OFF_OFFERS_CLOSE_DAYS, 3
+            )
+            if changed.pending is None:  # other managers exist: always a request
+                raise RuntimeError("the department setting lock probe opened no request")
+            return changed.pending.id
+
+    # 1. A change while a shift moves between the two managers. managers[0] sorts first.
+    department_id, managers = a_department("Kitchen", 2)
+    shift_id = a_shift(managers[0], 2)
+    with session() as blocker:
+        blocker.get(Department, department_id, with_for_update=True)  # held until rollback
+
+        def change() -> None:
+            with session() as db:
+                department_settings.change(
+                    db, person(db, managers[1]), department_id, TIME_OFF_OFFERS_CLOSE_DAYS, 3
+                )
+
+        outcomes = race(blocker, change, reassign(shift_id, managers[1]))
+    if outcomes != ["ok", "ok"]:
+        problems.append(f"a setting change while a shift moves between managers: {outcomes}")
+
+    # 2. A confirmation while a shift moves between the two reviewers. The asker is
+    #    managers[0]; the reviewers are managers[1] and managers[2], and [1] sorts first.
+    department_id, managers = a_department("Bar", 3)
+    request_id = opened(managers[0], department_id)
+    shift_id = a_shift(managers[1], 4)
+    with session() as blocker:
+        blocker.scalars(
+            select(RoleAssignment).where(RoleAssignment.user_id == managers[1]).with_for_update()
+        ).all()  # held until rollback
+
+        def confirm() -> None:
+            with session() as db:
+                # Not sensitive: no password re-entry, so no session is needed.
+                approval_requests.approve(
+                    db, person(db, managers[2]), request_id, session=cast(Any, None)
+                )
+
+        outcomes = race(blocker, confirm, reassign(shift_id, managers[2]))
+    if outcomes != ["ok", "ok"]:
+        problems.append(f"a confirmation while a shift moves between reviewers: {outcomes}")
+
+    # 3. The last confirmation, with its view fixed before the department was archived.
+    department_id, managers = a_department("Patio", 2)
+    request_id = opened(managers[0], department_id)
+    with session() as request_2:
+        request_2.get(Department, department_id)  # its view is now fixed
+        request_2.scalars(select(ApprovalRequest)).all()
+        reviewer = person(request_2, managers[1])
+        with session() as request_1:
+            org.archive_department(request_1, person(request_1, owner_id), department_id)
+        ended = outcome(
+            lambda: approval_requests.approve(
+                request_2, reviewer, request_id, session=cast(Any, None)
+            )
+        )
+        request_2.rollback()
+    with session() as db:
+        written = own_department_value(db, TIME_OFF_OFFERS_CLOSE_DAYS, department_id)
+    if ended != "409" or written is not None:
+        problems.append(f"a confirmation for an archived department: {ended}, value {written}")
+    return problems
+
+
 def _coverage_approval_lock_problems(engine: Engine) -> list[str]:
     """Approving time off with a coworker's offer while the same two people's shifts are
     reassigned, at the same moment, in two threads; return what failed (#209).
@@ -4022,6 +4278,157 @@ def _people_race_problems(engine: Engine) -> list[str]:
 _NO_RIGHT = {1044, 1142, 1143, 1227}
 
 
+# MySQL's error number for a value past a column's range in strict mode
+# ("Out of range value for column"). Any other error from the probe write proves nothing.
+_OUT_OF_RANGE = 1264
+
+
+def _strict_mode_problems(urls: list[str]) -> list[str]:
+    """Whether MySQL refuses numbers past a column's range instead of clipping them (#105,
+    threat T6).
+
+    MySQL 8.4 starts in strict mode, which refuses an out-of-range value with an error; a
+    server or connection without it would silently store 32,767 in place of 40,000. The
+    request limits keep such numbers out, and strict mode is the second layer. Nothing in
+    the application sets sql_mode, and this checks that every user's connection is strict
+    and that a write past a SMALLINT really fails (on a temporary table, so nothing stays).
+    """
+    from sqlalchemy.exc import DBAPIError
+
+    problems = []
+    for url in urls:
+        engine = create_engine(url)
+        try:
+            with engine.connect() as connection:
+                mode = connection.execute(text("SELECT @@SESSION.sql_mode")).scalar_one()
+                if "STRICT_TRANS_TABLES" not in str(mode).split(","):
+                    problems.append(f"a connection is not in strict mode: sql_mode is {mode!r}")
+        finally:
+            engine.dispose()
+    # The write itself, as the first user (the migrations user may create temporary tables).
+    engine = create_engine(urls[0])
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("CREATE TEMPORARY TABLE strict_probe (n SMALLINT)"))
+            try:
+                connection.execute(text("INSERT INTO strict_probe (n) VALUES (40000)"))
+            except DBAPIError as error:
+                # Only "Out of range value" (1264) shows strict mode refused it; any other
+                # failure (a typo, a lost connection) proves nothing (review of #202).
+                code = error.orig.args[0] if error.orig is not None else None
+                if code != _OUT_OF_RANGE:
+                    problems.append(f"the 40000 write failed for another reason: {error.orig}")
+            else:
+                stored = connection.execute(text("SELECT n FROM strict_probe")).scalar_one()
+                problems.append(f"40000 in a SMALLINT was not refused; {stored} was stored")
+            connection.rollback()
+    finally:
+        engine.dispose()
+    return problems
+
+
+# Definitions the backup leaves out (docker/backup/backup.sh, full_backup): it takes tables
+# and views only, which is all the database defines.
+_LEFT_OUT_OF_BACKUPS = (
+    (
+        "trigger",
+        "SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()",
+    ),
+    ("event", "SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA = DATABASE()"),
+    (
+        "routine",
+        "SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE()",
+    ),
+)
+
+
+def _left_out_of_backups(connection: Connection) -> list[str]:
+    """The kinds of definition the database has that the backups leave out."""
+    return [kind for kind, sql in _LEFT_OUT_OF_BACKUPS if connection.execute(text(sql)).scalar()]
+
+
+def _backup_user_problems(backup_url: str, admin_url: str) -> list[str]:
+    """What the backup user can do that it must not, or cannot that it must (#117).
+
+    It reads the database and the binary log (docs/operations/backup-and-restore.md) and
+    changes nothing: a break-in that takes the backup tool's password can copy the data,
+    which the backups hold anyway, but cannot change or destroy it.
+    """
+    problems = []
+    # A trigger, event, or routine added later would be left out of every backup without
+    # a word, so it stops the check here. Counted as the migration user (admin_url), not
+    # the backup user: MySQL shows a user only the definitions it has a right to, and the
+    # backup user has no right to these, so it would always count none (second review of
+    # #205). A probe event, made and dropped as the migration user, shows the count can
+    # see one.
+    admin = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as connection:
+            problems += [
+                f"the database has a {kind}, which the backups leave out: dump it too"
+                " (backup.sh) and give the backup user the right to read it"
+                for kind in _left_out_of_backups(connection)
+            ]
+            # An event, not a trigger: with the binary log on, MySQL lets only SUPER
+            # create triggers, which the migration user does not have.
+            connection.execute(
+                text(
+                    "CREATE EVENT backup_inventory_probe"
+                    " ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 DAY DO SELECT 1"
+                )
+            )
+            try:
+                if "event" not in _left_out_of_backups(connection):
+                    problems.append(
+                        "the count of definitions the backups leave out missed an event"
+                    )
+            finally:
+                connection.execute(text("DROP EVENT backup_inventory_probe"))
+    finally:
+        admin.dispose()
+    engine = create_engine(backup_url, isolation_level="AUTOCOMMIT")
+    try:
+        # What it must be able to do: read every table, see the binary log, close it.
+        with engine.connect() as connection:
+            for sql in (
+                "SELECT COUNT(*) FROM audit_events",
+                "SELECT COUNT(*) FROM users",
+                "SHOW BINARY LOGS",
+                "SHOW BINARY LOG STATUS",
+                "FLUSH BINARY LOGS",
+            ):
+                try:
+                    connection.execute(text(sql))
+                except DBAPIError as error:
+                    problems.append(f"the backup user cannot run {sql}: {error.orig}")
+        # What it must not: change data or structure, read other users' passwords.
+        for sql in (
+            "INSERT INTO audit_chain_heads (chain_id, last_seq) VALUES (0x00, 0)",
+            "UPDATE users SET display_name = display_name",
+            "DELETE FROM sessions",
+            "CREATE TABLE backup_probe (id INT)",
+            "DROP TABLE shifts",
+            "TRUNCATE TABLE sessions",
+            "SELECT authentication_string FROM mysql.user",
+            "CREATE USER backup_probe IDENTIFIED BY 'x'",
+            # Definitions (review of #205): no TRIGGER, EVENT, or routine rights. The same
+            # right covers dropping, which cannot be tried without one to drop: "DROP ...
+            # IF EXISTS" of a missing one only gives a note, whatever the rights.
+            "CREATE TRIGGER backup_probe BEFORE INSERT ON sessions FOR EACH ROW SET @x = 1",
+            "CREATE EVENT backup_probe ON SCHEDULE EVERY 1 DAY DO SELECT 1",
+            "CREATE PROCEDURE backup_probe() SELECT 1",
+        ):
+            with engine.connect() as connection:
+                try:
+                    connection.execute(text(sql))
+                except DBAPIError:
+                    continue
+                problems.append(f"the backup user may run {sql}")
+    finally:
+        engine.dispose()
+    return problems
+
+
 def _grant_problems(app_url: str) -> list[str]:
     """What the application user can do that it must not, or cannot that it must.
 
@@ -4195,9 +4602,9 @@ def main() -> int:
     container = None
     url = os.environ.get("MIGRATION_CHECK_DATABASE_URL", "")
     # With MIGRATION_CHECK_DATABASE_URL, one user does both jobs.
-    app_url = url
+    app_url, backup_url = url, ""
     if not url:
-        container, url, app_url = _start_mysql()
+        container, url, app_url, backup_url = _start_mysql()
     try:
         _wait_until_ready(url)
         # migrations/env.py reads the URLs from the app settings: each address goes in its
@@ -4221,9 +4628,12 @@ def main() -> int:
         command.upgrade(config, "head")
         differences = _differences_from_models(url)
         rule_problems = _database_rule_problems(url) + upgrade_problems + race_problems
+        rule_problems += _strict_mode_problems([url, app_url])
         # Last, as a refused change that got through could leave the database broken.
         if app_url != url:
             rule_problems += _grant_problems(app_url)
+        if backup_url:
+            rule_problems += _backup_user_problems(backup_url, url)
         else:
             print("one database user given: the application user's rights are not checked")
     finally:
@@ -4245,7 +4655,7 @@ def main() -> int:
     where = "a fresh MySQL 8.4" if container else "MIGRATION_CHECK_DATABASE_URL"
     print(
         f"one head ({heads[0]}); upgrade, downgrade, upgrade passed on {where}; "
-        "models match; database rules and the application user's rights hold"
+        "models match; database rules and the application and backup users' rights hold"
     )
     return 0
 

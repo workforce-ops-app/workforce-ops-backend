@@ -57,21 +57,32 @@ from app.authz.scope import (
     person_scope,
     resolve,
 )
+from app.core.request_context import AUTHZ_DENIED, TENANCY_NOT_FOUND
 from app.modules.org.models import Department, Team, User
 
 
 class Forbidden(HTTPException):
-    """403: the user may not do this. One message, whatever the reason."""
+    """403: the user may not do this. One message, whatever the reason.
 
-    def __init__(self) -> None:
+    `permission` is the code authorize() refused, for the refusal log line only (#92,
+    app/core/request_context.py); it is never part of the answer."""
+
+    refusal_kind = AUTHZ_DENIED
+
+    def __init__(self, permission: str | None = None) -> None:
         super().__init__(status_code=403, detail="You do not have permission to do this.")
+        self.permission = permission
 
 
 class NotFound(HTTPException):
-    """404: the target is not in the user's company, so for them it does not exist."""
+    """404: the target is not in the user's company, so for them it does not exist. The
+    log line says so (tenancy.not_found); the answer never does."""
 
-    def __init__(self) -> None:
+    refusal_kind = TENANCY_NOT_FOUND
+
+    def __init__(self, permission: str | None = None) -> None:
         super().__init__(status_code=404, detail="Not found.")
+        self.permission = permission
 
 
 def _maybe_fresh[Q: GenerativeSelect](query: Q, fresh: bool) -> Q:
@@ -313,35 +324,35 @@ def authorize(
 
     # 1. Another company's target does not exist for this user.
     if target is not None and getattr(target, "company_id", user.company_id) != user.company_id:
-        raise NotFound()
+        raise NotFound(code)
 
     # 2 and 3. The assignments that grant it (none for deactivated people or archived roles).
     found = grants(db, user, code, fresh=fresh)
     if not found:
-        raise Forbidden()
+        raise Forbidden(code)
 
     # 4. By kind.
     if permission.kind is Kind.SELF:
         if target is not None and _owner_of(db, target) != user.id:
-            raise Forbidden()
+            raise Forbidden(code)
         return
 
     if permission.kind is Kind.COMPANY:
         if not any(grant.scope_type == "company" for grant in found):
-            raise Forbidden()
+            raise Forbidden(code)
         return
 
     if permission.kind is Kind.RECORD:
         if target is not None:
             scope = resolve(db, target)
             if not any(covers(grant, scope) for grant in found):
-                raise Forbidden()
+                raise Forbidden(code)
         return
 
     # Person: someone else, in scope, and the user is above them.
     if target is not None:
         if not isinstance(target, User) or target.id == user.id:
-            raise Forbidden()
+            raise Forbidden(code)
         if fresh:
             # The person as now committed: they may have moved department or team while
             # this request waited. The caller's copy is updated too (FOR SHARE).
@@ -350,9 +361,9 @@ def authorize(
         else:
             scope = resolve(db, target)
         if not any(covers(grant, scope) for grant in found):
-            raise Forbidden()
+            raise Forbidden(code)
         if not is_above(db, user, target, fresh=fresh):
-            raise Forbidden()
+            raise Forbidden(code)
 
 
 def covers_department(db: Session, user: User, code: str, department_id: uuid.UUID) -> bool:
