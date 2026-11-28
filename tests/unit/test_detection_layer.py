@@ -187,15 +187,22 @@ def test_a_body_the_app_never_read_is_not_inspected(client: TestClient, app: Fas
     the endpoint (DE1), so only the query string is copied."""
     refused = TestClient(app)  # no Origin header
     assert refused.post(f"/api/departments?q={XSS}", json={"name": XSS}).status_code == 403
-    [copy] = _copies(app)
+    # The layer's copy, and the refusal's own (#92), which holds no value at all.
+    [copy, refusal] = _copies(app)
     assert copy.values == [("query.q", XSS)]
+    assert refusal.values == [] and refusal.refusal is not None
 
 
 def test_credential_routes_are_not_copied_at_all(client: TestClient, app: FastAPI) -> None:
     client.post(f"/api/sessions?q={XSS}", json={"email": XSS, "password": XSS})
     # Even refused by the CSRF check (no Origin), it is still known to be sign-in.
     TestClient(app).post(f"/api/sessions?q={XSS}", json={"email": XSS, "password": XSS})
-    assert _copies(app) == []
+    # Only the refused one's own copy (#92): it says a forged sign-in was refused, and
+    # holds nothing that was sent (rule DE3 is about the values, and there are none).
+    [refusal] = _copies(app)
+    assert refusal.values == [] and refusal.refusal is not None
+    assert refusal.refusal.kind == "csrf.refused" and refusal.identity is None
+    assert XSS not in repr(refusal)
 
 
 def test_a_failure_in_the_layer_never_reaches_the_request(

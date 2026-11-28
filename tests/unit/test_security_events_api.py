@@ -118,6 +118,13 @@ def test_the_summary_counts_each_kind_in_both_windows(events: ShiftSetup) -> Non
         "detection.path_traversal": (0, 0),  # 40 days ago: in neither window
         "detection.command_injection": (0, 0),
         "detection.format_string": (0, 0),
+        # Refused requests (#92): every one is a company kind, so always in the summary.
+        "authz.denied": (0, 0),
+        "tenancy.not_found": (0, 0),
+        "request.not_found": (0, 0),
+        "csrf.refused": (0, 0),
+        "auth.reauth_failed": (0, 0),
+        "auth.reauth_locked": (0, 0),
         # A summary row stands for the events the rate cap held back: 15, not 1.
         "detection.summary": (15, 15),
         # A broken audit chain is a company kind too, so it is always in the summary.

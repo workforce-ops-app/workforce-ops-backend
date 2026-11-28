@@ -38,6 +38,9 @@
    migrations (app/db/grants.py), it cannot change the structure, cannot change or
    remove audit entries, and can read every table the app uses.
 
+7. The backup user's rights (_backup_user_problems, #117): created by the same script,
+   it can read every table and the binary log, and can change nothing.
+
 The database is a throwaway Docker container (removed afterwards), unless
 MIGRATION_CHECK_DATABASE_URL points at an empty database to use instead. That one URL
 is then used for everything, and step 7 is skipped: it needs the two users.
@@ -107,14 +110,15 @@ def _docker() -> str:
     return path
 
 
-def _start_mysql() -> tuple[str, str, str]:
-    """Start an empty MySQL container with the two users, as Docker Compose creates them.
+def _start_mysql() -> tuple[str, str, str, str]:
+    """Start an empty MySQL container with the three users, as Docker Compose creates them.
 
-    Returns the container's name, the migrations user's URL, and the application user's.
+    Returns the container's name and the URLs of the migrations, application, and backup
+    users.
     """
     name = f"workforce-ops-migration-check-{secrets.token_hex(4)}"
     # Throwaway passwords, never stored. Hex only, so they fit in a URL as they are.
-    root, app, migrations = (secrets.token_hex(16) for _ in range(3))
+    root, app, migrations, backup = (secrets.token_hex(16) for _ in range(4))
     port = _free_port()
     # Every argument is fixed or generated here; nothing comes from user input.
     subprocess.run(  # noqa: S603
@@ -126,6 +130,7 @@ def _start_mysql() -> tuple[str, str, str]:
             "--env", "MYSQL_DATABASE=migration_check",
             "--env", f"MYSQL_APP_PASSWORD={app}",
             "--env", f"MYSQL_MIGRATIONS_PASSWORD={migrations}",
+            "--env", f"MYSQL_BACKUP_PASSWORD={backup}",
             MYSQL_IMAGE,
         ],
         check=True,
@@ -136,6 +141,7 @@ def _start_mysql() -> tuple[str, str, str]:
         name,
         f"mysql+pymysql://workforce_migrations:{migrations}@{address}",
         f"mysql+pymysql://workforce_app:{app}@{address}",
+        f"mysql+pymysql://workforce_backup:{backup}@{address}",
     )
 
 
@@ -4272,6 +4278,108 @@ def _people_race_problems(engine: Engine) -> list[str]:
 _NO_RIGHT = {1044, 1142, 1143, 1227}
 
 
+# Definitions the backup leaves out (docker/backup/backup.sh, full_backup): it takes tables
+# and views only, which is all the database defines.
+_LEFT_OUT_OF_BACKUPS = (
+    (
+        "trigger",
+        "SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = DATABASE()",
+    ),
+    ("event", "SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA = DATABASE()"),
+    (
+        "routine",
+        "SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE()",
+    ),
+)
+
+
+def _left_out_of_backups(connection: Connection) -> list[str]:
+    """The kinds of definition the database has that the backups leave out."""
+    return [kind for kind, sql in _LEFT_OUT_OF_BACKUPS if connection.execute(text(sql)).scalar()]
+
+
+def _backup_user_problems(backup_url: str, admin_url: str) -> list[str]:
+    """What the backup user can do that it must not, or cannot that it must (#117).
+
+    It reads the database and the binary log (docs/operations/backup-and-restore.md) and
+    changes nothing: a break-in that takes the backup tool's password can copy the data,
+    which the backups hold anyway, but cannot change or destroy it.
+    """
+    problems = []
+    # A trigger, event, or routine added later would be left out of every backup without
+    # a word, so it stops the check here. Counted as the migration user (admin_url), not
+    # the backup user: MySQL shows a user only the definitions it has a right to, and the
+    # backup user has no right to these, so it would always count none (second review of
+    # #205). A probe event, made and dropped as the migration user, shows the count can
+    # see one.
+    admin = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as connection:
+            problems += [
+                f"the database has a {kind}, which the backups leave out: dump it too"
+                " (backup.sh) and give the backup user the right to read it"
+                for kind in _left_out_of_backups(connection)
+            ]
+            # An event, not a trigger: with the binary log on, MySQL lets only SUPER
+            # create triggers, which the migration user does not have.
+            connection.execute(
+                text(
+                    "CREATE EVENT backup_inventory_probe"
+                    " ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 DAY DO SELECT 1"
+                )
+            )
+            try:
+                if "event" not in _left_out_of_backups(connection):
+                    problems.append(
+                        "the count of definitions the backups leave out missed an event"
+                    )
+            finally:
+                connection.execute(text("DROP EVENT backup_inventory_probe"))
+    finally:
+        admin.dispose()
+    engine = create_engine(backup_url, isolation_level="AUTOCOMMIT")
+    try:
+        # What it must be able to do: read every table, see the binary log, close it.
+        with engine.connect() as connection:
+            for sql in (
+                "SELECT COUNT(*) FROM audit_events",
+                "SELECT COUNT(*) FROM users",
+                "SHOW BINARY LOGS",
+                "SHOW BINARY LOG STATUS",
+                "FLUSH BINARY LOGS",
+            ):
+                try:
+                    connection.execute(text(sql))
+                except DBAPIError as error:
+                    problems.append(f"the backup user cannot run {sql}: {error.orig}")
+        # What it must not: change data or structure, read other users' passwords.
+        for sql in (
+            "INSERT INTO audit_chain_heads (chain_id, last_seq) VALUES (0x00, 0)",
+            "UPDATE users SET display_name = display_name",
+            "DELETE FROM sessions",
+            "CREATE TABLE backup_probe (id INT)",
+            "DROP TABLE shifts",
+            "TRUNCATE TABLE sessions",
+            "SELECT authentication_string FROM mysql.user",
+            "CREATE USER backup_probe IDENTIFIED BY 'x'",
+            # Definitions (review of #205): no TRIGGER, EVENT, or routine rights. The same
+            # right covers dropping, which cannot be tried without one to drop: "DROP ...
+            # IF EXISTS" of a missing one only gives a note, whatever the rights.
+            "CREATE TRIGGER backup_probe BEFORE INSERT ON sessions FOR EACH ROW SET @x = 1",
+            "CREATE EVENT backup_probe ON SCHEDULE EVERY 1 DAY DO SELECT 1",
+            "CREATE PROCEDURE backup_probe() SELECT 1",
+        ):
+            with engine.connect() as connection:
+                try:
+                    connection.execute(text(sql))
+                except DBAPIError:
+                    continue
+                problems.append(f"the backup user may run {sql}")
+    finally:
+        engine.dispose()
+    return problems
+
+
 def _grant_problems(app_url: str) -> list[str]:
     """What the application user can do that it must not, or cannot that it must.
 
@@ -4445,9 +4553,9 @@ def main() -> int:
     container = None
     url = os.environ.get("MIGRATION_CHECK_DATABASE_URL", "")
     # With MIGRATION_CHECK_DATABASE_URL, one user does both jobs.
-    app_url = url
+    app_url, backup_url = url, ""
     if not url:
-        container, url, app_url = _start_mysql()
+        container, url, app_url, backup_url = _start_mysql()
     try:
         _wait_until_ready(url)
         # migrations/env.py reads the URLs from the app settings: each address goes in its
@@ -4474,6 +4582,8 @@ def main() -> int:
         # Last, as a refused change that got through could leave the database broken.
         if app_url != url:
             rule_problems += _grant_problems(app_url)
+        if backup_url:
+            rule_problems += _backup_user_problems(backup_url, url)
         else:
             print("one database user given: the application user's rights are not checked")
     finally:
@@ -4495,7 +4605,7 @@ def main() -> int:
     where = "a fresh MySQL 8.4" if container else "MIGRATION_CHECK_DATABASE_URL"
     print(
         f"one head ({heads[0]}); upgrade, downgrade, upgrade passed on {where}; "
-        "models match; database rules and the application user's rights hold"
+        "models match; database rules and the application and backup users' rights hold"
     )
     return 0
 

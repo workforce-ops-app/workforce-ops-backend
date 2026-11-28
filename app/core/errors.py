@@ -25,6 +25,8 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from app.core.request_context import note_refusal
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,6 +34,13 @@ logger = logging.getLogger(__name__)
 async def http_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     if not isinstance(exc, StarletteHTTPException):
         raise exc
+    # What this answer refuses, for the request's refusal log line (#92,
+    # app/core/request_context.py): the error's own kind (and the permission, when
+    # authorize() refused) if it names one. Noted here, as the answer leaves, so a check
+    # that failed and was caught earlier never names the wrong refusal.
+    kind = getattr(exc, "refusal_kind", None)
+    if kind is not None:
+        note_refusal(kind, getattr(exc, "permission", None))
     return JSONResponse(
         status_code=exc.status_code,
         content={

@@ -139,9 +139,23 @@ def note_identity(state: dict[str, Any], identity: Identity) -> None:
     state[IDENTITY_KEY] = identity
 
 
+@dataclass(frozen=True)
+class Refusal:
+    """A refused answer, for a security event of its own (#92): what was refused
+    (app/core/request_context.py, REFUSAL_KINDS) and, when authorize() refused, which
+    permission. Nothing the client sent."""
+
+    kind: str
+    permission: str | None = None
+
+
 @dataclass
 class RequestCopy:
-    """What the worker gets from one request: the collected values and facts about it."""
+    """What the worker gets from one request: the collected values and facts about it.
+
+    A refused request also sends a copy of its own (app/core/request_context.py) with no
+    values and the refusal, so the refusal is recorded even for a credential route,
+    whose values are never copied (DE3): it holds nothing the client sent."""
 
     values: list[tuple[str, str]]  # (field, text), already filtered and capped
     method: str
@@ -150,6 +164,7 @@ class RequestCopy:
     request_id: str
     occurred_at: datetime
     identity: Identity | None = None  # None: no valid session (a platform event)
+    refusal: Refusal | None = None  # set only on a refused request's own copy
 
 
 @dataclass
@@ -232,7 +247,7 @@ def _is_json(scope: Scope) -> bool:
     return False
 
 
-def _find_route(
+def find_route(
     routes: list[RouteContext], scope: Scope
 ) -> tuple[RouteContext | None, dict[str, Any]]:
     """The route the router will choose, and its path values, matched the same way the
@@ -279,7 +294,7 @@ class DetectionMiddleware:
 
         # 1. Which route, and is it a credential route? Then pass it through untouched.
         try:
-            route, path_params = _find_route(self.routes, scope)
+            route, path_params = find_route(self.routes, scope)
         except Exception:
             # Without the message or stack: neither may carry what was sent.
             logger.error("Detection could not match the route")
